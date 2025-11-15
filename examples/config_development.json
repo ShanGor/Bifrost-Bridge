@@ -1,0 +1,45 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:3000",
+  "max_connections": 1000,
+  "timeout_secs": 30,
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/dev",
+        "root_dir": "./src/dev/assets",
+        "spa_mode": false,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": true,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/storybook",
+        "root_dir": "./storybook-static",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/coverage",
+        "root_dir": "./coverage/lcov-report",
+        "spa_mode": false,
+        "enable_directory_listing": true,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/",
+        "root_dir": "./public",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html", "index.htm"]
+      }
+    ],
+    "enable_directory_listing": true,
+    "index_files": ["index.html", "index.htm"],
+    "spa_mode": true,
+    "spa_fallback_file": "index.html"
+  }
+}

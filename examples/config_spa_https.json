@@ -1,0 +1,20 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8443",
+  "max_connections": 1000,
+  "timeout_secs": 30,
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/ui",
+        "root_dir": "D:\\sources\\api-helper\\api-helper-frontend\\dist"
+      }
+    ],
+    "enable_directory_listing": false,
+    "index_files": ["index.html", "index.htm"],
+    "spa_mode": true,
+    "spa_fallback_file": "index.html"
+  },
+  "private_key": "D:\\sources\\rust\\proxy-server\\examples\\localhost.key",
+  "certificate": "D:\\sources\\rust\\proxy-server\\examples\\localhost.crt"
+}

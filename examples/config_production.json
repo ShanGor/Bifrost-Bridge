@@ -1,0 +1,54 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "0.0.0.0:80",
+  "max_connections": 5000,
+  "timeout_secs": 60,
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/",
+        "root_dir": "/var/www/html",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/api",
+        "root_dir": "/var/www/api-docs",
+        "spa_mode": false,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html", "index.htm"]
+      },
+      {
+        "path": "/assets",
+        "root_dir": "/var/www/assets",
+        "spa_mode": false,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/cdn",
+        "root_dir": "/var/www/cdn",
+        "spa_mode": false,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/downloads",
+        "root_dir": "/var/www/downloads",
+        "spa_mode": false,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": true,
+        "index_files": ["index.html"]
+      }
+    ],
+    "enable_directory_listing": false,
+    "index_files": ["index.html", "index.htm"],
+    "spa_mode": false,
+    "spa_fallback_file": "index.html"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "max_connections": 1000,
+  "timeout_secs": 30,
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/user-service",
+        "root_dir": "./services/user-service/dist",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/admin-panel",
+        "root_dir": "./services/admin-panel/dist",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/api-docs",
+        "root_dir": "./documentation/api",
+        "spa_mode": false,
+        "enable_directory_listing": true,
+        "index_files": ["index.html"]
+      },
+      {
+        "path": "/monitoring",
+        "root_dir": "./monitoring/dashboard",
+        "spa_mode": true,
+        "spa_fallback_file": "dashboard.html",
+        "enable_directory_listing": false,
+        "index_files": ["dashboard.html"]
+      },
+      {
+        "path": "/shared",
+        "root_dir": "./shared/static",
+        "spa_mode": false,
+        "enable_directory_listing": false,
+        "index_files": ["index.html"]
+      }
+    ],
+    "enable_directory_listing": false,
+    "index_files": ["index.html", "index.htm"],
+    "spa_mode": false,
+    "spa_fallback_file": "index.html"
+  }
+}

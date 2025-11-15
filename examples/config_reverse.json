@@ -1,0 +1,7 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "reverse_proxy_target": "http://backend.example.com:3000",
+  "max_connections": 1000,
+  "timeout_secs": 30
+}

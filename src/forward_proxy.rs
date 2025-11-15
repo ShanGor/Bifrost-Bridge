@@ -18,7 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use base64::{Engine as _, engine::general_purpose};
 
 pub struct ForwardProxy {
-    client: Client<HttpsConnector<HttpConnector>>,
+    client: Client<HttpsConnector<HttpConnector>>, // HTTPS client for direct connections
     connect_timeout: Duration,
     idle_timeout: Duration,
     max_connection_lifetime: Duration,
@@ -62,16 +62,20 @@ impl ForwardProxy {
         connection_pool_enabled: bool,
         pool_max_idle_per_host: usize,
     ) -> Self {
-        Self::new_with_relay_proxies(
-            connect_timeout_secs,
-            idle_timeout_secs,
-            max_connection_lifetime_secs,
+        Self {
+            client: Client::builder()
+                .pool_max_idle_per_host(pool_max_idle_per_host)
+                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
+                .build(HttpsConnector::new()),
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             connection_pool_enabled,
             pool_max_idle_per_host,
-            Vec::new(),
-            None,
-            None,
-        )
+            relay_proxies: Vec::new(),
+            proxy_username: None,
+            proxy_password: None,
+        }
     }
 
     pub fn new_with_relay(
@@ -393,25 +397,182 @@ impl ForwardProxy {
         }
 
         // Reconstruct request for target server or relay proxy
-        if let Some(relay) = relay_proxy {
-            // When using relay proxy, keep the absolute URI in the request
-            // and add Proxy-Authorization header if needed
+        let response = if let Some(relay) = relay_proxy {
+            // When using relay proxy for HTTP requests:
+            // We need to connect to the relay proxy and send the request with absolute URI
+            
+            // Add Proxy-Authorization header if configured
             if let Some(ref auth) = relay.auth {
                 let auth_value = HeaderValue::from_str(auth)
                     .map_err(|e| ProxyError::Config(format!("Invalid auth header: {}", e)))?;
                 req.headers_mut().insert(PROXY_AUTHORIZATION, auth_value);
             }
-            // Keep the original absolute URI for relay proxy
+
+            println!("Sending HTTP request to relay proxy {} for target {}", relay.url, target_uri);
+
+            // For HTTP requests through a relay proxy:
+            // The request must have an absolute URI and we connect to the relay
+            
+            // Parse relay proxy URL
+            let relay_uri = relay.url.parse::<Uri>()
+                .map_err(|e| ProxyError::Config(format!("Invalid relay proxy URL: {}", e)))?;
+            
+            let relay_host = relay_uri.host()
+                .ok_or_else(|| ProxyError::Config("Relay proxy URL missing host".to_string()))?;
+            let relay_port = relay_uri.port_u16().unwrap_or(8080);
+            let relay_addr = format!("{}:{}", relay_host, relay_port);
+            
+            // Connect to relay proxy
+            let mut stream = TcpStream::connect(&relay_addr).await
+                .map_err(|e| ProxyError::Connection(format!("Failed to connect to relay proxy: {}", e)))?;
+            
+            // Build the HTTP request line with absolute URI
+            let method = req.method().as_str();
+            let uri = req.uri(); // This is the absolute target URI
+            
+            use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
+            
+            // Send request line
+            let request_line = format!("{} {} HTTP/1.1\r\n", method, uri);
+            stream.write_all(request_line.as_bytes()).await
+                .map_err(|e| ProxyError::Connection(format!("Failed to send request line: {}", e)))?;
+            
+            // Send headers
+            for (name, value) in req.headers() {
+                let header_line = format!("{}: {}\r\n", name.as_str(), 
+                    value.to_str().unwrap_or(""));
+                stream.write_all(header_line.as_bytes()).await
+                    .map_err(|e| ProxyError::Connection(format!("Failed to send header: {}", e)))?;
+            }
+            
+            // End of headers
+            stream.write_all(b"\r\n").await
+                .map_err(|e| ProxyError::Connection(format!("Failed to send header end: {}", e)))?;
+            
+            // Send body if present
+            let body_bytes = hyper::body::to_bytes(req.into_body()).await
+                .map_err(|e| ProxyError::Http(format!("Failed to read request body: {}", e)))?;
+            if !body_bytes.is_empty() {
+                stream.write_all(&body_bytes).await
+                    .map_err(|e| ProxyError::Connection(format!("Failed to send body: {}", e)))?;
+            }
+            
+            stream.flush().await
+                .map_err(|e| ProxyError::Connection(format!("Failed to flush: {}", e)))?;
+            
+            // Read response
+            let mut reader = BufReader::new(stream);
+            let mut status_line = String::new();
+            reader.read_line(&mut status_line).await
+                .map_err(|e| ProxyError::Connection(format!("Failed to read status line: {}", e)))?;
+            
+            // Parse status line: HTTP/1.1 200 OK
+            let parts: Vec<&str> = status_line.trim().split(' ').collect();
+            let status_code = if parts.len() >= 2 {
+                parts[1].parse::<u16>().unwrap_or(502)
+            } else {
+                502
+            };
+            
+            // Read headers
+            let mut response_headers = hyper::HeaderMap::new();
+            let mut content_length: Option<usize> = None;
+            let mut chunked = false;
+            
+            loop {
+                let mut header_line = String::new();
+                reader.read_line(&mut header_line).await
+                    .map_err(|e| ProxyError::Connection(format!("Failed to read header: {}", e)))?;
+                
+                if header_line.trim().is_empty() {
+                    break; // End of headers
+                }
+                
+                // Parse header
+                if let Some(colon_pos) = header_line.find(':') {
+                    let name = &header_line[..colon_pos].trim();
+                    let value = &header_line[colon_pos + 1..].trim();
+                    
+                    // Track content-length and transfer-encoding
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse().ok();
+                    } else if name.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked") {
+                        chunked = true;
+                    }
+                    
+                    if let Ok(header_name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+                        if let Ok(header_value) = hyper::header::HeaderValue::from_str(value) {
+                            response_headers.insert(header_name, header_value);
+                        }
+                    }
+                }
+            }
+            
+            // Read body
+            let body_bytes = if chunked {
+                // Handle chunked encoding
+                let mut body = Vec::new();
+                loop {
+                    let mut chunk_size_line = String::new();
+                    reader.read_line(&mut chunk_size_line).await
+                        .map_err(|e| ProxyError::Connection(format!("Failed to read chunk size: {}", e)))?;
+                    
+                    let chunk_size = usize::from_str_radix(chunk_size_line.trim(), 16)
+                        .map_err(|e| ProxyError::Http(format!("Invalid chunk size: {}", e)))?;
+                    
+                    if chunk_size == 0 {
+                        break;
+                    }
+                    
+                    let mut chunk = vec![0u8; chunk_size];
+                    use tokio::io::AsyncReadExt;
+                    reader.read_exact(&mut chunk).await
+                        .map_err(|e| ProxyError::Connection(format!("Failed to read chunk: {}", e)))?;
+                    body.extend_from_slice(&chunk);
+                    
+                    // Read trailing \r\n
+                    let mut trailing = [0u8; 2];
+                    reader.read_exact(&mut trailing).await
+                        .map_err(|e| ProxyError::Connection(format!("Failed to read chunk trailer: {}", e)))?;
+                }
+                body
+            } else if let Some(len) = content_length {
+                // Read exact content length
+                let mut body = vec![0u8; len];
+                use tokio::io::AsyncReadExt;
+                reader.read_exact(&mut body).await
+                    .map_err(|e| ProxyError::Connection(format!("Failed to read body: {}", e)))?;
+                body
+            } else {
+                // Read until connection close
+                let mut body = Vec::new();
+                use tokio::io::AsyncReadExt;
+                reader.read_to_end(&mut body).await
+                    .map_err(|e| ProxyError::Connection(format!("Failed to read body: {}", e)))?;
+                body
+            };
+            
+            // Build response
+            let mut response = Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY));
+            
+            // Add headers
+            if let Some(headers) = response.headers_mut() {
+                *headers = response_headers;
+            }
+            
+            response.body(Body::from(body_bytes))
+                .map_err(|e| ProxyError::Http(format!("Failed to build response: {}", e)))?
         } else {
             // Direct connection: reconstruct request normally
             self.reconstruct_request(&mut req, &target_uri);
-        }
 
-        // Send request with timeout
-        let response = timeout(self.connect_timeout, self.client.request(req))
-            .await
-            .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
-            .map_err(|e| ProxyError::Http(e.to_string()))?;
+            // Send request through direct connection using client
+            timeout(self.connect_timeout, self.client.request(req))
+                .await
+                .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
+                .map_err(|e| ProxyError::Http(e.to_string()))?
+        };
 
         // Log successful response
         println!("Successfully forwarded request to {}://{}:{} - Status: {}", scheme, host, port, response.status());

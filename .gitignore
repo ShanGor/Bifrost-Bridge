@@ -1,2 +1,3 @@
 /examples/*.crt
 /examples/*.key
+/examples/test-*.json

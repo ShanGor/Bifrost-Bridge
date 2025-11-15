@@ -1,32 +1,19 @@
 {
   "mode": "Forward",
-  "listen_addr": "127.0.0.1:8080",
+  "listen_addr": "127.0.0.1:3128",
   "max_connections": 1000,
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,
   "max_connection_lifetime_secs": 300,
+  "max_header_size": 16384,
   "connection_pool_enabled": true,
-  "pool_max_idle_per_host": 20,
+  "pool_max_idle_per_host": 10,
   "relay_proxies": [
     {
-      "relay_proxy_url": "http://upstream-proxy.example.com:3128",
-      "relay_proxy_username": "proxy_user",
-      "relay_proxy_password": "proxy_password",
-      "relay_proxy_domains": [
-        "example.com",
-        ".google.com",
-        "*.github.com",
-        "specific.subdomain.com"
-      ]
-    },
-    {
-      "relay_proxy_url": "http://proxy2.my-company.com:3128",
-      "relay_proxy_username": "user2",
-      "relay_proxy_password": "pass2",
-      "relay_proxy_domains": [
-        "amazonaws.com",
-        ".microsoft.com"
-      ]
+      "relay_proxy_url": "http://127.0.0.1:8080",
+      "relay_proxy_username": "relayuser",
+      "relay_proxy_password": "relaypass",
+      "relay_proxy_domains": []
     }
   ]
 }

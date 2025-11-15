@@ -71,6 +71,12 @@ struct Args {
 
     #[clap(long, value_name = "BYTES", help = "Maximum HTTP header size in bytes")]
     max_header_size: Option<usize>,
+
+    #[clap(long, value_name = "USERNAME", help = "Username for proxy authentication (Basic Auth)")]
+    proxy_username: Option<String>,
+
+    #[clap(long, value_name = "PASSWORD", help = "Password for proxy authentication (Basic Auth)")]
+    proxy_password: Option<String>,
 }
 
 #[tokio::main]
@@ -219,6 +225,13 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         connection_pool_enabled: Some(!args.no_connection_pool),
         pool_max_idle_per_host: args.pool_max_idle,
         max_header_size: args.max_header_size,
+        relay_proxies: None,
+        relay_proxy_url: None,
+        relay_proxy_username: None,
+        relay_proxy_password: None,
+        relay_proxy_domain_suffixes: None,
+        proxy_username: args.proxy_username.clone(),
+        proxy_password: args.proxy_password.clone(),
     };
 
     // Configure static files if specified

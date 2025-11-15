@@ -29,6 +29,7 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R010 | HTTPS Support | ✅ Completed | 2025-11-15 | Add HTTPS server with private key and certificate file paths |
 | R011 | Configurable Connection Pooling | ✅ Completed | 2025-11-15 | Add pool/no-pool mode configuration for forward proxy connections |
 | R012 | Granular Timeout Configuration | ✅ Completed | 2025-11-15 | Replace single timeout with three distinct timeout types |
+| R013 | Basic Authentication for Forward Proxy | ✅ Completed | 2025-11-15 | Add Basic Authentication support for forward proxy clients |
 
 ### 📝 **Pending Requirements**
 
@@ -283,6 +284,64 @@ cargo run -- --mode forward --listen 127.0.0.1:8080 \
 - Prevents stale connections with lifetime limits
 - Improved load balancing capabilities
 - More predictable proxy behavior under different load conditions
+
+### R013: Basic Authentication for Forward Proxy ✅
+**Description:** Add Basic Authentication support for forward proxy clients to control access
+**Implementation:** Full Basic Authentication implementation with Proxy-Authorization header validation
+**Technical Details:**
+- Added `proxy_username` and `proxy_password` fields to main Config struct
+- Added CLI arguments `--proxy-username` and `--proxy-password` for credential configuration
+- Implemented `verify_authentication()` method to validate Base64 encoded credentials
+- Returns HTTP 401 Unauthorized for missing or invalid credentials
+- Sends `Proxy-Authenticate: Basic realm="Proxy Server"` header for browser compatibility
+- When credentials are not configured, proxy operates in open mode (no authentication required)
+- Supports both CLI arguments and JSON configuration file
+- Compatible with all HTTP methods (GET, POST, PUT, DELETE, CONNECT, etc.)
+**Security Features:**
+- Credentials validated using case-sensitive comparison
+- Invalid credentials return generic error message to prevent enumeration attacks
+- Removes authentication headers before forwarding requests to target servers
+- Maintains relay proxy authentication independently from client authentication
+**Usage Examples:**
+```bash
+# CLI - With authentication
+cargo run -- --mode forward --listen 127.0.0.1:8080 --proxy-username admin --proxy-password secret123
+
+# CLI - Without authentication (open proxy)
+cargo run -- --mode forward --listen 127.0.0.1:8080
+
+# JSON Configuration
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:8080",
+  "proxy_username": "admin",
+  "proxy_password": "secret123",
+  "connection_pool_enabled": true
+}
+```
+**Client Configuration Examples:**
+```bash
+# cURL with authentication
+curl -U admin:secret123 -x http://127.0.0.1:8080 http://example.com
+
+# Environment variables (Linux/Mac)
+export http_proxy=http://admin:secret123@127.0.0.1:8080
+export https_proxy=http://admin:secret123@127.0.0.1:8080
+
+# Firefox Network Settings
+Manual Proxy Configuration:
+- HTTP Proxy: 127.0.0.1 Port: 8080
+- Check "Proxy authentication required"
+- Username: admin
+- Password: secret123
+```
+**Benefits:**
+- Secure access control for proxy services
+- Prevents unauthorized proxy usage
+- Standard HTTP Basic Auth support
+- Easy to configure and use
+- Works with all browsers and HTTP clients
+- Independent of upstream relay proxy authentication
 
 ---
 

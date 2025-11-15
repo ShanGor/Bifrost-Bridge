@@ -1,4 +1,4 @@
-use crate::config::{Config, ProxyMode};
+use crate::config::{Config, ProxyMode, RelayProxyConfig};
 use crate::error::ProxyError;
 use crate::forward_proxy::ForwardProxy;
 use crate::reverse_proxy::ReverseProxy;
@@ -74,13 +74,34 @@ impl ProxyFactory {
                     .unwrap_or(300);
                 let connection_pool_enabled = config.connection_pool_enabled.unwrap_or(true);
                 let pool_max_idle_per_host = config.pool_max_idle_per_host.unwrap_or(10);
-                let proxy = ForwardProxy::new_with_pool_config(
+                
+                // Support both new relay_proxies and legacy relay_proxy fields
+                let relay_configs = if let Some(relay_proxies) = config.relay_proxies {
+                    // Use new multi-relay configuration
+                    relay_proxies
+                } else if config.relay_proxy_url.is_some() {
+                    // Convert legacy single relay proxy to new format
+                    vec![RelayProxyConfig {
+                        relay_proxy_url: config.relay_proxy_url.unwrap(),
+                        relay_proxy_username: config.relay_proxy_username,
+                        relay_proxy_password: config.relay_proxy_password,
+                        relay_proxy_domains: config.relay_proxy_domain_suffixes.unwrap_or_default(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                
+                let proxy = ForwardProxy::new_with_relay_proxies(
                     connect_timeout_secs,
                     idle_timeout_secs,
                     max_connection_lifetime_secs,
                     connection_pool_enabled,
                     pool_max_idle_per_host,
+                    relay_configs,
+                    config.proxy_username,
+                    config.proxy_password,
                 );
+                
                 Ok(Box::new(ForwardProxyAdapter {
                     proxy,
                     addr: config.listen_addr,

@@ -123,6 +123,19 @@ impl StaticFileConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayProxyConfig {
+    pub relay_proxy_url: String,
+    #[serde(default)]
+    pub relay_proxy_username: Option<String>,
+    #[serde(default)]
+    pub relay_proxy_password: Option<String>,
+    // Domain patterns in NO_PROXY format
+    // Supports: "example.com", ".example.com", "*.example.com", "subdomain.example.com"
+    #[serde(default)]
+    pub relay_proxy_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mode: ProxyMode,
     pub listen_addr: SocketAddr,
@@ -150,6 +163,23 @@ pub struct Config {
     pub pool_max_idle_per_host: Option<usize>,
     #[serde(default = "default_max_header_size")]
     pub max_header_size: Option<usize>,
+    // Multiple relay proxy configurations
+    #[serde(default)]
+    pub relay_proxies: Option<Vec<RelayProxyConfig>>,
+    // Legacy single relay proxy fields (deprecated, use relay_proxies instead)
+    #[serde(default)]
+    pub relay_proxy_url: Option<String>,
+    #[serde(default)]
+    pub relay_proxy_username: Option<String>,
+    #[serde(default)]
+    pub relay_proxy_password: Option<String>,
+    #[serde(default)]
+    pub relay_proxy_domain_suffixes: Option<Vec<String>>,
+    // Basic authentication for forward proxy
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    #[serde(default)]
+    pub proxy_password: Option<String>,
 }
 
 fn default_max_header_size() -> Option<usize> {
@@ -174,6 +204,13 @@ impl Default for Config {
             connection_pool_enabled: Some(true),
             pool_max_idle_per_host: Some(10),
             max_header_size: default_max_header_size(),
+            relay_proxies: None,
+            relay_proxy_url: None,
+            relay_proxy_username: None,
+            relay_proxy_password: None,
+            relay_proxy_domain_suffixes: None,
+            proxy_username: None,
+            proxy_password: None,
         }
     }
 }

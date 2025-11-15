@@ -14,6 +14,9 @@ pub enum ProxyError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Authentication error: {0}")]
+    Auth(String),
+
     #[error("URL parsing error: {0}")]
     Url(#[from] url::ParseError),
 

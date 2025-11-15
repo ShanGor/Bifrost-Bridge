@@ -24,7 +24,16 @@ struct Args {
     #[clap(short, long, value_name = "FILE", help = "Configuration file path")]
     config: Option<String>,
 
-    #[clap(long, value_name = "SECONDS", help = "Request timeout in seconds")]
+    #[clap(long, value_name = "SECONDS", help = "Connection timeout in seconds")]
+    connect_timeout: Option<u64>,
+
+    #[clap(long, value_name = "SECONDS", help = "Idle timeout in seconds")]
+    idle_timeout: Option<u64>,
+
+    #[clap(long, value_name = "SECONDS", help = "Maximum connection lifetime in seconds")]
+    max_connection_lifetime: Option<u64>,
+
+    #[clap(long, value_name = "SECONDS", help = "Request timeout in seconds (deprecated, use specific timeout options)")]
     timeout: Option<u64>,
 
     #[clap(long, value_name = "FILE", help = "Generate a sample configuration file")]
@@ -59,6 +68,9 @@ struct Args {
 
     #[clap(long, value_name = "NUM", help = "Maximum idle connections per host for connection pooling")]
     pool_max_idle: Option<usize>,
+
+    #[clap(long, value_name = "BYTES", help = "Maximum HTTP header size in bytes")]
+    max_header_size: Option<usize>,
 }
 
 #[tokio::main]
@@ -127,7 +139,12 @@ fn generate_sample_config(file_path: &str) -> Result<(), Box<dyn std::error::Err
   "mode": "Forward",
   "listen_addr": "127.0.0.1:8080",
   "max_connections": 1000,
-  "timeout_secs": 30
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "max_header_size": 16384,
+  "connection_pool_enabled": true,
+  "pool_max_idle_per_host": 10
 }"#;
 
     let sample_reverse = r#"{
@@ -135,16 +152,26 @@ fn generate_sample_config(file_path: &str) -> Result<(), Box<dyn std::error::Err
   "listen_addr": "127.0.0.1:8080",
   "reverse_proxy_target": "http://backend.example.com:3000",
   "max_connections": 1000,
-  "timeout_secs": 30
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "max_header_size": 16384
 }"#;
 
     let sample_spa = r#"{
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:8080",
   "max_connections": 1000,
-  "timeout_secs": 30,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "max_header_size": 16384,
   "static_files": {
-    "root_dir": "./dist",
+    "mounts": [{
+      "path": "/",
+      "root_dir": "./dist",
+      "spa_mode": true
+    }],
     "enable_directory_listing": false,
     "index_files": ["index.html"],
     "spa_mode": true,
@@ -176,20 +203,22 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
     let listen_addr = args.listen.as_deref().unwrap_or("127.0.0.1:8080");
     let listen_addr: std::net::SocketAddr = listen_addr.parse()?;
 
-    let timeout_secs = args.timeout.unwrap_or(30);
-
     let mut config = Config {
         mode,
         listen_addr,
         reverse_proxy_target: args.target.clone(),
         forward_proxy_port: Some(3128),
         max_connections: Some(1000),
-        timeout_secs: Some(timeout_secs),
+        connect_timeout_secs: args.connect_timeout,
+        idle_timeout_secs: args.idle_timeout,
+        max_connection_lifetime_secs: args.max_connection_lifetime,
+        timeout_secs: args.timeout,
         static_files: None,
         private_key: args.private_key.clone(),
         certificate: args.certificate.clone(),
         connection_pool_enabled: Some(!args.no_connection_pool),
         pool_max_idle_per_host: args.pool_max_idle,
+        max_header_size: args.max_header_size,
     };
 
     // Configure static files if specified

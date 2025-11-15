@@ -17,21 +17,26 @@ use url::Url;
 pub struct ReverseProxy {
     client: Client<HttpConnector>,
     target_url: Url,
-    timeout_duration: Duration,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    max_connection_lifetime: Duration,
     preserve_host: bool,
 }
 
 impl ReverseProxy {
-    pub fn new(target_url: String, timeout_secs: u64) -> Result<Self, ProxyError> {
+    pub fn new(target_url: String, connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Result<Self, ProxyError> {
         let url = Url::parse(&target_url)
             .map_err(|e| ProxyError::Url(e))?;
 
         Ok(Self {
             client: Client::builder()
                 .pool_max_idle_per_host(10)
+                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
                 .build_http(),
             target_url: url,
-            timeout_duration: Duration::from_secs(timeout_secs),
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             preserve_host: true,
         })
     }
@@ -43,23 +48,30 @@ impl ReverseProxy {
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
         let target_url = self.target_url.clone();
-        let timeout_duration = self.timeout_duration;
+        let connect_timeout = self.connect_timeout;
+        let idle_timeout = self.idle_timeout;
+        let max_connection_lifetime = self.max_connection_lifetime;
         let preserve_host = self.preserve_host;
 
         let make_svc = make_service_fn(move |_conn| {
             let target_url = target_url.clone();
-            let timeout_duration = timeout_duration;
+            let connect_timeout = connect_timeout;
+            let idle_timeout = idle_timeout;
+            let max_connection_lifetime = max_connection_lifetime;
             let preserve_host = preserve_host;
 
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
                     let client = Client::builder()
                         .pool_max_idle_per_host(10)
+                        .pool_idle_timeout(idle_timeout)
                         .build_http();
                     let proxy = ReverseProxy {
                         client,
                         target_url: target_url.clone(),
-                        timeout_duration,
+                        connect_timeout,
+                        idle_timeout,
+                        max_connection_lifetime,
                         preserve_host,
                     };
                     async move {
@@ -102,7 +114,7 @@ impl ReverseProxy {
         self.modify_request(&mut req, &target_uri);
 
         // Send request with timeout
-        let response = timeout(self.timeout_duration, self.client.request(req))
+        let response = timeout(self.connect_timeout, self.client.request(req))
             .await
             .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
             .map_err(|e| ProxyError::Http(e.to_string()))?;
@@ -204,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_target_uri_building() {
-        let proxy = ReverseProxy::new("http://backend.example.com".to_string(), 30).unwrap();
+        let proxy = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300).unwrap();
 
         let mut req = Request::builder()
             .method(Method::GET)
@@ -218,10 +230,10 @@ mod tests {
 
     #[test]
     fn test_reverse_proxy_creation() {
-        let result = ReverseProxy::new("http://backend.example.com".to_string(), 30);
+        let result = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300);
         assert!(result.is_ok());
 
-        let invalid_url = ReverseProxy::new("not-a-url".to_string(), 30);
+        let invalid_url = ReverseProxy::new("not-a-url".to_string(), 10, 90, 300);
         assert!(invalid_url.is_err());
     }
 }

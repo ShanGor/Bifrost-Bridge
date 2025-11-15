@@ -2,7 +2,9 @@
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:3000",
   "max_connections": 1000,
-  "timeout_secs": 30,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
   "static_files": {
     "mounts": [
       {

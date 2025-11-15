@@ -9,8 +9,8 @@ A high-performance proxy server written in Rust that can function as both a forw
 - **Multiple Static Roots**: Serve static files from multiple directories at different URL paths
 - **High Performance**: Built on Tokio and Hyper for async I/O
 - **Configurable**: Supports both command-line arguments and configuration files
-- **Connection Pooling**: Efficient connection reuse
-- **Timeout Handling**: Configurable request timeouts
+- **Connection Pooling**: Efficient connection reuse with configurable pool settings
+- **Granular Timeout Control**: Three distinct timeout types (connect, idle, lifetime)
 - **SPA Support**: Single Page Application fallback with proper MIME type handling
 - **Graceful Shutdown**: Clean shutdown with Ctrl+C handling
 - **Logging**: Comprehensive logging with env_logger
@@ -47,8 +47,11 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 --target http://backend:3000
 # Using configuration file
 cargo run -- --config config.json
 
-# Set custom timeout
-cargo run -- --mode forward --listen 127.0.0.1:8080 --timeout 60
+# Set custom timeouts
+cargo run -- --mode forward --listen 127.0.0.1:8080 \
+  --connect-timeout 10 \
+  --idle-timeout 90 \
+  --max-connection-lifetime 300
 
 # Serve static files
 cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./public
@@ -155,7 +158,9 @@ Create a JSON configuration file:
   "listen_addr": "127.0.0.1:8080",
   "forward_proxy_port": 3128,
   "max_connections": 1000,
-  "timeout_secs": 30
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300
 }
 ```
 
@@ -166,7 +171,9 @@ Create a JSON configuration file:
   "listen_addr": "127.0.0.1:8080",
   "reverse_proxy_target": "http://backend.example.com:3000",
   "max_connections": 1000,
-  "timeout_secs": 30
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300
 }
 ```
 
@@ -177,7 +184,9 @@ Create a JSON configuration file:
   "listen_addr": "127.0.0.1:8080",
   "reverse_proxy_target": "http://api.backend.com:3000",
   "max_connections": 1000,
-  "timeout_secs": 30,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
   "static_files": {
     "mounts": [
       {
@@ -211,7 +220,8 @@ cargo run -- --mode forward --listen 127.0.0.1:8080
 ### Features
 
 - HTTP proxying
-- Connection pooling
+- Connection pooling with configurable idle and lifetime settings
+- Granular timeout control (connect, idle, lifetime)
 - Request timeout handling
 - Error handling and logging
 
@@ -369,18 +379,20 @@ src/
 ## Performance Considerations
 
 - Built on Tokio for async I/O
-- Connection pooling for backend requests
+- Connection pooling for backend requests with configurable pool settings
+- Idle timeout for efficient pool management
+- Maximum connection lifetime prevents stale connections
 - Configurable connection limits
-- Timeout handling to prevent hanging requests
+- Granular timeout handling (connect, idle, lifetime) to prevent hanging requests
 
 ## Error Handling
 
 The proxy includes comprehensive error handling:
 
-- Connection errors
+- Connection errors with connect timeout
 - HTTP parsing errors
 - Configuration errors
-- Timeout errors
+- Timeout errors (connect, idle, lifetime)
 - Forward error responses to clients
 
 ## Logging

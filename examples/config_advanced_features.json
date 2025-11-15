@@ -2,7 +2,9 @@
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:8443",
   "max_connections": 2000,
-  "timeout_secs": 60,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 120,
+  "max_connection_lifetime_secs": 600,
   "static_files": {
     "mounts": [
       {

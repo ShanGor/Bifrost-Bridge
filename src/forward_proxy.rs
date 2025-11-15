@@ -17,31 +17,39 @@ use tokio_rustls::TlsAcceptor;
 
 pub struct ForwardProxy {
     client: Client<HttpsConnector<HttpConnector>>,
-    timeout_duration: Duration,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    max_connection_lifetime: Duration,
     connection_pool_enabled: bool,
     pool_max_idle_per_host: usize,
 }
 
 impl ForwardProxy {
-    pub fn new(timeout_secs: u64) -> Self {
+    pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Self {
         Self {
             client: Client::builder()
                 .pool_max_idle_per_host(10)
+                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
                 .build(HttpsConnector::new()),
-            timeout_duration: Duration::from_secs(timeout_secs),
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             connection_pool_enabled: true,
             pool_max_idle_per_host: 10,
         }
     }
 
     pub fn new_with_pool_config(
-        timeout_secs: u64,
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
         pool_max_idle_per_host: usize,
     ) -> Self {
         let client = if connection_pool_enabled {
             Client::builder()
                 .pool_max_idle_per_host(pool_max_idle_per_host)
+                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
                 .build(HttpsConnector::new())
         } else {
             Client::builder()
@@ -51,7 +59,9 @@ impl ForwardProxy {
 
         Self {
             client,
-            timeout_duration: Duration::from_secs(timeout_secs),
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             connection_pool_enabled,
             pool_max_idle_per_host,
         }
@@ -80,12 +90,16 @@ impl ForwardProxy {
     }
 
     async fn run_http(self, addr: SocketAddr) -> Result<(), ProxyError> {
-        let timeout_duration = self.timeout_duration;
+        let connect_timeout = self.connect_timeout;
+        let idle_timeout = self.idle_timeout;
+        let max_connection_lifetime = self.max_connection_lifetime;
         let connection_pool_enabled = self.connection_pool_enabled;
         let pool_max_idle_per_host = self.pool_max_idle_per_host;
 
         let make_svc = make_service_fn(move |_conn| {
-            let timeout_duration = timeout_duration;
+            let connect_timeout = connect_timeout;
+            let idle_timeout = idle_timeout;
+            let max_connection_lifetime = max_connection_lifetime;
             let connection_pool_enabled = connection_pool_enabled;
             let pool_max_idle_per_host = pool_max_idle_per_host;
             async move {
@@ -93,6 +107,7 @@ impl ForwardProxy {
                     let client = if connection_pool_enabled {
                         Client::builder()
                             .pool_max_idle_per_host(pool_max_idle_per_host)
+                            .pool_idle_timeout(idle_timeout)
                             .build(HttpsConnector::new())
                     } else {
                         Client::builder()
@@ -101,7 +116,9 @@ impl ForwardProxy {
                     };
                     let proxy = ForwardProxy {
                         client,
-                        timeout_duration,
+                        connect_timeout,
+                        idle_timeout,
+                        max_connection_lifetime,
                         connection_pool_enabled,
                         pool_max_idle_per_host,
                     };
@@ -124,7 +141,9 @@ impl ForwardProxy {
     }
 
     async fn run_https(self, addr: SocketAddr, tls_config: Option<Arc<ServerConfig>>) -> Result<(), ProxyError> {
-        let timeout_duration = self.timeout_duration;
+        let connect_timeout = self.connect_timeout;
+        let idle_timeout = self.idle_timeout;
+        let max_connection_lifetime = self.max_connection_lifetime;
         let connection_pool_enabled = self.connection_pool_enabled;
         let pool_max_idle_per_host = self.pool_max_idle_per_host;
         let tls_acceptor = if let Some(config) = tls_config {
@@ -147,7 +166,9 @@ impl ForwardProxy {
             let (tcp_stream, _) = tcp_listener.accept().await
                 .map_err(|e| ProxyError::Io(e))?;
 
-            let timeout_duration = timeout_duration;
+            let connect_timeout = connect_timeout;
+            let idle_timeout = idle_timeout;
+            let max_connection_lifetime = max_connection_lifetime;
             let connection_pool_enabled = connection_pool_enabled;
             let pool_max_idle_per_host = pool_max_idle_per_host;
             let tls_acceptor = tls_acceptor.clone();
@@ -161,6 +182,7 @@ impl ForwardProxy {
                                 let client = if connection_pool_enabled {
                                     Client::builder()
                                         .pool_max_idle_per_host(pool_max_idle_per_host)
+                                        .pool_idle_timeout(idle_timeout)
                                         .build(HttpsConnector::new())
                                 } else {
                                     Client::builder()
@@ -169,7 +191,9 @@ impl ForwardProxy {
                                 };
                                 let proxy = ForwardProxy {
                                     client,
-                                    timeout_duration,
+                                    connect_timeout,
+                                    idle_timeout,
+                                    max_connection_lifetime,
                                     connection_pool_enabled,
                                     pool_max_idle_per_host,
                                 };
@@ -218,14 +242,23 @@ impl ForwardProxy {
         // Extract target URL from request
         let target_uri = self.extract_target_uri(&req)?;
 
+        // Log HTTP request forwarding (similar to CONNECT logging for HTTPS)
+        let host = target_uri.host().unwrap_or("unknown");
+        let port = target_uri.port_u16().unwrap_or(80);
+        let scheme = target_uri.scheme_str().unwrap_or("http");
+        println!("HTTP request to {}://{}:{}{}", scheme, host, port, target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""));
+
         // Reconstruct request for target server
         self.reconstruct_request(&mut req, &target_uri);
 
         // Send request with timeout
-        let response = timeout(self.timeout_duration, self.client.request(req))
+        let response = timeout(self.connect_timeout, self.client.request(req))
             .await
             .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
             .map_err(|e| ProxyError::Http(e.to_string()))?;
+
+        // Log successful response
+        println!("Successfully forwarded request to {}://{}:{} - Status: {}", scheme, host, port, response.status());
 
         Ok(response)
     }
@@ -385,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_target_uri_extraction() {
-        let proxy = ForwardProxy::new(30);
+        let proxy = ForwardProxy::new(10, 90, 300);
 
         // Test absolute URI
         let absolute_uri: Uri = "http://example.com/path".parse().unwrap();

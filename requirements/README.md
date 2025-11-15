@@ -28,19 +28,19 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R009 | Custom Media Type Mappings | ✅ Completed | 2025-11-15 | Allow custom MIME type mappings like .mjs -> application/javascript |
 | R010 | HTTPS Support | ✅ Completed | 2025-11-15 | Add HTTPS server with private key and certificate file paths |
 | R011 | Configurable Connection Pooling | ✅ Completed | 2025-11-15 | Add pool/no-pool mode configuration for forward proxy connections |
+| R012 | Granular Timeout Configuration | ✅ Completed | 2025-11-15 | Replace single timeout with three distinct timeout types |
 
 ### 📝 **Pending Requirements**
 
 | ID | Requirement | Status | Date Raised | Description |
 |----|-------------|--------|------------|-------------|
 | R008 | Configurable Thread Pool | 📋 Pending | 2025-11-15 | Add worker_threads configuration to control concurrency |
-| R011 | Configurable Connection Pooling | ✅ Completed | 2025-11-15 | Add pool/no-pool mode configuration for forward proxy connections |
-| R012 | Documentation Maintenance | 📋 Pending | 2025-11-15 | Ensure documentation stays updated with code changes |
-| R013 | Logging System | 📋 Pending | TBD | Add structured logging with configurable levels |
-| R013 | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
-| R014 | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
-| R015 | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
-| R016 | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
+| R013 | Documentation Maintenance | 📋 Pending | 2025-11-15 | Ensure documentation stays updated with code changes |
+| R014 | Logging System | 📋 Pending | TBD | Add structured logging with configurable levels |
+| R015 | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
+| R016 | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
+| R017 | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
+| R018 | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
 
 ---
 
@@ -239,6 +239,50 @@ cargo run -- --mode forward --listen 127.0.0.1:8888 --no-connection-pool
 - **No-Pool Mode:** Connection isolation, better for security-sensitive applications
 - **Configurable:** Tunable based on workload patterns and performance requirements
 - **Real-time Feedback:** Server startup messages indicate current pool configuration
+
+### R012: Granular Timeout Configuration ✅
+**Description:** Replace single timeout_secs with three distinct timeout types for better connection management
+**Implementation:** Added connect_timeout_secs, idle_timeout_secs, and max_connection_lifetime_secs
+**Technical Details:**
+- **Connect Timeout**: Controls timeout for establishing new connections to target servers
+- **Idle Timeout**: Controls how long idle connections remain in the connection pool
+- **Max Connection Lifetime**: Controls maximum lifetime of any connection before being closed
+- Applied to both ForwardProxy and ReverseProxy implementations
+- Hyper client configured with pool_idle_timeout for efficient connection management
+- Backward compatibility maintained with legacy timeout_secs field
+**Default Values:**
+- `connect_timeout_secs`: 10 seconds (connection establishment)
+- `idle_timeout_secs`: 90 seconds (pool idle timeout)
+- `max_connection_lifetime_secs`: 300 seconds (5 minutes total lifetime)
+**Usage Examples:**
+```bash
+# CLI
+cargo run -- --mode forward --listen 127.0.0.1:8080 \
+  --connect-timeout 10 \
+  --idle-timeout 90 \
+  --max-connection-lifetime 300
+
+# JSON Configuration
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:8080",
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "connection_pool_enabled": true
+}
+```
+**Migration Guide:**
+- Old `timeout_secs` field is deprecated but still supported
+- If old field is present, it will be used as `connect_timeout_secs`
+- New configurations should use the three new timeout fields
+- All example configuration files updated to new format
+**Benefits:**
+- Fine-grained control over connection behavior
+- Better resource management with idle timeout
+- Prevents stale connections with lifetime limits
+- Improved load balancing capabilities
+- More predictable proxy behavior under different load conditions
 
 ---
 

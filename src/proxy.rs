@@ -64,11 +64,20 @@ impl ProxyFactory {
     pub fn create_proxy(config: Config) -> Result<Box<dyn Proxy + Send>, ProxyError> {
         match config.mode {
             ProxyMode::Forward => {
-                let timeout_secs = config.timeout_secs.unwrap_or(30);
+                // Support backward compatibility with timeout_secs
+                let connect_timeout_secs = config.connect_timeout_secs
+                    .or(config.timeout_secs)
+                    .unwrap_or(10);
+                let idle_timeout_secs = config.idle_timeout_secs
+                    .unwrap_or(90);
+                let max_connection_lifetime_secs = config.max_connection_lifetime_secs
+                    .unwrap_or(300);
                 let connection_pool_enabled = config.connection_pool_enabled.unwrap_or(true);
                 let pool_max_idle_per_host = config.pool_max_idle_per_host.unwrap_or(10);
                 let proxy = ForwardProxy::new_with_pool_config(
-                    timeout_secs,
+                    connect_timeout_secs,
+                    idle_timeout_secs,
+                    max_connection_lifetime_secs,
                     connection_pool_enabled,
                     pool_max_idle_per_host,
                 );
@@ -94,8 +103,15 @@ impl ProxyFactory {
                     // Reverse proxy mode (with or without static files)
                     let target_url = config.reverse_proxy_target
                         .ok_or_else(|| ProxyError::Config("Reverse proxy target URL is required for reverse proxy mode".to_string()))?;
-                    let timeout_secs = config.timeout_secs.unwrap_or(30);
-                    let proxy = ReverseProxy::new(target_url, timeout_secs)?;
+                    // Support backward compatibility with timeout_secs
+                    let connect_timeout_secs = config.connect_timeout_secs
+                        .or(config.timeout_secs)
+                        .unwrap_or(10);
+                    let idle_timeout_secs = config.idle_timeout_secs
+                        .unwrap_or(90);
+                    let max_connection_lifetime_secs = config.max_connection_lifetime_secs
+                        .unwrap_or(300);
+                    let proxy = ReverseProxy::new(target_url, connect_timeout_secs, idle_timeout_secs, max_connection_lifetime_secs)?;
                     Ok(Box::new(ReverseProxyAdapter {
                         proxy,
                         addr: config.listen_addr,

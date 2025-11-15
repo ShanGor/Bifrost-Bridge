@@ -129,6 +129,15 @@ pub struct Config {
     pub reverse_proxy_target: Option<String>,
     pub forward_proxy_port: Option<u16>,
     pub max_connections: Option<usize>,
+    // New timeout configurations
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_connection_lifetime_secs: Option<u64>,
+    // Legacy timeout field for backward compatibility
+    #[serde(default)]
     pub timeout_secs: Option<u64>,
     pub static_files: Option<StaticFileConfig>,
     #[serde(default)]
@@ -139,6 +148,12 @@ pub struct Config {
     pub connection_pool_enabled: Option<bool>,
     #[serde(default)]
     pub pool_max_idle_per_host: Option<usize>,
+    #[serde(default = "default_max_header_size")]
+    pub max_header_size: Option<usize>,
+}
+
+fn default_max_header_size() -> Option<usize> {
+    Some(16 * 1024) // 16KB default header size limit
 }
 
 impl Default for Config {
@@ -149,12 +164,16 @@ impl Default for Config {
             reverse_proxy_target: None,
             forward_proxy_port: Some(3128),
             max_connections: Some(1000),
-            timeout_secs: Some(30),
+            connect_timeout_secs: Some(10),
+            idle_timeout_secs: Some(90),
+            max_connection_lifetime_secs: Some(300),
+            timeout_secs: None,
             static_files: None,
             private_key: None,
             certificate: None,
             connection_pool_enabled: Some(true),
             pool_max_idle_per_host: Some(10),
+            max_header_size: default_max_header_size(),
         }
     }
 }

@@ -10,7 +10,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -240,28 +240,56 @@ impl ForwardProxy {
 
         println!("CONNECT request to {}:{}", host, port);
 
-        // For CONNECT requests, we need to establish the tunnel first,
-        // then return the response. However, with hyper's architecture,
-        // we cannot easily access the underlying TCP stream.
+        // Spawn the upgrade and tunnel handling
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    println!("Successfully upgraded connection for {}:{}", host, port);
+                    
+                    // Connect to the target server
+                    match TcpStream::connect(format!("{}:{}", host, port)).await {
+                        Ok(target_stream) => {
+                            println!("Successfully connected to target {}:{}", host, port);
+                            
+                            // Setup bidirectional tunnel
+                            let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+                            let (mut target_read, mut target_write) = target_stream.into_split();
 
-        // The correct approach for CONNECT in HTTP forward proxy is to:
-        // 1. Return 200 Connection established immediately
-        // 2. Handle the tunneling at the connection level
+                            let client_to_target = async {
+                                match tokio::io::copy(&mut client_read, &mut target_write).await {
+                                    Ok(bytes) => println!("Client -> Target: {} bytes transferred for {}:{}", bytes, host, port),
+                                    Err(e) => eprintln!("Error in client->target tunnel for {}:{}: {}", host, port, e),
+                                }
+                            };
 
-        // Note: A complete implementation would require lower-level socket access
-        // to properly implement CONNECT tunneling. For now, we'll return the
-        // standard CONNECT response which indicates tunnel establishment.
+                            let target_to_client = async {
+                                match tokio::io::copy(&mut target_read, &mut client_write).await {
+                                    Ok(bytes) => println!("Target -> Client: {} bytes transferred for {}:{}", bytes, host, port),
+                                    Err(e) => eprintln!("Error in target->client tunnel for {}:{}: {}", host, port, e),
+                                }
+                            };
 
-        println!("Returning 200 Connection established for {}:{}", host, port);
+                            // Run both directions concurrently
+                            tokio::join!(client_to_target, target_to_client);
+                            println!("TCP tunnel closed for {}:{}", host, port);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to target {}:{}: {}", host, port, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to upgrade connection for {}:{}: {}", host, port, e);
+                }
+            }
+        });
 
-        // Return 200 Connection established
-        let response = Response::builder()
+        // Return 200 Connection Established immediately
+        // The upgrade will happen after this response is sent
+        Ok(Response::builder()
             .status(StatusCode::OK)
-            .header(CONNECTION, "close")
             .body(Body::empty())
-            .unwrap();
-
-        Ok(response)
+            .unwrap())
     }
 
     fn extract_target_uri(&self, req: &Request<Body>) -> Result<Uri, ProxyError> {

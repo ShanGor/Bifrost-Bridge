@@ -1,49 +1,66 @@
+//! Forward proxy implementation supporting HTTP and HTTPS protocols.
+//!
+//! This module provides a forward proxy server with the following features:
+//! - HTTP/HTTPS CONNECT tunneling for HTTPS requests
+//! - Relay proxy support with domain-based routing
+//! - Basic proxy authentication
+//! - Connection pooling and timeout configuration
+
 use crate::error::ProxyError;
 use crate::config::RelayProxyConfig;
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode, Uri};
-use hyper::client::HttpConnector;
-use hyper_tls::HttpsConnector;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::header::{HOST, CONNECTION, PROXY_AUTHORIZATION, HeaderValue};
+use hyper::{Request, Response, StatusCode, Uri, Method};
+use hyper::body::{Bytes, Incoming};
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1::Builder as ServerBuilder;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use hyper::header::{HOST, PROXY_AUTHORIZATION, HeaderValue};
 use std::convert::Infallible;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use base64::{Engine as _, engine::general_purpose};
 
+/// Forward proxy server implementation.
+///
+/// Supports both direct connections and relay proxy routing based on domain patterns.
 pub struct ForwardProxy {
-    client: Client<HttpsConnector<HttpConnector>>, // HTTPS client for direct connections
     connect_timeout: Duration,
     idle_timeout: Duration,
     max_connection_lifetime: Duration,
     connection_pool_enabled: bool,
     pool_max_idle_per_host: usize,
-    relay_proxies: Vec<RelayProxyWithAuth>, // Multiple relay proxies with pre-computed auth
-    proxy_username: Option<String>, // Username for proxy authentication
-    proxy_password: Option<String>, // Password for proxy authentication
+    relay_proxies: Vec<RelayProxyWithAuth>,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
 }
 
-// Internal structure to store relay proxy config with pre-computed auth header
+/// Internal structure to store relay proxy configuration with pre-computed authentication.
 #[derive(Clone)]
 struct RelayProxyWithAuth {
     url: String,
-    auth: Option<String>, // Base64 encoded "username:password"
-    domains: Vec<String>,  // Domain patterns in NO_PROXY format
+    /// Base64 encoded "Basic {credentials}" header value
+    auth: Option<String>,
+    /// Domain patterns in NO_PROXY format for routing decisions
+    domains: Vec<String>,
 }
 
 impl ForwardProxy {
+    /// Creates a new forward proxy with basic timeout configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `connect_timeout_secs` - Timeout for establishing connections
+    /// * `idle_timeout_secs` - Idle timeout for pooled connections
+    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections
     pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Self {
         Self {
-            client: Client::builder()
-                .pool_max_idle_per_host(10)
-                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
-                .build(HttpsConnector::new()),
             connect_timeout: Duration::from_secs(connect_timeout_secs),
             idle_timeout: Duration::from_secs(idle_timeout_secs),
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
@@ -55,6 +72,15 @@ impl ForwardProxy {
         }
     }
 
+    /// Creates a new forward proxy with connection pool configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `connect_timeout_secs` - Timeout for establishing connections
+    /// * `idle_timeout_secs` - Idle timeout for pooled connections
+    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections
+    /// * `connection_pool_enabled` - Whether to enable connection pooling
+    /// * `pool_max_idle_per_host` - Maximum idle connections per host
     pub fn new_with_pool_config(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
@@ -63,10 +89,6 @@ impl ForwardProxy {
         pool_max_idle_per_host: usize,
     ) -> Self {
         Self {
-            client: Client::builder()
-                .pool_max_idle_per_host(pool_max_idle_per_host)
-                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
-                .build(HttpsConnector::new()),
             connect_timeout: Duration::from_secs(connect_timeout_secs),
             idle_timeout: Duration::from_secs(idle_timeout_secs),
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
@@ -78,6 +100,17 @@ impl ForwardProxy {
         }
     }
 
+    /// Creates a forward proxy with relay proxy support (legacy single relay).
+    ///
+    /// This method is maintained for backward compatibility. For multiple relay proxies,
+    /// use `new_with_relay_proxies` instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `relay_proxy_url` - URL of the relay proxy server
+    /// * `relay_proxy_username` - Optional username for relay authentication
+    /// * `relay_proxy_password` - Optional password for relay authentication
+    /// * `relay_proxy_domain_suffixes` - Optional domain patterns for relay routing
     pub fn new_with_relay(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
@@ -113,6 +146,16 @@ impl ForwardProxy {
         )
     }
 
+    /// Creates a forward proxy with multiple relay proxy support.
+    ///
+    /// Supports routing different domains through different relay proxies based on
+    /// domain matching patterns.
+    ///
+    /// # Arguments
+    ///
+    /// * `relay_configs` - List of relay proxy configurations with routing rules
+    /// * `proxy_username` - Optional username for proxy authentication (client to this proxy)
+    /// * `proxy_password` - Optional password for proxy authentication (client to this proxy)
     pub fn new_with_relay_proxies(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
@@ -123,16 +166,7 @@ impl ForwardProxy {
         proxy_username: Option<String>,
         proxy_password: Option<String>,
     ) -> Self {
-        let client = if connection_pool_enabled {
-            Client::builder()
-                .pool_max_idle_per_host(pool_max_idle_per_host)
-                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
-                .build(HttpsConnector::new())
-        } else {
-            Client::builder()
-                .pool_max_idle_per_host(0)
-                .build(HttpsConnector::new())
-        };
+        // Client approach removed - using direct TCP connections for CONNECT requests
 
         // Convert RelayProxyConfig to RelayProxyWithAuth
         let relay_proxies: Vec<RelayProxyWithAuth> = relay_configs
@@ -155,7 +189,6 @@ impl ForwardProxy {
             .collect();
 
         Self {
-            client,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
             idle_timeout: Duration::from_secs(idle_timeout_secs),
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
@@ -199,7 +232,15 @@ impl ForwardProxy {
         let proxy_username = self.proxy_username;
         let proxy_password = self.proxy_password;
 
-        let make_svc = make_service_fn(move |_conn| {
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+
+        println!("HTTP forward proxy listening on: http://{}", addr);
+
+        loop {
+            let (stream, remote_addr) = listener.accept().await
+                .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+
             let connect_timeout = connect_timeout;
             let idle_timeout = idle_timeout;
             let max_connection_lifetime = max_connection_lifetime;
@@ -208,43 +249,185 @@ impl ForwardProxy {
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
             let proxy_password = proxy_password.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    let client = if connection_pool_enabled {
-                        Client::builder()
-                            .pool_max_idle_per_host(pool_max_idle_per_host)
-                            .pool_idle_timeout(idle_timeout)
-                            .build(HttpsConnector::new())
-                    } else {
-                        Client::builder()
-                            .pool_max_idle_per_host(0)
-                            .build(HttpsConnector::new())
-                    };
-                    let proxy = ForwardProxy {
-                        client,
-                        connect_timeout,
-                        idle_timeout,
-                        max_connection_lifetime,
-                        connection_pool_enabled,
-                        pool_max_idle_per_host,
-                        relay_proxies: relay_proxies.clone(),
-                        proxy_username: proxy_username.clone(),
-                        proxy_password: proxy_password.clone(),
-                    };
-                    async move {
-                        proxy.handle_request(req).await
+
+            tokio::spawn(async move {
+                // For CONNECT requests, we need to handle the tunnel manually
+                // Try to peek at the first line to check if it's CONNECT
+                let mut peek_buf = vec![0u8; 1024];
+
+                // Try to peek at the first line without consuming
+                match stream.peek(&mut peek_buf).await {
+                    Ok(n) if n > 0 => {
+                        let first_line = String::from_utf8_lossy(&peek_buf[..n]);
+                        if first_line.starts_with("CONNECT ") {
+                            // It's a CONNECT request, handle it manually at TCP level
+                            let _ = ForwardProxy::handle_connect_raw(
+                                stream,
+                                remote_addr,
+                                connect_timeout,
+                                idle_timeout,
+                                max_connection_lifetime,
+                                connection_pool_enabled,
+                                pool_max_idle_per_host,
+                                relay_proxies,
+                                proxy_username,
+                                proxy_password,
+                            ).await;
+                            return;
+                        }
                     }
-                }))
-            }
-        });
+                    _ => {
+                        // Can't peek or not enough data, treat as normal HTTP
+                    }
+                }
 
-        let server = Server::bind(&addr).serve(make_svc);
-        println!("HTTP forward proxy listening on: {}", addr);
-
-        if let Err(e) = server.await {
-            eprintln!("Server error: {}", e);
-            return Err(ProxyError::Hyper(e.to_string()));
+                // Not a CONNECT request, use normal HTTP handling
+                let io = TokioIo::new(stream);
+                if let Err(err) = ServerBuilder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let proxy = ForwardProxy {
+                                connect_timeout,
+                                idle_timeout,
+                                max_connection_lifetime,
+                                connection_pool_enabled,
+                                pool_max_idle_per_host,
+                                relay_proxies: relay_proxies.clone(),
+                                proxy_username: proxy_username.clone(),
+                                proxy_password: proxy_password.clone(),
+                            };
+                            async move {
+                                // Check if this is a CONNECT request
+                                if req.method() == Method::CONNECT {
+                                    proxy.handle_connect_tunnel(req).await
+                                } else {
+                                    proxy.handle_request(req).await
+                                }
+                            }
+                        })
+                    )
+                    .await
+                {
+                    eprintln!("Error serving connection: {}", err);
+                }
+            });
         }
+    }
+
+    /// Handles CONNECT requests at the raw TCP level.
+    ///
+    /// This bypasses hyper's HTTP handling to establish a direct TCP tunnel,
+    /// which is necessary for proper HTTPS proxy support through relay proxies.
+    async fn handle_connect_raw(
+        stream: TcpStream,
+        remote_addr: SocketAddr,
+        connect_timeout: Duration,
+        idle_timeout: Duration,
+        max_connection_lifetime: Duration,
+        connection_pool_enabled: bool,
+        pool_max_idle_per_host: usize,
+        relay_proxies: Vec<RelayProxyWithAuth>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Result<(), std::io::Error> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mut reader = BufReader::new(stream);
+        
+        // Read the CONNECT request line
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await?;
+        println!("CONNECT request: {}", request_line.trim());
+
+        // Parse the request
+        let parts: Vec<&str> = request_line.trim().split(' ').collect();
+        if parts.len() < 2 {
+            let error = "HTTP/1.1 400 Bad Request\r\n\r\n";
+            let mut stream = reader.into_inner();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, error.as_bytes()).await?;
+            return Ok(());
+        }
+
+        let target = parts[1].to_string();
+
+        // Parse target host and port
+        let (target_host, target_port) = if let Some(colon_pos) = target.rfind(':') {
+            let host = &target[..colon_pos];
+            let port_str = &target[colon_pos + 1..];
+            let port = port_str.parse::<u16>().unwrap_or(443);
+            (host.to_string(), port)
+        } else {
+            (target.clone(), 443)
+        };
+
+        // Read and discard headers until empty line
+        loop {
+            let mut header_line = String::new();
+            reader.read_line(&mut header_line).await?;
+            if header_line.trim().is_empty() || header_line == "\r\n" {
+                break;
+            }
+        }
+        
+        // Get the underlying stream back
+        let mut stream = reader.into_inner();
+
+        // Find relay proxy if configured
+        let proxy_config = ForwardProxy {
+            connect_timeout,
+            idle_timeout,
+            max_connection_lifetime,
+            connection_pool_enabled,
+            pool_max_idle_per_host,
+            relay_proxies,
+            proxy_username,
+            proxy_password,
+        };
+
+        let relay_proxy = proxy_config.find_relay_proxy_for_domain(&target_host);
+        let target_desc = if let Some(relay) = &relay_proxy {
+            format!("{} via relay {}", target, relay.url)
+        } else {
+            target.clone()
+        };
+
+        // Connect to target
+        let target_result = if let Some(relay) = relay_proxy {
+            println!("Connecting to {} via relay proxy", target_desc);
+            ForwardProxy::connect_via_relay(
+                &relay.url,
+                &relay.auth,
+                &target_host,
+                target_port,
+            ).await
+        } else {
+            println!("Direct connection to {}", target_desc);
+            TcpStream::connect(format!("{}:{}", target_host, target_port)).await
+        };
+
+        let target_stream = match target_result {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to connect to target: {}", e);
+                let error_response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+                stream.write_all(error_response.as_bytes()).await?;
+                return Err(e);
+            }
+        };
+
+        println!("Successfully connected to target, setting up tunnel");
+
+        // Send 200 OK to client
+        let ok_response = "HTTP/1.1 200 Connection established\r\nProxy-agent: Rust-Proxy/1.0\r\n\r\n";
+        stream.write_all(ok_response.as_bytes()).await
+            .map_err(|e| {
+                eprintln!("Failed to send 200 OK response: {}", e);
+                e
+            })?;
+
+        // Set up bidirectional tunnel
+        let _ = ForwardProxy::setup_tunnel(stream, target_stream, remote_addr, target_desc).await;
 
         Ok(())
     }
@@ -294,18 +477,8 @@ impl ForwardProxy {
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
                             let service = service_fn(move |req| {
-                                let client = if connection_pool_enabled {
-                                    Client::builder()
-                                        .pool_max_idle_per_host(pool_max_idle_per_host)
-                                        .pool_idle_timeout(idle_timeout)
-                                        .build(HttpsConnector::new())
-                                } else {
-                                    Client::builder()
-                                        .pool_max_idle_per_host(0)
-                                        .build(HttpsConnector::new())
-                                };
+                                // Client approach removed - using direct TCP connections for CONNECT requests
                                 let proxy = ForwardProxy {
-                                    client,
                                     connect_timeout,
                                     idle_timeout,
                                     max_connection_lifetime,
@@ -316,13 +489,18 @@ impl ForwardProxy {
                                     proxy_password: proxy_password.clone(),
                                 };
                                 async move {
-                                    proxy.handle_request(req).await
+                                    // Check if this is a CONNECT request
+                                    if req.method() == Method::CONNECT {
+                                        proxy.handle_connect_tunnel(req).await
+                                    } else {
+                                        proxy.handle_request(req).await
+                                    }
                                 }
                             });
 
-                            if let Err(e) = hyper::server::conn::Http::new()
-                                .http1_keep_alive(true)
-                                .serve_connection(tls_stream, service)
+                            if let Err(e) = ServerBuilder::new()
+                                .keep_alive(true)
+                                .serve_connection(TokioIo::new(tls_stream), service)
                                 .await
                             {
                                 eprintln!("Error serving HTTPS connection: {}", e);
@@ -337,7 +515,7 @@ impl ForwardProxy {
         }
     }
 
-    async fn handle_request(&self, req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    async fn handle_request(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
         match self.process_request(req).await {
             Ok(response) => Ok(response),
             Err(e) => {
@@ -351,7 +529,7 @@ impl ForwardProxy {
 
                 let mut response_builder = Response::builder()
                     .status(status)
-                    .body(Body::from(format!("Proxy Error: {}", e)))
+                    .body(Full::new(Bytes::from(format!("Proxy Error: {}", e))))
                     .unwrap();
 
                 // Add Proxy-Authenticate header for 401 responses
@@ -365,13 +543,16 @@ impl ForwardProxy {
         }
     }
 
-    async fn process_request(&self, mut req: Request<Body>) -> Result<Response<Body>, ProxyError> {
+    async fn process_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>, ProxyError> {
         // Verify authentication credentials
         self.verify_authentication(&req)?;
 
         // Handle CONNECT method for HTTPS
         if *req.method() == Method::CONNECT {
-            return self.handle_connect(req).await;
+            return match self.handle_connect_tunnel(req).await {
+                Ok(response) => Ok(response),
+                Err(_) => unreachable!(), // Infallible means this never happens
+            };
         }
 
         // Extract target URL from request
@@ -450,10 +631,11 @@ impl ForwardProxy {
                 .map_err(|e| ProxyError::Connection(format!("Failed to send header end: {}", e)))?;
             
             // Send body if present
-            let body_bytes = hyper::body::to_bytes(req.into_body()).await
+            let body_bytes = req.into_body().collect().await
                 .map_err(|e| ProxyError::Http(format!("Failed to read request body: {}", e)))?;
-            if !body_bytes.is_empty() {
-                stream.write_all(&body_bytes).await
+            let body_data = body_bytes.to_bytes();
+            if !body_data.is_empty() {
+                stream.write_all(&body_data).await
                     .map_err(|e| ProxyError::Connection(format!("Failed to send body: {}", e)))?;
             }
             
@@ -561,17 +743,11 @@ impl ForwardProxy {
                 *headers = response_headers;
             }
             
-            response.body(Body::from(body_bytes))
+            response.body(Full::new(Bytes::from(body_bytes)))
                 .map_err(|e| ProxyError::Http(format!("Failed to build response: {}", e)))?
         } else {
-            // Direct connection: reconstruct request normally
-            self.reconstruct_request(&mut req, &target_uri);
-
-            // Send request through direct connection using client
-            timeout(self.connect_timeout, self.client.request(req))
-                .await
-                .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
-                .map_err(|e| ProxyError::Http(e.to_string()))?
+            // Direct connection to target
+            self.forward_direct_http_request(req, &target_uri).await?
         };
 
         // Log successful response
@@ -580,45 +756,93 @@ impl ForwardProxy {
         Ok(response)
     }
 
-    async fn handle_connect(&self, req: Request<Body>) -> Result<Response<Body>, ProxyError> {
+    /// Forwards an HTTP request directly to the target server.
+    ///
+    /// This method handles direct HTTP proxy connections without going through a relay.
+    async fn forward_direct_http_request(
+        &self,
+        mut req: Request<Incoming>,
+        target_uri: &Uri,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+
+        // Build HTTP client
+        let client = Client::builder(TokioExecutor::new())
+            .build_http();
+
+        // Update request URI to absolute form for target
+        *req.uri_mut() = target_uri.clone();
+
+        // Remove proxy-specific headers
+        req.headers_mut().remove(PROXY_AUTHORIZATION);
+        req.headers_mut().remove("Proxy-Connection");
+
+        // Forward the request
+        let response = client.request(req).await
+            .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
+
+        // Convert response to Full<Bytes>
+        let (parts, body) = response.into_parts();
+        let body_bytes = body.collect().await
+            .map_err(|e| ProxyError::Http(format!("Failed to read response body: {}", e)))?;
+
+        Ok(Response::from_parts(parts, Full::new(body_bytes.to_bytes())))
+    }
+
+    async fn handle_connect_tunnel(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
         // Extract host and port from CONNECT request
-        let authority = req.uri().authority()
-            .ok_or_else(|| ProxyError::Config("Invalid CONNECT target".to_string()))?;
+        let authority = match req.uri().authority() {
+            Some(auth) => auth,
+            None => return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("Invalid CONNECT target")))
+                .unwrap()),
+        };
 
         let host = authority.host().to_string();
         let port = authority.port_u16().unwrap_or(443);
+
+        println!("Handling CONNECT request to {}:{}", host, port);
 
         // Find matching relay proxy for this domain
         let relay_proxy = self.find_relay_proxy_for_domain(&host);
 
         if let Some(relay) = &relay_proxy {
-            println!("CONNECT request to {}:{} via relay proxy {} (matched domain rule)", host, port, relay.url);
+            println!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
         } else {
-            println!("CONNECT request to {}:{} (direct connection)", host, port);
+            println!("Direct connection to {}:{}", host, port);
         }
 
-        // Spawn the upgrade and tunnel handling
+        // Spawn a task to handle the upgrade and tunnel
         tokio::spawn(async move {
+            // Wait for the connection to be upgraded
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
                     println!("Successfully upgraded connection for {}:{}", host, port);
                     
-                    // Connect to the target server (directly or via relay proxy)
+                    // Wrap upgraded connection with TokioIo for AsyncRead/AsyncWrite
+                    let upgraded_io = TokioIo::new(upgraded);
+                    
+                    // Connect to the target (directly or via relay)
                     let target_stream = if let Some(relay) = relay_proxy {
-                        // Connect via relay proxy
-                        match Self::connect_via_relay(&relay.url, &relay.auth, &host, port).await {
+                        match ForwardProxy::connect_via_relay(
+                            &relay.url,
+                            &relay.auth,
+                            &host,
+                            port
+                        ).await {
                             Ok(stream) => stream,
                             Err(e) => {
-                                eprintln!("Failed to connect via relay proxy to {}:{}: {}", host, port, e);
+                                eprintln!("Failed to connect via relay to {}:{}: {}", host, port, e);
                                 return;
                             }
                         }
                     } else {
-                        // Direct connection
                         match TcpStream::connect(format!("{}:{}", host, port)).await {
                             Ok(stream) => stream,
                             Err(e) => {
-                                eprintln!("Failed to connect to target {}:{}: {}", host, port, e);
+                                eprintln!("Failed to connect to {}:{}: {}", host, port, e);
                                 return;
                             }
                         }
@@ -626,20 +850,20 @@ impl ForwardProxy {
 
                     println!("Successfully connected to target {}:{}", host, port);
                     
-                    // Setup bidirectional tunnel
-                    let (mut client_read, mut client_write) = tokio::io::split(upgraded);
+                    // Set up bidirectional tunnel
+                    let (mut client_read, mut client_write) = tokio::io::split(upgraded_io);
                     let (mut target_read, mut target_write) = target_stream.into_split();
 
                     let client_to_target = async {
                         match tokio::io::copy(&mut client_read, &mut target_write).await {
-                            Ok(bytes) => println!("Client -> Target: {} bytes transferred for {}:{}", bytes, host, port),
+                            Ok(bytes) => println!("Client -> Target: {} bytes for {}:{}", bytes, host, port),
                             Err(e) => eprintln!("Error in client->target tunnel for {}:{}: {}", host, port, e),
                         }
                     };
 
                     let target_to_client = async {
                         match tokio::io::copy(&mut target_read, &mut client_write).await {
-                            Ok(bytes) => println!("Target -> Client: {} bytes transferred for {}:{}", bytes, host, port),
+                            Ok(bytes) => println!("Target -> Client: {} bytes for {}:{}", bytes, host, port),
                             Err(e) => eprintln!("Error in target->client tunnel for {}:{}: {}", host, port, e),
                         }
                     };
@@ -654,16 +878,57 @@ impl ForwardProxy {
             }
         });
 
-        // Return 200 Connection Established immediately
-        // The upgrade will happen after this response is sent
+        // Return 200 OK to signal that tunnel is being established
         Ok(Response::builder()
             .status(StatusCode::OK)
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .unwrap())
     }
 
-    // Find the first matching relay proxy for the given domain
-    // Returns None if no relay proxy matches (direct connection)
+    /// Sets up a bidirectional TCP tunnel between client and target.
+    ///
+    /// Copies data in both directions until one side closes the connection.
+    async fn setup_tunnel(
+        client_stream: TcpStream,
+        target_stream: TcpStream,
+        client_addr: SocketAddr,
+        target_desc: String,
+    ) -> Result<(), std::io::Error> {
+        println!("Setting up bidirectional tunnel between {} and {}", client_addr, target_desc);
+
+        let (client_read, client_write) = client_stream.into_split();
+        let (target_read, target_write) = target_stream.into_split();
+
+        // Use asyncRwLock or spawn tasks with owned halves
+        // Tunnel data from client to target
+        let c2t = tokio::spawn(async move {
+            let mut client_read = client_read;
+            let mut target_write = target_write;
+            if let Err(e) = tokio::io::copy(&mut client_read, &mut target_write).await {
+                eprintln!("Error copying client to target: {}", e);
+            }
+        });
+
+        // Tunnel data from target to client
+        let t2c = tokio::spawn(async move {
+            let mut target_read = target_read;
+            let mut client_write = client_write;
+            if let Err(e) = tokio::io::copy(&mut target_read, &mut client_write).await {
+                eprintln!("Error copying target to client: {}", e);
+            }
+        });
+
+        // Wait for both directions to complete
+        let _ = tokio::join!(c2t, t2c);
+
+        println!("Tunnel closed between {} and {}", client_addr, target_desc);
+        Ok(())
+    }
+
+    /// Finds the first matching relay proxy for the given domain.
+    ///
+    /// Returns `None` if no relay proxy matches (indicating direct connection).
+    /// Matches are based on NO_PROXY format patterns.
     fn find_relay_proxy_for_domain(&self, host: &str) -> Option<RelayProxyWithAuth> {
         for relay in &self.relay_proxies {
             // If no domains configured for this relay, it matches all domains
@@ -679,12 +944,15 @@ impl ForwardProxy {
         None
     }
 
-    // Check if a host matches any NO_PROXY format patterns
-    // NO_PROXY format supports:
-    // - "example.com" - matches example.com and *.example.com
-    // - ".example.com" - matches *.example.com only
-    // - "*.example.com" - matches *.example.com only
-    // - "subdomain.example.com" - matches subdomain.example.com exactly
+    /// Checks if a host matches any NO_PROXY format patterns.
+    ///
+    /// Supported NO_PROXY formats:
+    /// - `"example.com"` - matches example.com and *.example.com
+    /// - `".example.com"` - matches *.example.com only
+    /// - `"*.example.com"` - matches *.example.com only
+    /// - `"subdomain.example.com"` - matches subdomain.example.com exactly
+    ///
+    /// Matching is case-insensitive.
     fn matches_no_proxy_pattern(host: &str, patterns: &[String]) -> bool {
         let host_lower = host.to_lowercase();
         
@@ -720,7 +988,9 @@ impl ForwardProxy {
         self.find_relay_proxy_for_domain(host).is_some()
     }
 
-    // Helper function to connect via relay proxy
+    /// Connects to a target host through a relay proxy.
+    ///
+    /// Establishes a CONNECT tunnel through the relay proxy to the target destination.
     async fn connect_via_relay(
         relay_url: &str,
         relay_auth: &Option<String>,
@@ -770,7 +1040,7 @@ impl ForwardProxy {
         Ok(stream)
     }
 
-    fn extract_target_uri(&self, req: &Request<Body>) -> Result<Uri, ProxyError> {
+    fn extract_target_uri<B>(&self, req: &Request<B>) -> Result<Uri, ProxyError> {
         let original_uri = req.uri();
 
         // If URI is absolute (contains scheme and host), use it directly
@@ -800,7 +1070,7 @@ impl ForwardProxy {
     }
 
     /// Verify Basic Authentication credentials from Proxy-Authorization header
-    fn verify_authentication(&self, req: &Request<Body>) -> Result<(), ProxyError> {
+    fn verify_authentication(&self, req: &Request<Incoming>) -> Result<(), ProxyError> {
         // If no credentials are configured, allow all requests
         if self.proxy_username.is_none() && self.proxy_password.is_none() {
             return Ok(());
@@ -843,22 +1113,6 @@ impl ForwardProxy {
         }
     }
 
-    fn reconstruct_request(&self, req: &mut Request<Body>, target_uri: &Uri) {
-        // Update request URI to target
-        *req.uri_mut() = target_uri.clone();
-
-        // Remove hop-by-hop headers
-        let headers = req.headers_mut();
-        headers.remove(CONNECTION);
-        headers.remove("Proxy-Connection");
-        headers.remove("Keep-Alive");
-        headers.remove("Proxy-Authenticate");
-        headers.remove("Proxy-Authorization");
-        headers.remove("TE");
-        headers.remove("Trailers");
-        headers.remove("Transfer-Encoding");
-        headers.remove("Upgrade");
-    }
 }
 
 /// Create TLS server configuration from certificate and private key files
@@ -875,26 +1129,23 @@ fn create_tls_config(private_key_path: &str, cert_path: &str) -> Result<ServerCo
 
     // Load certificate chain
     let certs = rustls_pemfile::certs(&mut cert_file)
-        .map_err(|e| ProxyError::Config(format!("Failed to read certificate: {}", e)))?
         .into_iter()
-        .map(rustls::Certificate)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ProxyError::Config(format!("Failed to read certificate: {}", e)))?;
 
     // Load private key
-    let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut private_key_file)
-        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?
+    let keys = rustls_pemfile::pkcs8_private_keys(&mut private_key_file)
         .into_iter()
-        .map(rustls::PrivateKey)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?;
 
     if keys.is_empty() {
         return Err(ProxyError::Config("No valid private key found".to_string()));
     }
 
     let config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(certs, keys.into_iter().next().unwrap())
+        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap()))
         .map_err(|e| ProxyError::Config(format!("Failed to create TLS config: {}", e)))?;
 
     Ok(config)
@@ -904,6 +1155,7 @@ fn create_tls_config(private_key_path: &str, cert_path: &str) -> Result<ServerCo
 mod tests {
     use super::*;
     use hyper::{Method, Uri};
+    use http_body_util::Empty;
 
     #[test]
     fn test_target_uri_extraction() {
@@ -911,13 +1163,36 @@ mod tests {
 
         // Test absolute URI
         let absolute_uri: Uri = "http://example.com/path".parse().unwrap();
-        let mut req = Request::builder()
+        let req = Request::builder()
             .method(Method::GET)
             .uri(absolute_uri.clone())
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap();
 
         let extracted = proxy.extract_target_uri(&req).unwrap();
         assert_eq!(extracted, absolute_uri);
+    }
+
+    #[test]
+    fn test_no_proxy_pattern_matching() {
+        // Test exact domain match
+        assert!(ForwardProxy::matches_no_proxy_pattern("example.com", &["example.com".to_string()]));
+        
+        // Test subdomain match with plain domain
+        assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &["example.com".to_string()]));
+        
+        // Test wildcard pattern
+        assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &["*.example.com".to_string()]));
+        assert!(!ForwardProxy::matches_no_proxy_pattern("example.com", &["*.example.com".to_string()]));
+        
+        // Test dot prefix pattern
+        assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &[".example.com".to_string()]));
+        assert!(!ForwardProxy::matches_no_proxy_pattern("example.com", &[".example.com".to_string()]));
+        
+        // Test no match
+        assert!(!ForwardProxy::matches_no_proxy_pattern("other.com", &["example.com".to_string()]));
+        
+        // Test case insensitivity
+        assert!(ForwardProxy::matches_no_proxy_pattern("EXAMPLE.COM", &["example.com".to_string()]));
     }
 }

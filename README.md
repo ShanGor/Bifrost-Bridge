@@ -1,5 +1,4 @@
-# Rust Proxy Server
-
+# Bifrost Bridge
 A high-performance proxy server written in Rust that can function as both a forward proxy (正向代理) and reverse proxy (反向代理), combining capabilities of both Nginx and Squid.
 
 ## Features

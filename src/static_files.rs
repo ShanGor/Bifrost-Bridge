@@ -1,9 +1,11 @@
 use crate::error::ProxyError;
 use crate::config::{StaticFileConfig, ResolvedStaticMount};
-use hyper::{Body, Method, Response, StatusCode};
+use hyper::{Method, Response, StatusCode};
+use hyper::body::Incoming;
+use http_body_util::Full;
+use hyper::body::Bytes;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokio::fs::File;
 
 #[derive(Clone)]
 pub struct StaticFileHandler {
@@ -45,12 +47,12 @@ impl StaticFileHandler {
         })
     }
 
-    pub async fn handle_request(&self, req: &hyper::Request<Body>) -> Result<Response<Body>, ProxyError> {
+    pub async fn handle_request(&self, req: &hyper::Request<Incoming>) -> Result<Response<Full<Bytes>>, ProxyError> {
         if req.method() != &Method::GET && req.method() != &Method::HEAD {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .header("Allow", "GET, HEAD")
-                .body(Body::empty())
+                .body(Full::new(Bytes::new()))
                 .map_err(|e| ProxyError::Http(e.to_string()))?);
         }
 
@@ -116,7 +118,7 @@ impl StaticFileHandler {
         Ok(requested_path)
     }
 
-    async fn handle_spa_fallback_in_mount(&self, mount_info: &MountInfo, is_head: bool) -> Result<Response<Body>, ProxyError> {
+    async fn handle_spa_fallback_in_mount(&self, mount_info: &MountInfo, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
         let fallback_path = mount_info.root_path.join(&mount_info.resolved_mount.spa_fallback_file);
 
         // Check if fallback file exists
@@ -127,7 +129,7 @@ impl StaticFileHandler {
         self.handle_file(&fallback_path, is_head).await
     }
 
-    async fn handle_directory_in_mount(&self, mount_info: &MountInfo, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Body>, ProxyError> {
+    async fn handle_directory_in_mount(&self, mount_info: &MountInfo, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
         if !mount_info.resolved_mount.enable_directory_listing {
             // Try to serve index files for directories
             for index_file in &mount_info.resolved_mount.index_files {
@@ -148,7 +150,7 @@ impl StaticFileHandler {
         self.generate_directory_listing_in_mount(dir_path, request_path, is_head).await
     }
 
-    async fn generate_directory_listing_in_mount(&self, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Body>, ProxyError> {
+    async fn generate_directory_listing_in_mount(&self, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
         let mut entries = match fs::read_dir(dir_path) {
             Ok(entries) => entries,
             Err(_) => return Ok(self.not_found_response()),
@@ -215,9 +217,9 @@ impl StaticFileHandler {
 
         let content_length = html.len();
         let body = if is_head {
-            Body::empty()
+            Full::new(Bytes::new())
         } else {
-            Body::from(html)
+            Full::new(Bytes::from(html))
         };
 
         Ok(Response::builder()
@@ -231,7 +233,7 @@ impl StaticFileHandler {
     
     // resolve_file_path is replaced by resolve_file_path_in_mount for multi-mount support
 
-    async fn handle_file(&self, file_path: &PathBuf, is_head: bool) -> Result<Response<Body>, ProxyError> {
+    async fn handle_file(&self, file_path: &PathBuf, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
         let metadata = fs::metadata(file_path)
             .map_err(|_| ProxyError::NotFound(format!("File not found: {:?}", file_path)))?;
 
@@ -251,13 +253,12 @@ impl StaticFileHandler {
             .header("Cache-Control", "public, max-age=3600");
 
         let body = if is_head {
-            Body::empty()
+            Full::new(Bytes::new())
         } else {
-            let file = File::open(file_path).await
-                .map_err(|e| ProxyError::Config(format!("Cannot open file: {}", e)))?;
-
-            let stream = tokio_util::io::ReaderStream::new(file);
-            Body::wrap_stream(stream)
+            // Simplified approach: read file into memory for this migration
+            let contents = tokio::fs::read(file_path).await
+                .map_err(|e| ProxyError::Config(format!("Cannot read file: {}", e)))?;
+            Full::new(Bytes::from(contents))
         };
 
         response.body(body).map_err(|e| ProxyError::Http(e.to_string()))
@@ -268,11 +269,11 @@ impl StaticFileHandler {
     // handle_spa_fallback is replaced by handle_spa_fallback_in_mount for multi-mount support
 
     
-    fn not_found_response(&self) -> Response<Body> {
+    fn not_found_response(&self) -> Response<Full<Bytes>> {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Content-Type", "text/html; charset=utf-8")
-            .body(Body::from(
+            .body(Full::new(Bytes::from(
                 r#"<!DOCTYPE html>
 <html>
 <head><title>404 Not Found</title></head>
@@ -281,7 +282,7 @@ impl StaticFileHandler {
     <p>The requested resource was not found on this server.</p>
 </body>
 </html>"#
-            ))
+            )))
             .unwrap()
     }
 

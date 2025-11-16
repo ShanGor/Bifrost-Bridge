@@ -1,0 +1,19 @@
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:6666",
+  "max_connections": 1000,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "max_header_size": 16384,
+  "connection_pool_enabled": true,
+  "pool_max_idle_per_host": 10,
+  "relay_proxies": [
+    {
+      "relay_proxy_url": "http://127.0.0.1:7777",
+      "relay_proxy_username": "relayuser",
+      "relay_proxy_password": "relaypass",
+      "relay_proxy_domains": []
+    }
+  ]
+}

@@ -3,8 +3,12 @@ use crate::error::ProxyError;
 use crate::forward_proxy::ForwardProxy;
 use crate::reverse_proxy::ReverseProxy;
 use crate::static_files::StaticFileHandler;
-use hyper::{Body, Response, Server, StatusCode};
-use hyper::service::{make_service_fn, service_fn};
+use hyper::{Response, StatusCode};
+use hyper::body::Bytes;
+use hyper::service::service_fn;
+use hyper::server::conn::http1::Builder as ServerBuilder;
+use hyper_util::rt::TokioIo;
+use http_body_util::Full;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -33,26 +37,23 @@ fn create_tls_config(private_key_path: &str, cert_path: &str) -> Result<ServerCo
 
     // Load certificate chain
     let certs = rustls_pemfile::certs(&mut cert_file)
-        .map_err(|e| ProxyError::Config(format!("Failed to read certificate: {}", e)))?
         .into_iter()
-        .map(rustls::Certificate)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ProxyError::Config(format!("Failed to read certificate: {}", e)))?;
 
     // Load private key
-    let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut private_key_file)
-        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?
+    let keys = rustls_pemfile::pkcs8_private_keys(&mut private_key_file)
         .into_iter()
-        .map(rustls::PrivateKey)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?;
 
     if keys.is_empty() {
         return Err(ProxyError::Config("No valid private key found".to_string()));
     }
 
     let config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(certs, keys.into_iter().next().unwrap())
+        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap()))
         .map_err(|e| ProxyError::Config(format!("Failed to create TLS config: {}", e)))?;
 
     Ok(config)
@@ -228,16 +229,16 @@ impl Proxy for StaticFileProxyAdapter {
                                                 Err(_) => {
                                                     Ok::<_, Infallible>(Response::builder()
                                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                        .body(Body::from("Internal Server Error"))
+                                                        .body(Full::new(Bytes::from("Internal Server Error")))
                                                         .unwrap())
                                                 }
                                             }
                                         }
                                     });
 
-                                    if let Err(e) = hyper::server::conn::Http::new()
-                                        .http1_keep_alive(true)
-                                        .serve_connection(tls_stream, service)
+                                    if let Err(e) = ServerBuilder::new()
+                                        .keep_alive(true)
+                                        .serve_connection(TokioIo::new(tls_stream), service)
                                         .await
                                     {
                                         eprintln!("Error serving connection: {}", e);
@@ -252,36 +253,44 @@ impl Proxy for StaticFileProxyAdapter {
                 }
                 _ => {
                     // HTTP mode
-                    let make_svc = make_service_fn(move |_conn| {
-                        let handler = handler.clone();
-                        async {
-                            Ok::<_, Infallible>(service_fn(move |req| {
-                                let handler = handler.clone();
-                                async move {
-                                    match handler.handle_request(&req).await {
-                                        Ok(response) => Ok::<_, Infallible>(response),
-                                        Err(_) => {
-                                            Ok::<_, Infallible>(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .body(Body::from("Internal Server Error"))
-                                                .unwrap())
-                                        }
-                                    }
-                                }
-                            }))
-                        }
-                    });
-
-                    let server = Server::bind(&addr).serve(make_svc);
+                    let listener = tokio::net::TcpListener::bind(addr).await
+                        .map_err(|e| ProxyError::Hyper(e.to_string()))?;
                     println!("HTTP static file server listening on: http://{}", addr);
 
-                    if let Err(e) = server.await {
-                        eprintln!("Server error: {}", e);
-                        return Err(ProxyError::Hyper(e.to_string()));
+                    loop {
+                        let (stream, _) = listener.accept().await
+                            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+
+                        let handler = handler.clone();
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+
+                            if let Err(err) = ServerBuilder::new()
+                                .serve_connection(
+                                    io,
+                                    service_fn(move |req| {
+                                        let handler = handler.clone();
+                                        async move {
+                                            match handler.handle_request(&req).await {
+                                                Ok(response) => Ok::<_, Infallible>(response),
+                                                Err(_) => {
+                                                    Ok::<_, Infallible>(Response::builder()
+                                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                        .body(Full::new(Bytes::from("Internal Server Error")))
+                                                        .unwrap())
+                                                }
+                                            }
+                                        }
+                                    })
+                                )
+                                .await
+                            {
+                                eprintln!("Error serving connection: {}", err);
+                            }
+                        });
                     }
                 }
             }
-            Ok(())
         })
     }
 }

@@ -1,27 +1,30 @@
 [package]
-name = "proxy-server"
+name = "bifrost-bridge"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-hyper = { version = "0.14", features = ["full"] }
-hyper-tls = "0.5"
-rustls = "0.21"
-tokio-rustls = "0.24"
-async-trait = "0.1"
-clap = { version = "4.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-thiserror = "1.0"
-log = "0.4"
-env_logger = "0.10"
-url = "2.3"
-futures = "0.3"
-bytes = "1.4"
-tokio-util = { version = "0.7", features = ["io"] }
-percent-encoding = "2.2"
-httpdate = "1.0"
-rustls-pemfile = "1.0"
-base64 = "0.21"
+tokio = { version = "1.48.0", features = ["full"] }
+hyper = { version = "1.8.1", features = ["full"] }
+hyper-tls = "0.6.0"
+rustls = "0.23.35"
+tokio-rustls = "0.26.4"
+async-trait = "0.1.89"
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+log = "0.4.28"
+env_logger = "0.11.8"
+url = "2.5.7"
+futures = "0.3.31"
+bytes = "1.11.0"
+tokio-util = { version = "0.7.17", features = ["io"] }
+hyper-util = { version = "0.1.18", features = ["full"] }
+http-body-util = "0.1.2"
+percent-encoding = "2.3.2"
+httpdate = "1.0.3"
+rustls-pemfile = "2.2.0"
+base64 = "0.22.1"
+http = "1.3.1"

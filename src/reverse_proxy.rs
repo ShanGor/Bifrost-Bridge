@@ -1,9 +1,15 @@
 use crate::error::ProxyError;
-use hyper::{Body, Client, Request, Response, Server, StatusCode, Uri};
-use hyper::client::HttpConnector;
+use hyper::{Request, Response, StatusCode, Uri};
+use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use http::response::Parts;
+use hyper::client::conn::http1::Builder as ClientBuilder;
+use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::header::HOST;
 use hyper::header::HeaderName;
-use hyper::service::{make_service_fn, service_fn};
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 
 // Custom header names for X-Forwarded-* headers
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -11,7 +17,7 @@ static X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-prot
 static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use url::Url;
 
 /// Wrapper to store request data including client IP
@@ -21,7 +27,6 @@ struct RequestContext {
 }
 
 pub struct ReverseProxy {
-    client: Client<HttpConnector>,
     target_url: Url,
     connect_timeout: Duration,
     idle_timeout: Duration,
@@ -35,10 +40,6 @@ impl ReverseProxy {
             .map_err(|e| ProxyError::Url(e))?;
 
         Ok(Self {
-            client: Client::builder()
-                .pool_max_idle_per_host(10)
-                .pool_idle_timeout(Duration::from_secs(idle_timeout_secs))
-                .build_http(),
             target_url: url,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
             idle_timeout: Duration::from_secs(idle_timeout_secs),
@@ -53,66 +54,68 @@ impl ReverseProxy {
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
-        let target_url = self.target_url.clone();
-        let connect_timeout = self.connect_timeout;
-        let idle_timeout = self.idle_timeout;
-        let max_connection_lifetime = self.max_connection_lifetime;
-        let preserve_host = self.preserve_host;
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-        let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
-            let target_url = target_url.clone();
-            let connect_timeout = connect_timeout;
-            let idle_timeout = idle_timeout;
-            let max_connection_lifetime = max_connection_lifetime;
-            let preserve_host = preserve_host;
-
-            // Extract client IP from connection
-            let client_ip = Some(conn.remote_addr().ip().to_string());
-
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    let client = Client::builder()
-                        .pool_max_idle_per_host(10)
-                        .pool_idle_timeout(idle_timeout)
-                        .build_http();
-                    let proxy = ReverseProxy {
-                        client,
-                        target_url: target_url.clone(),
-                        connect_timeout,
-                        idle_timeout,
-                        max_connection_lifetime,
-                        preserve_host,
-                    };
-                    let context = RequestContext {
-                        client_ip: client_ip.clone(),
-                    };
-                    async move {
-                        proxy.handle_request_with_context(req, context).await
-                    }
-                }))
-            }
-        });
-
-        let server = Server::bind(&addr).serve(make_svc);
         println!("Reverse proxy listening on: {} -> {}", addr, self.target_url);
 
-        if let Err(e) = server.await {
-            eprintln!("Server error: {}", e);
-            return Err(ProxyError::Hyper(e.to_string()));
-        }
+        loop {
+            let (stream, remote_addr) = listener.accept().await
+                .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-        Ok(())
+            let target_url = self.target_url.clone();
+            let connect_timeout = self.connect_timeout;
+            let idle_timeout = self.idle_timeout;
+            let max_connection_lifetime = self.max_connection_lifetime;
+            let preserve_host = self.preserve_host;
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+
+                if let Err(err) = ServerBuilder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let target_url = target_url.clone();
+                            let connect_timeout = connect_timeout;
+                            let idle_timeout = idle_timeout;
+                            let max_connection_lifetime = max_connection_lifetime;
+                            let preserve_host = preserve_host;
+                            let client_ip = Some(remote_addr.ip().to_string());
+
+                            let context = RequestContext {
+                                client_ip: client_ip.clone(),
+                            };
+
+                            async move {
+                                let proxy = ReverseProxy {
+                                    target_url: target_url.clone(),
+                                    connect_timeout,
+                                    idle_timeout,
+                                    max_connection_lifetime,
+                                    preserve_host,
+                                };
+                                proxy.handle_request_with_context(req, context).await
+                            }
+                        })
+                    )
+                    .await
+                {
+                    eprintln!("Error serving connection: {}", err);
+                }
+            });
+        }
     }
 
   
-    async fn handle_request_with_context(&self, req: Request<Body>, context: RequestContext) -> Result<Response<Body>, Infallible> {
+    async fn handle_request_with_context(&self, req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, Infallible> {
         match self.process_request_with_context(req, context).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 eprintln!("Proxy error: {}", e);
                 let error_response = Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(format!("Proxy Error: {}", e)))
+                    .body(Full::new(Bytes::from(format!("Proxy Error: {}", e))))
                     .unwrap();
                 Ok(error_response)
             }
@@ -120,26 +123,65 @@ impl ReverseProxy {
     }
 
   
-    async fn process_request_with_context(&self, mut req: Request<Body>, context: RequestContext) -> Result<Response<Body>, ProxyError> {
+    async fn process_request_with_context(&self, mut req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, ProxyError> {
         // Construct target URL
         let target_uri = self.build_target_uri(&req)?;
 
         // Modify request for reverse proxy with context
         self.modify_request_with_context(&mut req, &target_uri, context);
 
-        // Send request with timeout
-        let response = timeout(self.connect_timeout, self.client.request(req))
+        // Extract host and port from target URI
+        let authority = target_uri.authority()
+            .ok_or_else(|| ProxyError::Config("Invalid target URI".to_string()))?;
+
+        let host = authority.host();
+        let port = authority.port_u16().unwrap_or(80);
+
+        // Connect to target server
+        let stream = tokio::time::timeout(
+            self.connect_timeout,
+            tokio::net::TcpStream::connect((host, port))
+        )
+        .await
+        .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
+        .map_err(|e| ProxyError::Connection(e.to_string()))?;
+
+        let io = TokioIo::new(stream);
+
+        // Send request using HTTP/1.1 client
+        let (mut sender, conn) = ClientBuilder::new()
+            .handshake(io)
             .await
-            .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
             .map_err(|e| ProxyError::Http(e.to_string()))?;
 
-        // Modify response
-        let modified_response = self.modify_response(response);
+        // Spawn the connection task
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                eprintln!("Connection error: {}", err);
+            }
+        });
 
-        Ok(modified_response)
+        // Send request
+        let response = tokio::time::timeout(
+            self.connect_timeout,
+            sender.send_request(req)
+        )
+        .await
+        .map_err(|_| ProxyError::Connection("Request timeout".to_string()))?
+        .map_err(|e| ProxyError::Http(e.to_string()))?;
+
+        // Modify response and collect body
+        let (parts, body) = response.into_parts();
+        let body_bytes = body.collect().await
+            .map_err(|e| ProxyError::Http(format!("Failed to collect response body: {}", e)))?;
+
+        // Apply response modifications to parts
+        let modified_parts = self.modify_response_parts(parts);
+
+        Ok(Response::from_parts(modified_parts, Full::new(body_bytes.to_bytes())))
     }
 
-    fn build_target_uri(&self, req: &Request<Body>) -> Result<Uri, ProxyError> {
+    fn build_target_uri<B>(&self, req: &Request<B>) -> Result<Uri, ProxyError> {
         let path_and_query = req.uri().path_and_query()
             .ok_or_else(|| ProxyError::Config("Invalid URI path".to_string()))?;
 
@@ -155,7 +197,7 @@ impl ReverseProxy {
     }
 
     
-    fn modify_request_with_context(&self, req: &mut Request<Body>, target_uri: &Uri, context: RequestContext) {
+    fn modify_request_with_context<B>(&self, req: &mut Request<B>, target_uri: &Uri, context: RequestContext) {
         // Update request URI to target
         // Collect needed headers before mutable borrow
         let original_host = req.headers().get(HOST).cloned();
@@ -196,8 +238,8 @@ impl ReverseProxy {
         headers.remove("Upgrade");
     }
 
-    fn modify_response(&self, mut response: Response<Body>) -> Response<Body> {
-        let headers = response.headers_mut();
+    fn modify_response_parts(&self, mut parts: Parts) -> Parts {
+        let headers = &mut parts.headers;
 
         // Remove hop-by-hop headers from response
         headers.remove("Connection");
@@ -212,7 +254,7 @@ impl ReverseProxy {
         // Add server identification header
         headers.insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
 
-        response
+        parts
     }
 }
 
@@ -225,10 +267,10 @@ mod tests {
     fn test_target_uri_building() {
         let proxy = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300).unwrap();
 
-        let mut req = Request::builder()
+        let req = Request::builder()
             .method(Method::GET)
             .uri("/api/users")
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .unwrap();
 
         let target_uri = proxy.build_target_uri(&req).unwrap();
@@ -252,7 +294,7 @@ mod tests {
             .method(Method::GET)
             .uri("/api/test")
             .header("Host", "example.com")
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .unwrap();
 
         let target_uri: Uri = "http://backend.example.com/api/test".parse().unwrap();
@@ -290,7 +332,7 @@ mod tests {
             .method(Method::GET)
             .uri("/api/test")
             .header("Host", "example.com")
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()))
             .unwrap();
 
         let target_uri: Uri = "http://backend.example.com/api/test".parse().unwrap();

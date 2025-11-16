@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::info;
-use proxy_server::{config::{Config, ProxyMode}, proxy::ProxyFactory};
+use bifrost_bridge::{config::{Config, ProxyMode}, proxy::ProxyFactory};
 use std::path::Path;
 use tokio::signal;
 use tokio::sync::oneshot;
@@ -238,13 +238,13 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
     if args.static_dir.is_some() || !args.mount.is_empty() {
         let mut static_config = if let Some(static_dir) = &args.static_dir {
             // Single directory mode (backward compatibility)
-            let mut config = proxy_server::config::StaticFileConfig::single(static_dir.clone(), args.spa);
+            let mut config = bifrost_bridge::config::StaticFileConfig::single(static_dir.clone(), args.spa);
             config.worker_threads = args.worker_threads;
             config.custom_mime_types = std::collections::HashMap::new();
             config
         } else {
             // Multiple mounts mode
-            proxy_server::config::StaticFileConfig {
+            bifrost_bridge::config::StaticFileConfig {
                 mounts: Vec::new(),
                 enable_directory_listing: false,
                 index_files: vec!["index.html".to_string(), "index.htm".to_string()],

@@ -1,0 +1,29 @@
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:3128",
+  "max_connections": 100,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "connection_pool_enabled": true,
+  "relay_proxies": [
+    {
+      "relay_proxy_url": "http://127.0.0.1:3129",
+      "relay_proxy_username": "admin",
+      "relay_proxy_password": "secret123",
+      "relay_proxy_domains": [
+        "google.com",
+        ".google.com",
+        ".youtube.com"
+      ]
+    },
+    {
+      "relay_proxy_url": "http://127.0.0.1:3129",
+      "relay_proxy_username": "admin",
+      "relay_proxy_password": "secret123",
+      "relay_proxy_domains": [
+        "baidu.com"
+      ]
+    }
+  ]
+}

@@ -28,13 +28,14 @@ use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use base64::{Engine as _, engine::general_purpose};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 
 /// Forward proxy server implementation.
 ///
 /// Supports both direct connections and relay proxy routing based on domain patterns.
 pub struct ForwardProxy {
     connection_pool_enabled: bool,
+    max_connection_lifetime: Duration,
     relay_proxies: Vec<RelayProxyWithAuth>,
     proxy_username: Option<String>,
     proxy_password: Option<String>,
@@ -59,8 +60,8 @@ impl ForwardProxy {
     ///
     /// * `connect_timeout_secs` - Timeout for establishing connections
     /// * `idle_timeout_secs` - Idle timeout for pooled connections
-    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections (currently unused)
-    pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, _max_connection_lifetime_secs: u64) -> Self {
+    /// * `max_connection_lifetime_secs` - Maximum lifetime for any connection (enforced on CONNECT tunnels)
+    pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Self {
         let http_client = Self::build_http_client(
             connect_timeout_secs,
             idle_timeout_secs,
@@ -69,6 +70,7 @@ impl ForwardProxy {
         
         Self {
             connection_pool_enabled: true,
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             relay_proxies: Vec::new(),
             proxy_username: None,
             proxy_password: None,
@@ -82,12 +84,12 @@ impl ForwardProxy {
     ///
     /// * `connect_timeout_secs` - Timeout for establishing connections
     /// * `idle_timeout_secs` - Idle timeout for pooled connections
-    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections (currently unused)
+    /// * `max_connection_lifetime_secs` - Maximum lifetime for any connection (enforced on CONNECT tunnels)
     /// * `connection_pool_enabled` - Whether to enable connection pooling
     pub fn new_with_pool_config(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
-        _max_connection_lifetime_secs: u64,
+        max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
     ) -> Self {
         let http_client = Self::build_http_client(
@@ -98,6 +100,7 @@ impl ForwardProxy {
         
         Self {
             connection_pool_enabled,
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             relay_proxies: Vec::new(),
             proxy_username: None,
             proxy_password: None,
@@ -119,7 +122,7 @@ impl ForwardProxy {
     pub fn new_with_relay(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
-        _max_connection_lifetime_secs: u64,
+        max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
         relay_proxy_url: Option<String>,
         relay_proxy_username: Option<String>,
@@ -141,7 +144,7 @@ impl ForwardProxy {
         Self::new_with_relay_proxies(
             connect_timeout_secs,
             idle_timeout_secs,
-            _max_connection_lifetime_secs,
+            max_connection_lifetime_secs,
             connection_pool_enabled,
             relay_configs,
             None,
@@ -162,7 +165,7 @@ impl ForwardProxy {
     pub fn new_with_relay_proxies(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
-        _max_connection_lifetime_secs: u64,
+        max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
         relay_configs: Vec<RelayProxyConfig>,
         proxy_username: Option<String>,
@@ -198,6 +201,7 @@ impl ForwardProxy {
 
         Self {
             connection_pool_enabled,
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             relay_proxies,
             proxy_username,
             proxy_password,
@@ -226,6 +230,7 @@ impl ForwardProxy {
             info!("HTTP client: connection pooling ENABLED (idle_timeout: {}s)",
                   idle_timeout_secs);
             builder.pool_idle_timeout(Duration::from_secs(idle_timeout_secs));
+            builder.pool_timer(TokioTimer::new()); // Required for pool_idle_timeout to work
         } else {
             info!("HTTP client: connection pooling DISABLED (no-pool mode)");
             builder.pool_max_idle_per_host(0); // Disable pooling
@@ -428,8 +433,14 @@ impl ForwardProxy {
                 e
             })?;
 
-        // Set up bidirectional tunnel
-        let _ = ForwardProxy::setup_tunnel(stream, target_stream, _remote_addr, target_desc).await;
+        // Set up bidirectional tunnel with max lifetime enforcement
+        let _ = ForwardProxy::setup_tunnel_with_lifetime(
+            stream,
+            target_stream,
+            _remote_addr,
+            target_desc,
+            Duration::from_secs(300), // Static method uses default 300s
+        ).await;
 
         Ok(())
     }
@@ -792,6 +803,7 @@ impl ForwardProxy {
 
         // Find matching relay proxy for this domain
         let relay_proxy = self.find_relay_proxy_for_domain(&host);
+        let max_lifetime = self.max_connection_lifetime; // Capture max lifetime
 
         if let Some(relay) = &relay_proxy {
             info!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
@@ -835,7 +847,7 @@ impl ForwardProxy {
 
                     info!("Successfully connected to target {}:{}", host, port);
                     
-                    // Set up bidirectional tunnel
+                    // Set up bidirectional tunnel with max lifetime enforcement
                     let (mut client_read, mut client_write) = tokio::io::split(upgraded_io);
                     let (mut target_read, mut target_write) = target_stream.into_split();
 
@@ -853,9 +865,20 @@ impl ForwardProxy {
                         }
                     };
 
-                    // Run both directions concurrently
-                    tokio::join!(client_to_target, target_to_client);
-                    info!("TCP tunnel closed for {}:{}", host, port);
+                    // Run both directions concurrently with max lifetime timeout
+                    let tunnel_future = async {
+                        tokio::join!(client_to_target, target_to_client);
+                    };
+
+                    match tokio::time::timeout(max_lifetime, tunnel_future).await {
+                        Ok(_) => {
+                            info!("TCP tunnel closed normally for {}:{}", host, port);
+                        }
+                        Err(_) => {
+                            info!("TCP tunnel max lifetime ({:?}) reached for {}:{}, closing connection", 
+                                  max_lifetime, host, port);
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Failed to upgrade connection for {}:{}: {}", host, port, e);
@@ -873,6 +896,43 @@ impl ForwardProxy {
     /// Sets up a bidirectional TCP tunnel between client and target.
     ///
     /// Copies data in both directions until one side closes the connection.
+    /// Set up bidirectional tunnel with maximum connection lifetime enforcement.
+    ///
+    /// Similar to Netty's maximum connection lifetime feature, this ensures that
+    /// connections are automatically closed after the specified duration, regardless
+    /// of activity. This is important for load balancing and preventing stale connections.
+    async fn setup_tunnel_with_lifetime(
+        client_stream: TcpStream,
+        target_stream: TcpStream,
+        client_addr: SocketAddr,
+        target_desc: String,
+        max_lifetime: Duration,
+    ) -> Result<(), std::io::Error> {
+        info!("Setting up bidirectional tunnel between {} and {} (max_lifetime: {:?})", 
+              client_addr, target_desc, max_lifetime);
+
+        // Wrap the tunnel operation with a timeout
+        let tunnel_future = Self::setup_tunnel(
+            client_stream,
+            target_stream,
+            client_addr.clone(),
+            target_desc.clone(),
+        );
+
+        match tokio::time::timeout(max_lifetime, tunnel_future).await {
+            Ok(result) => {
+                info!("Tunnel closed normally between {} and {}", client_addr, target_desc);
+                result
+            }
+            Err(_) => {
+                info!("Tunnel max lifetime reached ({:?}), closing connection between {} and {}",
+                      max_lifetime, client_addr, target_desc);
+                Ok(())
+            }
+        }
+    }
+
+    /// Set up bidirectional tunnel without lifetime limit (internal method).
     async fn setup_tunnel(
         client_stream: TcpStream,
         target_stream: TcpStream,
@@ -1123,6 +1183,7 @@ impl ForwardProxy {
         // Note: HTTP client is passed in, not using instance's client
         let proxy = ForwardProxy {
             connection_pool_enabled: true,
+            max_connection_lifetime: Duration::from_secs(300), // Default value for temporary instance
             relay_proxies,
             proxy_username,
             proxy_password,
@@ -1139,6 +1200,7 @@ impl ForwardProxy {
         // For CONNECT, we don't need the HTTP client
         let proxy = ForwardProxy {
             connection_pool_enabled: true,
+            max_connection_lifetime: Duration::from_secs(300), // Default value for temporary instance
             relay_proxies,
             proxy_username: None,
             proxy_password: None,

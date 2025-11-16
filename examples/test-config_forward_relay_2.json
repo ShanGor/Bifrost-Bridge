@@ -1,0 +1,21 @@
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:3129",
+  "max_connections": 1000,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "connection_pool_enabled": true,
+  "relay_proxies": [
+    {
+      "relay_proxy_url": "http://localhost:4780",
+      "relay_proxy_domains": [
+        "google.com",
+        ".google.com",
+        ".youtube.com"
+      ]
+    }
+  ],
+  "proxy_username": "admin",
+  "proxy_password": "secret123"
+}

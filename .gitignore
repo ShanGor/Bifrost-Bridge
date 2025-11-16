@@ -1,6 +1,5 @@
 /examples/*.crt
 /examples/*.key
-/examples/test-*.json
 /.claude/
 /.idea/
 /target/

@@ -1129,23 +1129,21 @@ fn create_tls_config(private_key_path: &str, cert_path: &str) -> Result<ServerCo
 
     // Load certificate chain
     let certs = rustls_pemfile::certs(&mut cert_file)
-        .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ProxyError::Config(format!("Failed to read certificate: {}", e)))?;
 
-    // Load private key
-    let keys = rustls_pemfile::pkcs8_private_keys(&mut private_key_file)
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?;
-
-    if keys.is_empty() {
-        return Err(ProxyError::Config("No valid private key found".to_string()));
+    if certs.is_empty() {
+        return Err(ProxyError::Config("No valid certificate found".to_string()));
     }
+
+    // Try to load private key in different formats
+    let private_key = rustls_pemfile::private_key(&mut private_key_file)
+        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?
+        .ok_or_else(|| ProxyError::Config("No valid private key found".to_string()))?;
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap()))
+        .with_single_cert(certs, private_key)
         .map_err(|e| ProxyError::Config(format!("Failed to create TLS config: {}", e)))?;
 
     Ok(config)

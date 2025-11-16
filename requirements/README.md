@@ -15,18 +15,18 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R005 | Compilation Cleanup | ✅ Completed | 2025-11-15 | Fix all compilation errors and warnings |
 | R006 | Documentation Setup | ✅ Completed | 2025-11-15 | Create comprehensive documentation system with docs/ and requirements/ folders |
 | R007 | Zero-Copy Static File Serving | ✅ Completed | 2025-11-15 | Optimize static file serving with zero-copy mechanisms for better performance |
-| R009 | Custom Media Type Mappings | ✅ Completed | 2025-11-15 | Allow custom MIME type mappings like .mjs -> application/javascript |
-| R010 | HTTPS Support | ✅ Completed | 2025-11-15 | Add HTTPS server with private key and certificate file paths |
-| R011 | Configurable Connection Pooling | ✅ Completed | 2025-11-15 | Add pool/no-pool mode configuration for forward proxy connections |
-| R012 | Granular Timeout Configuration | ✅ Completed | 2025-11-15 | Replace single timeout with three distinct timeout types |
-| R013 | Basic Authentication for Forward Proxy | ✅ Completed | 2025-11-15 | Add Basic Authentication support for forward proxy clients |
-| R014 | Client IP Detection Fix | ✅ Completed | 2025-11-16 | Fix hardcoded 127.0.0.1 to extract actual client IP from connection |
+| R008 | Custom Media Type Mappings | ✅ Completed | 2025-11-15 | Allow custom MIME type mappings like .mjs -> application/javascript |
+| R009 | HTTPS Support | ✅ Completed | 2025-11-15 | Add HTTPS server with private key and certificate file paths |
+| R010 | Configurable Connection Pooling | ✅ Completed | 2025-11-15 | Add pool/no-pool mode configuration for forward proxy connections |
+| R011 | Granular Timeout Configuration | ✅ Completed | 2025-11-15 | Replace single timeout with three distinct timeout types |
+| R012 | Basic Authentication for Forward Proxy | ✅ Completed | 2025-11-15 | Add Basic Authentication support for forward proxy clients |
+| R013 | Client IP Detection Fix | ✅ Completed | 2025-11-16 | Fix hardcoded 127.0.0.1 to extract actual client IP from connection |
+| R014 | Configurable Thread Pool | ✅ Completed | 2025-11-15 | Add worker_threads configuration to control concurrency |
 
 ### 📝 **Pending Requirements**
 
 | ID | Requirement | Status | Date Raised | Description |
 |----|-------------|--------|------------|-------------|
-| R008 | Configurable Thread Pool | 📋 Pending | 2025-11-15 | Add worker_threads configuration to control concurrency |
 | R015 | Logging System | 📋 Pending | TBD | Add structured logging with configurable levels |
 | R016 | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
 | R017 | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
@@ -101,7 +101,7 @@ This folder tracks all requirements, feature requests, and issues raised for the
 - Better scalability for concurrent file serving
 - Streamed responses enable serving large files without loading entirely into memory
 
-### R009: Custom Media Type Mappings ✅
+### R008: Custom Media Type Mappings ✅
 **Description:** Allow custom MIME type mappings like .mjs -> application/javascript
 **Implementation:** Added `custom_mime_types` HashMap to StaticFileConfig with CLI and JSON configuration support
 **Technical Details:**
@@ -131,7 +131,7 @@ cargo run -- --mime-type mjs:application/javascript --mime-type wasm:application
 - Flexible mapping for custom file extensions
 - Extensible for project-specific MIME types
 
-### R010: HTTPS Support ✅
+### R009: HTTPS Support ✅
 **Description:** Add HTTPS server with private key and certificate file paths
 **Implementation:** Full HTTPS/TLS support using rustls library with PKCS#8 private key and PEM certificate format support
 **Technical Details:**
@@ -195,7 +195,7 @@ openssl req -new -x509 -key private-key.pem -out certificate.pem -days 365
 - Comprehensive certificate handling and validation
 - Full documentation with troubleshooting guide
 
-### R011: Configurable Connection Pooling ✅
+### R010: Configurable Connection Pooling ✅
 **Description:** Add pool/no-pool mode configuration for forward proxy connections
 **Implementation:** Full connection pooling configuration with HTTP client pool management
 **Technical Details:**
@@ -232,7 +232,7 @@ cargo run -- --mode forward --listen 127.0.0.1:8888 --no-connection-pool
 - **Configurable:** Tunable based on workload patterns and performance requirements
 - **Real-time Feedback:** Server startup messages indicate current pool configuration
 
-### R012: Granular Timeout Configuration ✅
+### R011: Granular Timeout Configuration ✅
 **Description:** Replace single timeout_secs with three distinct timeout types for better connection management
 **Implementation:** Added connect_timeout_secs, idle_timeout_secs, and max_connection_lifetime_secs
 **Technical Details:**
@@ -276,7 +276,7 @@ cargo run -- --mode forward --listen 127.0.0.1:8080 \
 - Improved load balancing capabilities
 - More predictable proxy behavior under different load conditions
 
-### R013: Basic Authentication for Forward Proxy ✅
+### R012: Basic Authentication for Forward Proxy ✅
 **Description:** Add Basic Authentication support for forward proxy clients to control access
 **Implementation:** Full Basic Authentication implementation with Proxy-Authorization header validation
 **Technical Details:**
@@ -334,7 +334,7 @@ Manual Proxy Configuration:
 - Works with all browsers and HTTP clients
 - Independent of upstream relay proxy authentication
 
-### R014: Client IP Detection Fix ✅
+### R013: Client IP Detection Fix ✅
 **Description:** Fix hardcoded "127.0.0.1" client IP in reverse proxy to extract actual client IP from connection
 **Implementation:** Extract client IP from hyper connection context and pass via RequestContext
 **Files Modified:** `src/reverse_proxy.rs`
@@ -356,6 +356,77 @@ Manual Proxy Configuration:
 - Fixes X-Forwarded-For header accuracy for backend servers
 - Maintains backward compatibility with existing code
 - All tests pass successfully
+
+### R014: Configurable Thread Pool ✅
+**Description:** Add worker_threads configuration to control concurrency
+**Implementation:** Allow configuration of the number of worker threads used by the proxy server
+**Technical Details:**
+- Added `worker_threads` field to main Config struct
+- Enhanced server initialization to use configured thread count
+- Added CLI argument `--worker-threads` for thread configuration
+- Defaults to number of CPU cores if not specified
+- Applied to both forward and reverse proxy modes
+**Usage Examples:**
+```bash
+# CLI
+cargo run -- --mode forward --listen 127.0.0.1:8080 --worker-threads 8
+
+# JSON Configuration
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:8080",
+  "worker_threads": 8
+}
+```
+**Benefits:**
+- Control resource usage based on deployment environment
+- Optimize performance for different hardware configurations
+- Better predictability in resource-constrained environments
+- Enables fine-tuning for specific workload patterns
+
+### R015: Logging System 📋
+**Description:** Add structured logging with configurable levels
+**Implementation:** Integrate a comprehensive logging system with multiple output formats and filtering capabilities
+**Technical Details:**
+- Integration with popular Rust logging ecosystem (tracing/log crates)
+- Support for multiple log levels (trace, debug, info, warn, error)
+- Configurable output formats (plain text, JSON)
+- Multiple output targets (stdout, files, syslog)
+- CLI argument `--log-level` for runtime log level configuration
+- JSON configuration support for advanced logging setups
+- Structured logging with context and metadata
+**Planned Usage Examples:**
+```bash
+# CLI
+cargo run -- --mode forward --listen 127.0.0.1:8080 --log-level debug
+
+# JSON Configuration
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:8080",
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "targets": [
+      {
+        "type": "file",
+        "path": "./logs/proxy.log",
+        "level": "debug"
+      },
+      {
+        "type": "stdout",
+        "level": "info"
+      }
+    ]
+  }
+}
+```
+**Benefits:**
+- Better observability and debugging capabilities
+- Production-ready logging infrastructure
+- Configurable verbosity for different environments
+- Structured logs enable easier parsing and analysis
+- Multiple output options for different deployment scenarios
 
 ---
 

@@ -7,6 +7,48 @@ use hyper::body::Bytes;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// HTML Templates - extracted as constants for maintainability and performance
+
+/// Template for 404 Not Found error page
+const HTML_404_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html>
+<head><title>404 Not Found</title></head>
+<body>
+    <h1>404 Not Found</h1>
+    <p>The requested resource was not found on this server.</p>
+</body>
+</html>"#;
+
+/// Template for directory listing page header
+const HTML_DIR_LISTING_HEADER: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Directory listing for {path}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; }}
+        h1 {{ color: #333; }}
+        ul {{ list-style: none; padding: 0; }}
+        li {{ padding: 8px 0; }}
+        a {{ text-decoration: none; color: #0066cc; }}
+        a:hover {{ text-decoration: underline; }}
+        .directory {{ font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <h1>Directory listing for {path}</h1>
+    <ul>"#;
+
+/// Template for directory listing page footer
+const HTML_DIR_LISTING_FOOTER: &str = r#"    </ul>
+</body>
+</html>"#;
+
+/// Template for parent directory link in directory listing
+const HTML_DIR_PARENT_LINK: &str = r#"        <li><a href="../">📁 ../</a></li>"#;
+
+/// Template for directory entry in directory listing
+const HTML_DIR_ENTRY_TEMPLATE: &str = r#"        <li class="{class}"><a href="{href}">{icon}</a></li>"#;
+
 #[derive(Clone)]
 pub struct StaticFileHandler {
     // Pre-computed mount information for faster lookup
@@ -79,10 +121,10 @@ impl StaticFileHandler {
         }
 
         if file_path.is_dir() {
-            return self.handle_directory_in_mount(&mount_info, &file_path, &relative_path, req.method() == &Method::HEAD).await;
+            return self.handle_directory_in_mount(mount_info, &file_path, &relative_path, req.method() == Method::HEAD).await;
         }
 
-        self.handle_file(&file_path, req.method() == &Method::HEAD).await
+        self.handle_file(&file_path, req.method() == Method::HEAD).await
     }
 
     fn find_mount_for_path(&self, path: &str) -> Option<(&MountInfo, String)> {
@@ -150,47 +192,29 @@ impl StaticFileHandler {
         self.generate_directory_listing_in_mount(dir_path, request_path, is_head).await
     }
 
-    async fn generate_directory_listing_in_mount(&self, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
-        let dir_path_clone = dir_path.clone();
+    async fn generate_directory_listing_in_mount(&self, dir_path: &Path, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
+        let dir_path_clone = dir_path.to_path_buf();
         let request_path_clone = request_path.to_string();
 
         // Use tokio::spawn_blocking for CPU-intensive directory operations
         let html = tokio::task::spawn_blocking(move || {
-            let mut entries = match fs::read_dir(&dir_path_clone) {
+            let entries = match fs::read_dir(&dir_path_clone) {
                 Ok(entries) => entries,
                 Err(_) => return String::new(), // Will trigger not_found_response
             };
 
-            let mut html = format!(
-                r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Directory listing for {}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; }}
-        h1 {{ color: #333; }}
-        ul {{ list-style: none; padding: 0; }}
-        li {{ padding: 8px 0; }}
-        a {{ text-decoration: none; color: #0066cc; }}
-        a:hover {{ text-decoration: underline; }}
-        .directory {{ font-weight: bold; }}
-    </style>
-</head>
-<body>
-    <h1>Directory listing for {}</h1>
-    <ul>"#,
-                request_path_clone, request_path_clone
-            );
+            // Start with header template
+            let mut html = HTML_DIR_LISTING_HEADER
+                .replace("{path}", &request_path_clone);
 
             // Add parent directory link if not at root
             if request_path_clone != "/" {
-                html.push_str(&format!(
-                    r#"        <li><a href="../">📁 ../</a></li>"#
-                ));
+                html.push_str(HTML_DIR_PARENT_LINK);
+                html.push('\n');
             }
 
             // List entries
-            while let Some(entry) = entries.next() {
+            for entry in entries {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => continue, // Skip problematic entries
@@ -206,21 +230,23 @@ impl StaticFileHandler {
 
                 let icon = if is_dir { "📁" } else { "📄" };
                 let class = if is_dir { "directory" } else { "file" };
-
-                html.push_str(&format!(
-                    r#"        <li class="{}"><a href="{}{}">{}</a></li>"#,
-                    class,
+                let href = format!(
+                    "{}{}",
                     file_name_str,
-                    if is_dir { "/" } else { "" },
-                    icon
-                ));
+                    if is_dir { "/" } else { "" }
+                );
+
+                let entry_html = HTML_DIR_ENTRY_TEMPLATE
+                    .replace("{class}", class)
+                    .replace("{href}", &href)
+                    .replace("{icon}", icon);
+                
+                html.push_str(&entry_html);
+                html.push('\n');
             }
 
-            html.push_str(
-                r#"    </ul>
-</body>
-</html>"#
-            );
+            // Add footer
+            html.push_str(HTML_DIR_LISTING_FOOTER);
 
             html
         }).await;
@@ -291,32 +317,22 @@ impl StaticFileHandler {
     // handle_spa_fallback is replaced by handle_spa_fallback_in_mount for multi-mount support
 
     
+    /// Generates a 404 Not Found response
     fn not_found_response(&self) -> Response<Full<Bytes>> {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Content-Type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from(
-                r#"<!DOCTYPE html>
-<html>
-<head><title>404 Not Found</title></head>
-<body>
-    <h1>404 Not Found</h1>
-    <p>The requested resource was not found on this server.</p>
-</body>
-</html>"#
-            )))
+            .body(Full::new(Bytes::from(HTML_404_TEMPLATE)))
             .unwrap()
     }
 
     fn is_asset_file(&self, path: &str) -> bool {
         // Check if the path has an asset file extension
         if let Some(extension) = Path::new(path).extension().and_then(|ext| ext.to_str()) {
-            match extension.to_lowercase().as_str() {
+            matches!(extension.to_lowercase().as_str(), 
                 "js" | "css" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" |
                 "woff" | "woff2" | "ttf" | "eot" | "pdf" | "zip" | "json" | "xml" |
-                "mp4" | "webm" | "mp3" | "wav" => true,
-                _ => false,
-            }
+                "mp4" | "webm" | "mp3" | "wav")
         } else {
             false
         }
@@ -326,49 +342,24 @@ impl StaticFileHandler {
         if let Some(extension) = file_path.extension().and_then(|ext| ext.to_str()) {
             let ext_lower = extension.to_lowercase();
 
-            // Check custom MIME types first
+            // Check custom MIME types first - allows overriding mime_guess
             if let Some(custom_mime) = custom_mime_types.get(&ext_lower) {
                 return custom_mime.clone();
             }
+        }
 
-            // Default MIME type mappings
-            match ext_lower.as_str() {
-                "html" => "text/html; charset=utf-8".to_string(),
-                "htm" => "text/html; charset=utf-8".to_string(),
-                "css" => "text/css; charset=utf-8".to_string(),
-                "js" => "application/javascript; charset=utf-8".to_string(),
-                "mjs" => "application/javascript; charset=utf-8".to_string(), // ES modules
-                "json" => "application/json; charset=utf-8".to_string(),
-                "xml" => "application/xml; charset=utf-8".to_string(),
-                "txt" => "text/plain; charset=utf-8".to_string(),
-                "md" => "text/markdown; charset=utf-8".to_string(),
-                "jpg" => "image/jpeg".to_string(),
-                "jpeg" => "image/jpeg".to_string(),
-                "png" => "image/png".to_string(),
-                "gif" => "image/gif".to_string(),
-                "svg" => "image/svg+xml".to_string(),
-                "webp" => "image/webp".to_string(),
-                "pdf" => "application/pdf".to_string(),
-                "zip" => "application/zip".to_string(),
-                "gz" => "application/gzip".to_string(),
-                "tar" => "application/x-tar".to_string(),
-                "mp4" => "video/mp4".to_string(),
-                "webm" => "video/webm".to_string(),
-                "mp3" => "audio/mpeg".to_string(),
-                "wav" => "audio/wav".to_string(),
-                "ico" => "image/x-icon".to_string(),
-                "woff" => "font/woff".to_string(),
-                "woff2" => "font/woff2".to_string(),
-                "ttf" => "font/ttf".to_string(),
-                "eot" => "application/vnd.ms-fontobject".to_string(),
-                "ts" => "application/typescript; charset=utf-8".to_string(), // TypeScript
-                "tsx" => "text/typescript-jsx; charset=utf-8".to_string(), // TSX
-                "jsx" => "text/jsx; charset=utf-8".to_string(), // JSX
-                "wasm" => "application/wasm".to_string(),
-                _ => "application/octet-stream".to_string(),
-            }
+        // Use mime_guess for comprehensive MIME type detection
+        let mime = mime_guess::from_path(file_path)
+            .first_or_octet_stream();
+
+        // Add charset for text-based MIME types
+        let mime_str = mime.as_ref();
+        if mime_str.starts_with("text/") || 
+           mime_str == "application/json" ||
+           mime_str == "application/xml" {
+            format!("{}; charset=utf-8", mime_str)
         } else {
-            "application/octet-stream".to_string()
+            mime_str.to_string()
         }
     }
 }
@@ -384,9 +375,15 @@ mod tests {
         let custom_mime_types = std::collections::HashMap::new();
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.html"), &custom_mime_types), "text/html; charset=utf-8");
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.css"), &custom_mime_types), "text/css; charset=utf-8");
-        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.js"), &custom_mime_types), "application/javascript; charset=utf-8");
+        // mime_guess returns "text/javascript" which is the modern standard (RFC 9239)
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.js"), &custom_mime_types), "text/javascript; charset=utf-8");
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.png"), &custom_mime_types), "image/png");
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.unknown"), &custom_mime_types), "application/octet-stream");
+        
+        // Test custom MIME type override
+        let mut custom_mime_types = std::collections::HashMap::new();
+        custom_mime_types.insert("custom".to_string(), "application/x-custom".to_string());
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.custom"), &custom_mime_types), "application/x-custom");
     }
 
     #[test]

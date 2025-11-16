@@ -6,11 +6,12 @@ A high-performance proxy server written in Rust that can function as both a forw
 - **Forward Proxy**: Acts as a forward proxy similar to Squid
 - **Reverse Proxy**: Acts as a reverse proxy similar to Nginx
 - **Multiple Static Roots**: Serve static files from multiple directories at different URL paths
-- **High Performance**: Built on Tokio and Hyper for async I/O
+- **High Performance**: Built on Tokio and Hyper for async I/O with configurable worker threads
 - **Configurable**: Supports both command-line arguments and configuration files
 - **Connection Pooling**: Efficient connection reuse with configurable pool settings
 - **Granular Timeout Control**: Three distinct timeout types (connect, idle, lifetime)
 - **SPA Support**: Single Page Application fallback with proper MIME type handling
+- **Optimized Static File Serving**: Uses Tokio worker threads for CPU-intensive operations (directory listings, MIME type detection)
 - **Graceful Shutdown**: Clean shutdown with Ctrl+C handling
 - **Logging**: Comprehensive logging with env_logger
 
@@ -58,17 +59,22 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./public
 # Serve static files with SPA mode
 cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./dist --spa
 
+# Serve static files with configurable worker threads for better performance
+cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./public --worker-threads 8
+
 # Serve static files from multiple directories
 cargo run -- --mode reverse --listen 127.0.0.1:8080 \
   --mount "/app:/path/to/app/dist" \
   --mount "/api:/path/to/api/docs" \
-  --mount "/assets:/path/to/static/assets"
+  --mount "/assets:/path/to/static/assets" \
+  --worker-threads 4
 
 # Mix single directory with multiple mounts
 cargo run -- --mode reverse --listen 127.0.0.1:8080 \
   --static-dir ./main-app --spa \
   --mount "/admin:/path/to/admin-panel" \
-  --mount "/docs:/path/to/documentation"
+  --mount "/docs:/path/to/documentation" \
+  --worker-threads 6
 ```
 
 ### Multiple Static Roots
@@ -108,7 +114,7 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 \
 
 #### Multiple Mounts JSON Configuration
 
-**Multi-Mount Example:**
+**Multi-Mount Example with Threading:**
 ```json
 {
   "mode": "Reverse",
@@ -141,10 +147,10 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 \
     "enable_directory_listing": false,
     "index_files": ["index.html", "index.htm"],
     "spa_mode": false,
-    "spa_fallback_file": "index.html"
+    "spa_fallback_file": "index.html",
+    "worker_threads": 8
   }
 }
-```
 
 ### Configuration File
 
@@ -176,7 +182,7 @@ Create a JSON configuration file:
 }
 ```
 
-#### SPA Example (spa.json)
+#### SPA Example with Threading (spa.json)
 ```json
 {
   "mode": "Reverse",
@@ -196,7 +202,8 @@ Create a JSON configuration file:
     "enable_directory_listing": false,
     "index_files": ["index.html", "index.htm"],
     "spa_mode": true,
-    "spa_fallback_file": "index.html"
+    "spa_fallback_file": "index.html",
+    "worker_threads": 4
   }
 }
 ```
@@ -352,6 +359,55 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./dist --spa --
 - `--static-dir <DIR>`: Serve static files from this directory
 - `--spa`: Enable SPA mode (fallback to index file for non-found routes)
 - `--spa-fallback <FILE>`: Custom SPA fallback file name (default: `index.html`)
+- `--worker-threads <NUM>`: Number of worker threads for static file serving (default: CPU cores)
+
+## Performance and Threading
+
+The proxy server uses Tokio's runtime with configurable worker threads for optimal performance when serving static files.
+
+### Worker Thread Configuration
+
+**Command Line:**
+```bash
+# Use 8 worker threads for static file operations
+cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./public --worker-threads 8
+
+# Use auto-detected CPU core count
+cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./public
+```
+
+**Configuration File:**
+```json
+{
+  "static_files": {
+    "worker_threads": 8,
+    "mounts": [...]
+  }
+}
+```
+
+### Threading Implementation
+
+The server uses **Tokio worker threads** for CPU-intensive static file operations:
+
+- **Directory Listings**: CPU-intensive directory traversal and HTML generation run in `tokio::spawn_blocking`
+- **MIME Type Detection**: File extension processing and MIME type lookup use blocking threads
+- **File Operations**: File metadata and content reading remain async for I/O efficiency
+- **Non-blocking**: Main async runtime stays responsive while CPU work happens in dedicated threads
+
+### Performance Benefits
+
+- **High Concurrency**: Multiple requests processed simultaneously without blocking
+- **Optimized Resource Usage**: Tokio efficiently schedules CPU work across worker threads
+- **Scalability**: Configurable thread count adapts to different hardware capabilities
+- **Responsive**: Async operations continue while CPU-intensive work runs in background
+
+### Recommended Settings
+
+- **Small servers**: `--worker-threads 2-4`
+- **Medium servers**: `--worker-threads 4-8`
+- **Large servers**: `--worker-threads 8-16`
+- **Default**: Auto-detect CPU core count
 
 ## Architecture
 
@@ -365,7 +421,8 @@ src/
 ├── error.rs         # Error handling
 ├── proxy.rs         # Proxy factory and traits
 ├── forward_proxy.rs # Forward proxy implementation
-└── reverse_proxy.rs # Reverse proxy implementation
+├── reverse_proxy.rs # Reverse proxy implementation
+└── static_files.rs  # Static file serving with Tokio threading
 ```
 
 ### Key Components
@@ -373,16 +430,19 @@ src/
 1. **ProxyFactory**: Creates appropriate proxy instances based on configuration
 2. **ForwardProxy**: Implements forward proxy functionality
 3. **ReverseProxy**: Implements reverse proxy functionality
-4. **Config**: Handles configuration parsing and validation
+4. **StaticFileHandler**: Handles static file serving with Tokio threading optimization
+5. **Config**: Handles configuration parsing and validation
 
 ## Performance Considerations
 
-- Built on Tokio for async I/O
+- Built on Tokio for async I/O with configurable worker threads
+- Optimized static file serving with CPU-intensive operations in dedicated blocking threads
 - Connection pooling for backend requests with configurable pool settings
 - Idle timeout for efficient pool management
 - Maximum connection lifetime prevents stale connections
 - Configurable connection limits
 - Granular timeout handling (connect, idle, lifetime) to prevent hanging requests
+- Thread pool configuration for static file operations (directory listings, MIME type detection)
 
 ## Error Handling
 

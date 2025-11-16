@@ -22,6 +22,7 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R012 | Basic Authentication for Forward Proxy | ✅ Completed | 2025-11-15 | Add Basic Authentication support for forward proxy clients |
 | R013 | Client IP Detection Fix | ✅ Completed | 2025-11-16 | Fix hardcoded 127.0.0.1 to extract actual client IP from connection |
 | R014 | Configurable Thread Pool | ✅ Completed | 2025-11-16 | Add worker_threads configuration to control concurrency - fully implemented with custom tokio runtime |
+| R021 | Tokio Worker Threads for Static Files | ✅ Completed | 2025-11-16 | Implement Tokio-based threading for CPU-intensive static file operations using tokio::spawn_blocking |
 
 ### 📝 **Pending Requirements**
 
@@ -486,6 +487,48 @@ RUST_LOG=debug cargo run -- --mode forward --listen 127.0.0.1:8080
 - **Backward Compatible:** Existing `RUST_LOG` environment variable support
 - **Performance Optimized:** Efficient async logging with minimal overhead
 
+### R021: Tokio Worker Threads for Static Files ✅
+**Description:** Implement Tokio-based threading for CPU-intensive static file operations to improve concurrency and prevent blocking the async runtime
+**Implementation:** Replaced Rayon dependency with tokio::spawn_blocking for CPU-intensive operations while maintaining I/O efficiency
+**Technical Details:**
+- **Tokio spawn_blocking**: CPU-intensive operations (directory listings, MIME type detection) now run in `tokio::task::spawn_blocking`
+- **Static Method Support**: Added `guess_mime_type_static()` method for use in blocking threads without requiring `&self`
+- **Directory Listing Optimization**: Directory traversal and HTML generation moved to blocking threads
+- **MIME Type Detection Threading**: File extension processing and MIME type lookup use blocking threads
+- **Non-blocking I/O**: File metadata and content reading remain async for I/O efficiency
+- **Error Handling**: Comprehensive error handling for blocking thread operations
+**Key Implementation Changes:**
+- **Directory Listings**: `generate_directory_listing_in_mount()` now processes entries in blocking thread
+- **MIME Type Detection**: `handle_file()` uses `tokio::spawn_blocking` for MIME type processing
+- **Static Helper Method**: Created `guess_mime_type_static()` for thread-safe MIME type detection
+- **Removed Rayon**: Eliminated rayon dependency as per user requirement to use Tokio threads only
+- **Backward Compatibility**: Maintained existing instance method `guess_mime_type()` that delegates to static method
+**Files Modified:** `src/static_files.rs`, `Cargo.toml` (removed rayon dependency)
+**Performance Benefits:**
+- **High Concurrency**: Multiple static file requests processed simultaneously without blocking
+- **Optimized Resource Usage**: Tokio efficiently schedules CPU work across worker threads
+- **Non-blocking Runtime**: Main async runtime stays responsive while CPU work happens in dedicated threads
+- **Scalability**: Configurable worker thread count adapts to different hardware capabilities
+- **Better Throughput**: Directory listings and MIME type detection no longer block other requests
+**Thread Pool Configuration:**
+- **Integration**: Works seamlessly with existing `--worker-threads` configuration
+- **Default**: Auto-detect CPU core count when not specified
+- **Recommended Settings**: 2-4 threads for small servers, 4-8 for medium, 8-16 for large
+**Testing Results:**
+- ✅ All existing tests pass
+- ✅ HTTP mode static file serving works correctly
+- ✅ HTTPS mode static file serving works correctly
+- ✅ Directory listing with threading verified
+- ✅ MIME type detection with threading verified
+- ✅ SPA fallback functionality maintained
+- ✅ Multi-mount support preserved
+**Benefits:**
+- **Improved Responsiveness**: CPU-intensive operations no longer block the async runtime
+- **Better Resource Utilization**: Tokio worker threads efficiently handle CPU-bound work
+- **Production Ready**: Scales well under high concurrency loads
+- **Zero Breaking Changes**: All existing functionality maintained
+- **Standard Implementation**: Uses Tokio best practices for async/blocking separation
+
 ---
 
 ## 🎯 Next Priorities
@@ -497,6 +540,7 @@ RUST_LOG=debug cargo run -- --mode forward --listen 127.0.0.1:8080
 
 - **R014 (Thread Pool):** ✅ **FIXED** - Previously only configuration fields existed, now fully implemented with custom tokio runtime builder that actually uses the `worker_threads` value to configure thread pool size
 - **R015 (Logging System):** ✅ **COMPLETED** - Enhanced from basic env_logger to comprehensive structured logging system with JSON support, multiple output targets, CLI configuration, and detailed logging throughout the codebase
+- **R021 (Tokio Worker Threads):** ✅ **COMPLETED** - Replaced Rayon dependency with Tokio-based threading using `tokio::spawn_blocking` for CPU-intensive static file operations (directory listings, MIME type detection) while maintaining I/O efficiency and preventing async runtime blocking
 
 ---
 

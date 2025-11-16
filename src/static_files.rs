@@ -151,13 +151,18 @@ impl StaticFileHandler {
     }
 
     async fn generate_directory_listing_in_mount(&self, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
-        let mut entries = match fs::read_dir(dir_path) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(self.not_found_response()),
-        };
+        let dir_path_clone = dir_path.clone();
+        let request_path_clone = request_path.to_string();
 
-        let mut html = format!(
-            r#"<!DOCTYPE html>
+        // Use tokio::spawn_blocking for CPU-intensive directory operations
+        let html = tokio::task::spawn_blocking(move || {
+            let mut entries = match fs::read_dir(&dir_path_clone) {
+                Ok(entries) => entries,
+                Err(_) => return String::new(), // Will trigger not_found_response
+            };
+
+            let mut html = format!(
+                r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Directory listing for {}</title>
@@ -174,46 +179,57 @@ impl StaticFileHandler {
 <body>
     <h1>Directory listing for {}</h1>
     <ul>"#,
-            request_path, request_path
-        );
+                request_path_clone, request_path_clone
+            );
 
-        // Add parent directory link if not at root
-        if request_path != "/" {
-            let _parent_path = match Path::new(request_path).parent() {
-                Some(parent) => parent.to_string_lossy(),
-                None => "/".into(),
-            };
-            html.push_str(&format!(
-                r#"        <li><a href="../">📁 ../</a></li>"#
-            ));
-        }
+            // Add parent directory link if not at root
+            if request_path_clone != "/" {
+                html.push_str(&format!(
+                    r#"        <li><a href="../">📁 ../</a></li>"#
+                ));
+            }
 
-        // List entries
-        while let Some(entry) = entries.next() {
-            let entry = entry.map_err(|e| ProxyError::Io(e))?;
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
+            // List entries
+            while let Some(entry) = entries.next() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue, // Skip problematic entries
+                };
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
 
-            let file_type = entry.file_type().map_err(|e| ProxyError::Io(e))?;
-            let is_dir = file_type.is_dir();
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue, // Skip problematic entries
+                };
+                let is_dir = file_type.is_dir();
 
-            let icon = if is_dir { "📁" } else { "📄" };
-            let class = if is_dir { "directory" } else { "file" };
+                let icon = if is_dir { "📁" } else { "📄" };
+                let class = if is_dir { "directory" } else { "file" };
 
-            html.push_str(&format!(
-                r#"        <li class="{}"><a href="{}{}">{}</a></li>"#,
-                class,
-                file_name_str,
-                if is_dir { "/" } else { "" },
-                icon
-            ));
-        }
+                html.push_str(&format!(
+                    r#"        <li class="{}"><a href="{}{}">{}</a></li>"#,
+                    class,
+                    file_name_str,
+                    if is_dir { "/" } else { "" },
+                    icon
+                ));
+            }
 
-        html.push_str(
-            r#"    </ul>
+            html.push_str(
+                r#"    </ul>
 </body>
 </html>"#
-        );
+            );
+
+            html
+        }).await;
+
+        let html = html.map_err(|e| ProxyError::Config(format!("Directory listing error: {}", e)))?;
+
+        if html.is_empty() {
+            return Ok(self.not_found_response());
+        }
 
         let content_length = html.len();
         let body = if is_head {
@@ -241,7 +257,13 @@ impl StaticFileHandler {
             return Ok(self.not_found_response());
         }
 
-        let mime_type = self.guess_mime_type(file_path);
+        // Use tokio::spawn_blocking for CPU-intensive MIME type detection
+        let file_path_clone = file_path.clone();
+        let custom_mime_types_clone = self.custom_mime_types.clone();
+        let mime_type = tokio::task::spawn_blocking(move || {
+            Self::guess_mime_type_static(&file_path_clone, &custom_mime_types_clone)
+        }).await.map_err(|e| ProxyError::Config(format!("MIME type detection error: {}", e)))?;
+
         let last_modified = metadata.modified()
             .map_err(|e| ProxyError::Config(format!("Cannot get file metadata: {}", e)))?;
 
@@ -300,12 +322,12 @@ impl StaticFileHandler {
         }
     }
 
-    fn guess_mime_type(&self, file_path: &PathBuf) -> String {
+    fn guess_mime_type_static(file_path: &PathBuf, custom_mime_types: &std::collections::HashMap<String, String>) -> String {
         if let Some(extension) = file_path.extension().and_then(|ext| ext.to_str()) {
             let ext_lower = extension.to_lowercase();
 
             // Check custom MIME types first
-            if let Some(custom_mime) = self.custom_mime_types.get(&ext_lower) {
+            if let Some(custom_mime) = custom_mime_types.get(&ext_lower) {
                 return custom_mime.clone();
             }
 
@@ -358,14 +380,13 @@ mod tests {
 
     #[test]
     fn test_mime_type_detection() {
-        let config = StaticFileConfig::single("test-temp".to_string(), false);
-        let handler = StaticFileHandler::new(config).expect("Failed to create handler");
-
-        assert_eq!(handler.guess_mime_type(&PathBuf::from("test.html")), "text/html; charset=utf-8");
-        assert_eq!(handler.guess_mime_type(&PathBuf::from("test.css")), "text/css; charset=utf-8");
-        assert_eq!(handler.guess_mime_type(&PathBuf::from("test.js")), "application/javascript; charset=utf-8");
-        assert_eq!(handler.guess_mime_type(&PathBuf::from("test.png")), "image/png");
-        assert_eq!(handler.guess_mime_type(&PathBuf::from("test.unknown")), "application/octet-stream");
+        // Test static method directly
+        let custom_mime_types = std::collections::HashMap::new();
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.html"), &custom_mime_types), "text/html; charset=utf-8");
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.css"), &custom_mime_types), "text/css; charset=utf-8");
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.js"), &custom_mime_types), "application/javascript; charset=utf-8");
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.png"), &custom_mime_types), "image/png");
+        assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.unknown"), &custom_mime_types), "application/octet-stream");
     }
 
     #[test]

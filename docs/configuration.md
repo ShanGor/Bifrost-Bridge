@@ -39,6 +39,7 @@ cargo run -- --help
 | `--static-dir` | Single static directory (legacy) | `--static-dir ./public` |
 | `--spa` | Enable SPA mode for single directory | `--spa` |
 | `--mount` | Mount static directory at path | `--mount /app:./dist` |
+| `--worker-threads` | Number of worker threads for static file serving | `--worker-threads 8` |
 
 ### Connection Options
 

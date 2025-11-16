@@ -20,13 +20,33 @@ use std::convert::Infallible;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use base64::{Engine as _, engine::general_purpose};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::TokioExecutor;
+
+// Global shared HTTP client for connection pooling
+static GLOBAL_HTTP_CLIENT: OnceLock<Client<HttpConnector, Incoming>> = OnceLock::new();
+
+fn get_http_client() -> &'static Client<HttpConnector, Incoming> {
+    GLOBAL_HTTP_CLIENT.get_or_init(|| {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(Duration::from_secs(10)));
+        connector.set_keepalive(Some(Duration::from_secs(90)));
+        connector.set_nodelay(true); // Disable Nagle's algorithm for better latency
+        
+        Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(128) // Increased for high concurrency
+            .http2_only(false)
+            .build(connector)
+    })
+}
 
 /// Forward proxy server implementation.
 ///
@@ -339,7 +359,7 @@ impl ForwardProxy {
         // Read the CONNECT request line
         let mut request_line = String::new();
         reader.read_line(&mut request_line).await?;
-        info!("CONNECT request: {}", request_line.trim());
+        debug!("CONNECT request: {}", request_line.trim());
 
         // Parse the request
         let parts: Vec<&str> = request_line.trim().split(' ').collect();
@@ -568,12 +588,12 @@ impl ForwardProxy {
         let relay_proxy = self.find_relay_proxy_for_domain(host);
         
         if let Some(relay) = &relay_proxy {
-            info!("HTTP request to {}://{}:{}{} via relay proxy {} (matched domain rule)", 
+            debug!("HTTP request to {}://{}:{}{} via relay proxy {} (matched domain rule)", 
                     scheme, host, port, 
                     target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""),
                     relay.url);
         } else {
-            info!("HTTP request to {}://{}:{}{} (direct connection)", 
+            debug!("HTTP request to {}://{}:{}{} (direct connection)", 
                     scheme, host, port, 
                     target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""));
         }
@@ -752,7 +772,7 @@ impl ForwardProxy {
         };
 
         // Log successful response
-        info!("Successfully forwarded request to {}://{}:{} - Status: {}", scheme, host, port, response.status());
+        debug!("Successfully forwarded request to {}://{}:{} - Status: {}", scheme, host, port, response.status());
 
         Ok(response)
     }
@@ -765,12 +785,8 @@ impl ForwardProxy {
         mut req: Request<Incoming>,
         target_uri: &Uri,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
-        // Build HTTP client
-        let client = Client::builder(TokioExecutor::new())
-            .build_http();
+        // Use global shared HTTP client for connection pooling
+        let client = get_http_client();
 
         // Update request URI to absolute form for target
         *req.uri_mut() = target_uri.clone();

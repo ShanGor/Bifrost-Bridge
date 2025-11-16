@@ -7,7 +7,6 @@
   "max_connection_lifetime_secs": 300,
   "max_header_size": 16384,
   "connection_pool_enabled": true,
-  "pool_max_idle_per_host": 10,
   "proxy_username": "admin",
   "proxy_password": "secret123"
 }

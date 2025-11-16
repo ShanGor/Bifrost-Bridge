@@ -6,7 +6,6 @@
   "idle_timeout_secs": 90,
   "max_connection_lifetime_secs": 300,
   "connection_pool_enabled": true,
-  "pool_max_idle_per_host": 20,
   "relay_proxies": [
     {
       "relay_proxy_url": "http://corporate-proxy.company.com:8080",

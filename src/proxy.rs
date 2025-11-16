@@ -69,8 +69,8 @@ impl ProxyFactory {
         match config.mode {
             ProxyMode::Forward => {
                 info!("Initializing Forward Proxy mode");
-                debug!("Forward proxy configuration - connection_pool: {:?}, pool_max_idle: {:?}",
-                       config.connection_pool_enabled, config.pool_max_idle_per_host);
+                debug!("Forward proxy configuration - connection_pool: {:?}",
+                       config.connection_pool_enabled);
                 // Support backward compatibility with timeout_secs
                 let connect_timeout_secs = config.connect_timeout_secs
                     .or(config.timeout_secs)
@@ -80,7 +80,6 @@ impl ProxyFactory {
                 let max_connection_lifetime_secs = config.max_connection_lifetime_secs
                     .unwrap_or(300);
                 let connection_pool_enabled = config.connection_pool_enabled.unwrap_or(true);
-                let pool_max_idle_per_host = config.pool_max_idle_per_host.unwrap_or(10);
                 
                 // Support both new relay_proxies and legacy relay_proxy fields
                 let relay_configs = if let Some(relay_proxies) = config.relay_proxies {
@@ -103,7 +102,6 @@ impl ProxyFactory {
                     idle_timeout_secs,
                     max_connection_lifetime_secs,
                     connection_pool_enabled,
-                    pool_max_idle_per_host,
                     relay_configs,
                     config.proxy_username,
                     config.proxy_password,

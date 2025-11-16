@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
@@ -30,36 +30,16 @@ use base64::{Engine as _, engine::general_purpose};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 
-// Global shared HTTP client for connection pooling
-static GLOBAL_HTTP_CLIENT: OnceLock<Client<HttpConnector, Incoming>> = OnceLock::new();
-
-fn get_http_client() -> &'static Client<HttpConnector, Incoming> {
-    GLOBAL_HTTP_CLIENT.get_or_init(|| {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(Duration::from_secs(10)));
-        connector.set_keepalive(Some(Duration::from_secs(90)));
-        connector.set_nodelay(true); // Disable Nagle's algorithm for better latency
-        
-        Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(128) // Increased for high concurrency
-            .http2_only(false)
-            .build(connector)
-    })
-}
-
 /// Forward proxy server implementation.
 ///
 /// Supports both direct connections and relay proxy routing based on domain patterns.
 pub struct ForwardProxy {
-    connect_timeout: Duration,
-    idle_timeout: Duration,
-    max_connection_lifetime: Duration,
     connection_pool_enabled: bool,
-    pool_max_idle_per_host: usize,
     relay_proxies: Vec<RelayProxyWithAuth>,
     proxy_username: Option<String>,
     proxy_password: Option<String>,
+    // Instance-specific HTTP client configured per ForwardProxy settings
+    http_client: Arc<Client<HttpConnector, Incoming>>,
 }
 
 /// Internal structure to store relay proxy configuration with pre-computed authentication.
@@ -79,17 +59,20 @@ impl ForwardProxy {
     ///
     /// * `connect_timeout_secs` - Timeout for establishing connections
     /// * `idle_timeout_secs` - Idle timeout for pooled connections
-    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections
-    pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Self {
+    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections (currently unused)
+    pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, _max_connection_lifetime_secs: u64) -> Self {
+        let http_client = Self::build_http_client(
+            connect_timeout_secs,
+            idle_timeout_secs,
+            true,
+        );
+        
         Self {
-            connect_timeout: Duration::from_secs(connect_timeout_secs),
-            idle_timeout: Duration::from_secs(idle_timeout_secs),
-            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             connection_pool_enabled: true,
-            pool_max_idle_per_host: 10,
             relay_proxies: Vec::new(),
             proxy_username: None,
             proxy_password: None,
+            http_client: Arc::new(http_client),
         }
     }
 
@@ -99,25 +82,26 @@ impl ForwardProxy {
     ///
     /// * `connect_timeout_secs` - Timeout for establishing connections
     /// * `idle_timeout_secs` - Idle timeout for pooled connections
-    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections
+    /// * `max_connection_lifetime_secs` - Maximum lifetime for connections (currently unused)
     /// * `connection_pool_enabled` - Whether to enable connection pooling
-    /// * `pool_max_idle_per_host` - Maximum idle connections per host
     pub fn new_with_pool_config(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
-        max_connection_lifetime_secs: u64,
+        _max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
-        pool_max_idle_per_host: usize,
     ) -> Self {
-        Self {
-            connect_timeout: Duration::from_secs(connect_timeout_secs),
-            idle_timeout: Duration::from_secs(idle_timeout_secs),
-            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
+        let http_client = Self::build_http_client(
+            connect_timeout_secs,
+            idle_timeout_secs,
             connection_pool_enabled,
-            pool_max_idle_per_host,
+        );
+        
+        Self {
+            connection_pool_enabled,
             relay_proxies: Vec::new(),
             proxy_username: None,
             proxy_password: None,
+            http_client: Arc::new(http_client),
         }
     }
 
@@ -135,9 +119,8 @@ impl ForwardProxy {
     pub fn new_with_relay(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
-        max_connection_lifetime_secs: u64,
+        _max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
-        pool_max_idle_per_host: usize,
         relay_proxy_url: Option<String>,
         relay_proxy_username: Option<String>,
         relay_proxy_password: Option<String>,
@@ -158,9 +141,8 @@ impl ForwardProxy {
         Self::new_with_relay_proxies(
             connect_timeout_secs,
             idle_timeout_secs,
-            max_connection_lifetime_secs,
+            _max_connection_lifetime_secs,
             connection_pool_enabled,
-            pool_max_idle_per_host,
             relay_configs,
             None,
             None,
@@ -180,9 +162,8 @@ impl ForwardProxy {
     pub fn new_with_relay_proxies(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
-        max_connection_lifetime_secs: u64,
+        _max_connection_lifetime_secs: u64,
         connection_pool_enabled: bool,
-        pool_max_idle_per_host: usize,
         relay_configs: Vec<RelayProxyConfig>,
         proxy_username: Option<String>,
         proxy_password: Option<String>,
@@ -209,16 +190,50 @@ impl ForwardProxy {
             })
             .collect();
 
-        Self {
-            connect_timeout: Duration::from_secs(connect_timeout_secs),
-            idle_timeout: Duration::from_secs(idle_timeout_secs),
-            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
+        let http_client = Self::build_http_client(
+            connect_timeout_secs,
+            idle_timeout_secs,
             connection_pool_enabled,
-            pool_max_idle_per_host,
+        );
+
+        Self {
+            connection_pool_enabled,
             relay_proxies,
             proxy_username,
             proxy_password,
+            http_client: Arc::new(http_client),
         }
+    }
+
+    /// Build HTTP client with user-specified configuration.
+    ///
+    /// Respects the connection pooling settings from the configuration:
+    /// - When pool_enabled is true: enables connection reuse with idle timeout
+    /// - When pool_enabled is false: disables pooling (creates new connection for each request)
+    fn build_http_client(
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        pool_enabled: bool,
+    ) -> Client<HttpConnector, Incoming> {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(Duration::from_secs(connect_timeout_secs)));
+        connector.set_keepalive(Some(Duration::from_secs(idle_timeout_secs)));
+        connector.set_nodelay(true); // Disable Nagle's algorithm for better latency
+        
+        let mut builder = Client::builder(TokioExecutor::new());
+        
+        if pool_enabled {
+            info!("HTTP client: connection pooling ENABLED (idle_timeout: {}s)",
+                  idle_timeout_secs);
+            builder.pool_idle_timeout(Duration::from_secs(idle_timeout_secs));
+        } else {
+            info!("HTTP client: connection pooling DISABLED (no-pool mode)");
+            builder.pool_max_idle_per_host(0); // Disable pooling
+        }
+        
+        builder
+            .http2_only(false)
+            .build(connector)
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
@@ -244,14 +259,10 @@ impl ForwardProxy {
     }
 
     async fn run_http(self, addr: SocketAddr) -> Result<(), ProxyError> {
-        let connect_timeout = self.connect_timeout;
-        let idle_timeout = self.idle_timeout;
-        let max_connection_lifetime = self.max_connection_lifetime;
-        let connection_pool_enabled = self.connection_pool_enabled;
-        let pool_max_idle_per_host = self.pool_max_idle_per_host;
         let relay_proxies = self.relay_proxies.clone();
         let proxy_username = self.proxy_username;
         let proxy_password = self.proxy_password;
+        let http_client = self.http_client; // Capture the HTTP client
 
         let listener = tokio::net::TcpListener::bind(addr).await
             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
@@ -262,14 +273,10 @@ impl ForwardProxy {
             let (stream, remote_addr) = listener.accept().await
                 .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-            let connect_timeout = connect_timeout;
-            let idle_timeout = idle_timeout;
-            let max_connection_lifetime = max_connection_lifetime;
-            let connection_pool_enabled = connection_pool_enabled;
-            let pool_max_idle_per_host = pool_max_idle_per_host;
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
             let proxy_password = proxy_password.clone();
+            let http_client = http_client.clone(); // Clone the Arc for the spawn
 
             tokio::spawn(async move {
                 // For CONNECT requests, we need to handle the tunnel manually
@@ -285,11 +292,6 @@ impl ForwardProxy {
                             let _ = ForwardProxy::handle_connect_raw(
                                 stream,
                                 remote_addr,
-                                connect_timeout,
-                                idle_timeout,
-                                max_connection_lifetime,
-                                connection_pool_enabled,
-                                pool_max_idle_per_host,
                                 relay_proxies,
                                 proxy_username,
                                 proxy_password,
@@ -304,26 +306,21 @@ impl ForwardProxy {
 
                 // Not a CONNECT request, use normal HTTP handling
                 let io = TokioIo::new(stream);
+                let http_client = Arc::clone(&http_client);
                 if let Err(err) = ServerBuilder::new()
                     .serve_connection(
                         io,
                         service_fn(move |req| {
-                            let proxy = ForwardProxy {
-                                connect_timeout,
-                                idle_timeout,
-                                max_connection_lifetime,
-                                connection_pool_enabled,
-                                pool_max_idle_per_host,
-                                relay_proxies: relay_proxies.clone(),
-                                proxy_username: proxy_username.clone(),
-                                proxy_password: proxy_password.clone(),
-                            };
+                            let http_client = Arc::clone(&http_client);
+                            let relay_proxies = relay_proxies.clone();
+                            let proxy_username = proxy_username.clone();
+                            let proxy_password = proxy_password.clone();
                             async move {
                                 // Check if this is a CONNECT request
                                 if req.method() == Method::CONNECT {
-                                    proxy.handle_connect_tunnel(req).await
+                                    Self::handle_connect_tunnel_static(req, relay_proxies).await
                                 } else {
-                                    proxy.handle_request(req).await
+                                    Self::handle_request_static(req, http_client, relay_proxies, proxy_username, proxy_password).await
                                 }
                             }
                         })
@@ -342,15 +339,10 @@ impl ForwardProxy {
     /// which is necessary for proper HTTPS proxy support through relay proxies.
     async fn handle_connect_raw(
         stream: TcpStream,
-        remote_addr: SocketAddr,
-        connect_timeout: Duration,
-        idle_timeout: Duration,
-        max_connection_lifetime: Duration,
-        connection_pool_enabled: bool,
-        pool_max_idle_per_host: usize,
+        _remote_addr: SocketAddr,
         relay_proxies: Vec<RelayProxyWithAuth>,
-        proxy_username: Option<String>,
-        proxy_password: Option<String>,
+        _proxy_username: Option<String>,
+        _proxy_password: Option<String>,
     ) -> Result<(), std::io::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -395,18 +387,7 @@ impl ForwardProxy {
         let mut stream = reader.into_inner();
 
         // Find relay proxy if configured
-        let proxy_config = ForwardProxy {
-            connect_timeout,
-            idle_timeout,
-            max_connection_lifetime,
-            connection_pool_enabled,
-            pool_max_idle_per_host,
-            relay_proxies,
-            proxy_username,
-            proxy_password,
-        };
-
-        let relay_proxy = proxy_config.find_relay_proxy_for_domain(&target_host);
+        let relay_proxy = Self::find_relay_proxy_for_domain_static(&relay_proxies, &target_host);
         let target_desc = if let Some(relay) = &relay_proxy {
             format!("{} via relay {}", target, relay.url)
         } else {
@@ -448,20 +429,17 @@ impl ForwardProxy {
             })?;
 
         // Set up bidirectional tunnel
-        let _ = ForwardProxy::setup_tunnel(stream, target_stream, remote_addr, target_desc).await;
+        let _ = ForwardProxy::setup_tunnel(stream, target_stream, _remote_addr, target_desc).await;
 
         Ok(())
     }
 
     async fn run_https(self, addr: SocketAddr, tls_config: Option<Arc<ServerConfig>>) -> Result<(), ProxyError> {
-        let connect_timeout = self.connect_timeout;
-        let idle_timeout = self.idle_timeout;
-        let max_connection_lifetime = self.max_connection_lifetime;
-        let connection_pool_enabled = self.connection_pool_enabled;
-        let pool_max_idle_per_host = self.pool_max_idle_per_host;
         let relay_proxies = self.relay_proxies.clone();
         let proxy_username = self.proxy_username;
         let proxy_password = self.proxy_password;
+        let connection_pool_enabled = self.connection_pool_enabled;
+        let http_client = self.http_client; // Capture the HTTP client
         let tls_acceptor = if let Some(config) = tls_config {
             Some(TlsAcceptor::from(config))
         } else {
@@ -473,48 +451,38 @@ impl ForwardProxy {
 
         info!("HTTPS forward proxy listening on: https://{}", addr);
         if connection_pool_enabled {
-            info!("Connection pool enabled (max idle per host: {})", pool_max_idle_per_host);
+            info!("Connection pooling enabled");
         } else {
-            info!("Connection pool disabled (no-pool mode)");
+            info!("Connection pooling disabled (no-pool mode)");
         }
 
         loop {
             let (tcp_stream, _) = tcp_listener.accept().await
                 .map_err(|e| ProxyError::Io(e))?;
 
-            let connect_timeout = connect_timeout;
-            let idle_timeout = idle_timeout;
-            let max_connection_lifetime = max_connection_lifetime;
-            let connection_pool_enabled = connection_pool_enabled;
-            let pool_max_idle_per_host = pool_max_idle_per_host;
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
             let proxy_password = proxy_password.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let http_client = http_client.clone(); // Clone the Arc for the spawn
 
             tokio::spawn(async move {
                 if let Some(acceptor) = tls_acceptor {
                     // HTTPS mode
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => {
+                            let http_client = Arc::clone(&http_client);
                             let service = service_fn(move |req| {
-                                // Client approach removed - using direct TCP connections for CONNECT requests
-                                let proxy = ForwardProxy {
-                                    connect_timeout,
-                                    idle_timeout,
-                                    max_connection_lifetime,
-                                    connection_pool_enabled,
-                                    pool_max_idle_per_host,
-                                    relay_proxies: relay_proxies.clone(),
-                                    proxy_username: proxy_username.clone(),
-                                    proxy_password: proxy_password.clone(),
-                                };
+                                let http_client = Arc::clone(&http_client);
+                                let relay_proxies = relay_proxies.clone();
+                                let proxy_username = proxy_username.clone();
+                                let proxy_password = proxy_password.clone();
                                 async move {
                                     // Check if this is a CONNECT request
                                     if req.method() == Method::CONNECT {
-                                        proxy.handle_connect_tunnel(req).await
+                                        ForwardProxy::handle_connect_tunnel_static(req, relay_proxies).await
                                     } else {
-                                        proxy.handle_request(req).await
+                                        ForwardProxy::handle_request_static(req, http_client, relay_proxies, proxy_username, proxy_password).await
                                     }
                                 }
                             });
@@ -785,8 +753,8 @@ impl ForwardProxy {
         mut req: Request<Incoming>,
         target_uri: &Uri,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        // Use global shared HTTP client for connection pooling
-        let client = get_http_client();
+        // Use instance-specific HTTP client that respects configuration
+        let client = &self.http_client;
 
         // Update request URI to absolute form for target
         *req.uri_mut() = target_uri.clone();
@@ -1128,6 +1096,55 @@ impl ForwardProxy {
         } else {
             Err(ProxyError::Auth("Invalid username or password".to_string()))
         }
+    }
+
+    /// Static helper method to find relay proxy for a domain
+    fn find_relay_proxy_for_domain_static(relay_proxies: &[RelayProxyWithAuth], host: &str) -> Option<RelayProxyWithAuth> {
+        for relay in relay_proxies {
+            if relay.domains.is_empty() {
+                return Some(relay.clone());
+            }
+            if Self::matches_no_proxy_pattern(host, &relay.domains) {
+                return Some(relay.clone());
+            }
+        }
+        None
+    }
+
+    /// Static helper to handle HTTP requests
+    async fn handle_request_static(
+        req: Request<Incoming>,
+        http_client: Arc<Client<HttpConnector, Incoming>>,
+        relay_proxies: Vec<RelayProxyWithAuth>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        // Create a temporary proxy instance for request handling
+        // Note: HTTP client is passed in, not using instance's client
+        let proxy = ForwardProxy {
+            connection_pool_enabled: true,
+            relay_proxies,
+            proxy_username,
+            proxy_password,
+            http_client,
+        };
+        proxy.handle_request(req).await
+    }
+
+    /// Static helper to handle CONNECT tunnels
+    async fn handle_connect_tunnel_static(
+        req: Request<Incoming>,
+        relay_proxies: Vec<RelayProxyWithAuth>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        // For CONNECT, we don't need the HTTP client
+        let proxy = ForwardProxy {
+            connection_pool_enabled: true,
+            relay_proxies,
+            proxy_username: None,
+            proxy_password: None,
+            http_client: Arc::new(Self::build_http_client(10, 90, true)),
+        };
+        proxy.handle_connect_tunnel(req).await
     }
 
 }

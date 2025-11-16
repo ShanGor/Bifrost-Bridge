@@ -236,8 +236,6 @@ pub struct Config {
     pub certificate: Option<String>,
     #[serde(default)]
     pub connection_pool_enabled: Option<bool>,
-    #[serde(default)]
-    pub pool_max_idle_per_host: Option<usize>,
     #[serde(default = "default_max_header_size")]
     pub max_header_size: Option<usize>,
     // Multiple relay proxy configurations
@@ -281,7 +279,6 @@ impl Default for Config {
             private_key: None,
             certificate: None,
             connection_pool_enabled: Some(true),
-            pool_max_idle_per_host: Some(10),
             max_header_size: default_max_header_size(),
             relay_proxies: None,
             relay_proxy_url: None,

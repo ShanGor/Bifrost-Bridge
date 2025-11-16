@@ -206,8 +206,7 @@ fn generate_sample_config(file_path: &str) -> Result<(), Box<dyn std::error::Err
   "idle_timeout_secs": 90,
   "max_connection_lifetime_secs": 300,
   "max_header_size": 16384,
-  "connection_pool_enabled": true,
-  "pool_max_idle_per_host": 10
+  "connection_pool_enabled": true
 }"#;
 
     let sample_reverse = r#"{
@@ -279,7 +278,6 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         private_key: args.private_key.clone(),
         certificate: args.certificate.clone(),
         connection_pool_enabled: Some(!args.no_connection_pool),
-        pool_max_idle_per_host: args.pool_max_idle,
         max_header_size: args.max_header_size,
         relay_proxies: None,
         relay_proxy_url: None,

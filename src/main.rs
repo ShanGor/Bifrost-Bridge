@@ -270,7 +270,6 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         mode,
         listen_addr,
         reverse_proxy_target: args.target.clone(),
-        forward_proxy_port: Some(3128),
         max_connections: Some(1000),
         connect_timeout_secs: args.connect_timeout,
         idle_timeout_secs: args.idle_timeout,

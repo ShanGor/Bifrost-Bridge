@@ -218,7 +218,6 @@ pub struct Config {
     pub mode: ProxyMode,
     pub listen_addr: SocketAddr,
     pub reverse_proxy_target: Option<String>,
-    pub forward_proxy_port: Option<u16>,
     pub max_connections: Option<usize>,
     // New timeout configurations
     #[serde(default)]
@@ -273,7 +272,6 @@ impl Default for Config {
             mode: ProxyMode::Forward,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             reverse_proxy_target: None,
-            forward_proxy_port: Some(3128),
             max_connections: Some(1000),
             connect_timeout_secs: Some(10),
             idle_timeout_secs: Some(90),

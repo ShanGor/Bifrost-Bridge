@@ -1,7 +1,6 @@
 {
   "mode": "Forward",
-  "listen_addr": "127.0.0.1:8080",
-  "forward_proxy_port": 3128,
+  "listen_addr": "127.0.0.1:3128",
   "max_connections": 1000,
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,

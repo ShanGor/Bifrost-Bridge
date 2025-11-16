@@ -79,7 +79,6 @@ cargo run -- --help
   "max_connections": 1000,
   "timeout_secs": 30,
   "reverse_proxy_target": null,
-  "forward_proxy_port": null,
   "static_files": {
     "mounts": [...],
     "enable_directory_listing": false,
@@ -103,7 +102,6 @@ cargo run -- --help
 | `max_connections` | Number | Maximum concurrent connections | `1000` |
 | `timeout_secs` | Number | Connection timeout in seconds | `30` |
 | `reverse_proxy_target` | String | Target URL for reverse proxy | `null` |
-| `forward_proxy_port` | Number | Port for forward proxy | `null` |
 | `static_files` | Object | Static file serving configuration | `null` |
 | `private_key` | String | Path to PKCS#8 PEM format private key file for HTTPS | `null` |
 | `certificate` | String | Path to PEM format certificate file for HTTPS | `null` |

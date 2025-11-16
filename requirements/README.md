@@ -13,16 +13,6 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R003 | SPA Fallback Fix | ✅ Completed | 2025-11-15 | Fix JavaScript module loading issues in SPA mode |
 | R004 | Graceful Shutdown | ✅ Completed | 2025-11-15 | Improve shutdown handling with Ctrl+C support |
 | R005 | Compilation Cleanup | ✅ Completed | 2025-11-15 | Fix all compilation errors and warnings |
-
-### ✅ **Completed Requirements**
-
-| ID | Requirement | Status | Date Completed | Description |
-|----|-------------|--------|---------------|-------------|
-| R001 | Multiple Static Roots Support | ✅ Completed | 2025-11-15 | Support multiple static file directories with mount points |
-| R002 | Configuration Inheritance | ✅ Completed | 2025-11-15 | Allow mount configurations to inherit from top-level settings |
-| R003 | SPA Fallback Fix | ✅ Completed | 2025-11-15 | Fix JavaScript module loading issues in SPA mode |
-| R004 | Graceful Shutdown | ✅ Completed | 2025-11-15 | Improve shutdown handling with Ctrl+C support |
-| R005 | Compilation Cleanup | ✅ Completed | 2025-11-15 | Fix all compilation errors and warnings |
 | R006 | Documentation Setup | ✅ Completed | 2025-11-15 | Create comprehensive documentation system with docs/ and requirements/ folders |
 | R007 | Zero-Copy Static File Serving | ✅ Completed | 2025-11-15 | Optimize static file serving with zero-copy mechanisms for better performance |
 | R009 | Custom Media Type Mappings | ✅ Completed | 2025-11-15 | Allow custom MIME type mappings like .mjs -> application/javascript |
@@ -30,18 +20,19 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R011 | Configurable Connection Pooling | ✅ Completed | 2025-11-15 | Add pool/no-pool mode configuration for forward proxy connections |
 | R012 | Granular Timeout Configuration | ✅ Completed | 2025-11-15 | Replace single timeout with three distinct timeout types |
 | R013 | Basic Authentication for Forward Proxy | ✅ Completed | 2025-11-15 | Add Basic Authentication support for forward proxy clients |
+| R014 | Client IP Detection Fix | ✅ Completed | 2025-11-16 | Fix hardcoded 127.0.0.1 to extract actual client IP from connection |
 
 ### 📝 **Pending Requirements**
 
 | ID | Requirement | Status | Date Raised | Description |
 |----|-------------|--------|------------|-------------|
 | R008 | Configurable Thread Pool | 📋 Pending | 2025-11-15 | Add worker_threads configuration to control concurrency |
-| R013 | Documentation Maintenance | 📋 Pending | 2025-11-15 | Ensure documentation stays updated with code changes |
-| R014 | Logging System | 📋 Pending | TBD | Add structured logging with configurable levels |
-| R015 | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
-| R016 | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
-| R017 | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
-| R018 | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
+| R015 | Logging System | 📋 Pending | TBD | Add structured logging with configurable levels |
+| R016 | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
+| R017 | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
+| R018 | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
+| R019 | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
+| R020 | Documentation Maintenance | 📋 Pending | 2025-11-16 | Ensure documentation stays updated with code changes |
 
 ---
 
@@ -343,15 +334,38 @@ Manual Proxy Configuration:
 - Works with all browsers and HTTP clients
 - Independent of upstream relay proxy authentication
 
+### R014: Client IP Detection Fix ✅
+**Description:** Fix hardcoded "127.0.0.1" client IP in reverse proxy to extract actual client IP from connection
+**Implementation:** Extract client IP from hyper connection context and pass via RequestContext
+**Files Modified:** `src/reverse_proxy.rs`
+**Technical Details:**
+- Added `RequestContext` struct to store client IP extracted from connection
+- Modified `make_service_fn` to accept `&hyper::server::conn::AddrStream` parameter
+- Extracts client IP using `conn.remote_addr().ip().to_string()` from connection
+- Created new `handle_request_with_context()` and `process_request_with_context()` methods
+- Added `modify_request_with_context()` to use actual client IP from context
+- Updated `modify_request()` for backward compatibility (delegates to context version)
+- Added comprehensive unit tests for both with and without client IP scenarios
+**Test Coverage:**
+- `test_modify_request_with_client_ip()`: Verifies X-Forwarded-For header is set correctly with actual IP
+- `test_modify_request_without_client_ip()`: Verifies header is not set when IP is None
+**Benefits:**
+- Fixes critical security issue where actual client IP was not being reported
+- Enables proper access logging and monitoring with real client IPs
+- Allows IP-based access control and rate limiting
+- Fixes X-Forwarded-For header accuracy for backend servers
+- Maintains backward compatibility with existing code
+- All tests pass successfully
+
 ---
 
 ## 🎯 Next Priorities
 
-1. **High Priority:** Complete documentation setup (R006)
-2. **Medium Priority:** Implement logging system (R007)
-3. **Low Priority:** Add performance monitoring (R008)
+1. **High Priority:** Implement logging system (R015)
+2. **Medium Priority:** Add performance monitoring (R016)
+3. **Low Priority:** Add WebSocket support (R017)
 
 ---
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2025-11-16
 **Maintainer:** Development Team

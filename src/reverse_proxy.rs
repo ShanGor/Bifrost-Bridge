@@ -14,6 +14,12 @@ use std::net::SocketAddr;
 use tokio::time::{timeout, Duration};
 use url::Url;
 
+/// Wrapper to store request data including client IP
+#[derive(Clone, Debug)]
+struct RequestContext {
+    client_ip: Option<String>,
+}
+
 pub struct ReverseProxy {
     client: Client<HttpConnector>,
     target_url: Url,
@@ -53,12 +59,15 @@ impl ReverseProxy {
         let max_connection_lifetime = self.max_connection_lifetime;
         let preserve_host = self.preserve_host;
 
-        let make_svc = make_service_fn(move |_conn| {
+        let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
             let target_url = target_url.clone();
             let connect_timeout = connect_timeout;
             let idle_timeout = idle_timeout;
             let max_connection_lifetime = max_connection_lifetime;
             let preserve_host = preserve_host;
+
+            // Extract client IP from connection
+            let client_ip = Some(conn.remote_addr().ip().to_string());
 
             async move {
                 Ok::<_, Infallible>(service_fn(move |req| {
@@ -74,8 +83,11 @@ impl ReverseProxy {
                         max_connection_lifetime,
                         preserve_host,
                     };
+                    let context = RequestContext {
+                        client_ip: client_ip.clone(),
+                    };
                     async move {
-                        proxy.handle_request(req).await
+                        proxy.handle_request_with_context(req, context).await
                     }
                 }))
             }
@@ -92,8 +104,9 @@ impl ReverseProxy {
         Ok(())
     }
 
-    async fn handle_request(&self, req: Request<Body>) -> Result<Response<Body>, Infallible> {
-        match self.process_request(req).await {
+  
+    async fn handle_request_with_context(&self, req: Request<Body>, context: RequestContext) -> Result<Response<Body>, Infallible> {
+        match self.process_request_with_context(req, context).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 eprintln!("Proxy error: {}", e);
@@ -106,12 +119,13 @@ impl ReverseProxy {
         }
     }
 
-    async fn process_request(&self, mut req: Request<Body>) -> Result<Response<Body>, ProxyError> {
+  
+    async fn process_request_with_context(&self, mut req: Request<Body>, context: RequestContext) -> Result<Response<Body>, ProxyError> {
         // Construct target URL
         let target_uri = self.build_target_uri(&req)?;
 
-        // Modify request for reverse proxy
-        self.modify_request(&mut req, &target_uri);
+        // Modify request for reverse proxy with context
+        self.modify_request_with_context(&mut req, &target_uri, context);
 
         // Send request with timeout
         let response = timeout(self.connect_timeout, self.client.request(req))
@@ -140,10 +154,10 @@ impl ReverseProxy {
         Ok(target_uri)
     }
 
-    fn modify_request(&self, req: &mut Request<Body>, target_uri: &Uri) {
+    
+    fn modify_request_with_context(&self, req: &mut Request<Body>, target_uri: &Uri, context: RequestContext) {
         // Update request URI to target
         // Collect needed headers before mutable borrow
-        let client_ip = self.get_client_ip(req);
         let original_host = req.headers().get(HOST).cloned();
 
         *req.uri_mut() = target_uri.clone();
@@ -161,7 +175,7 @@ impl ReverseProxy {
         }
 
         // Add X-Forwarded-* headers
-        if let Some(client_ip) = client_ip {
+        if let Some(client_ip) = &context.client_ip {
             headers.insert(X_FORWARDED_FOR.clone(), client_ip.parse().unwrap());
         }
 
@@ -200,13 +214,6 @@ impl ReverseProxy {
 
         response
     }
-
-    fn get_client_ip(&self, _req: &Request<Body>) -> Option<String> {
-        // Try to get client IP from connection info
-        // In a real implementation, you'd get this from the connection
-        // For now, we'll return a placeholder
-        Some("127.0.0.1".to_string())
-    }
 }
 
 #[cfg(test)]
@@ -235,5 +242,76 @@ mod tests {
 
         let invalid_url = ReverseProxy::new("not-a-url".to_string(), 10, 90, 300);
         assert!(invalid_url.is_err());
+    }
+
+    #[test]
+    fn test_modify_request_with_client_ip() {
+        let proxy = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300).unwrap();
+
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/test")
+            .header("Host", "example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let target_uri: Uri = "http://backend.example.com/api/test".parse().unwrap();
+        let client_ip = "192.168.1.100".to_string();
+        let context = RequestContext {
+            client_ip: Some(client_ip.clone()),
+        };
+
+        proxy.modify_request_with_context(&mut req, &target_uri, context);
+
+        // Verify X-Forwarded-For header is set
+        assert_eq!(
+            req.headers().get("x-forwarded-for").unwrap().to_str().unwrap(),
+            client_ip
+        );
+
+        // Verify X-Forwarded-Proto header is set
+        assert_eq!(
+            req.headers().get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+
+        // Verify X-Forwarded-Host header is set
+        assert_eq!(
+            req.headers().get("x-forwarded-host").unwrap().to_str().unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_modify_request_without_client_ip() {
+        let proxy = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300).unwrap();
+
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/test")
+            .header("Host", "example.com")
+            .body(Body::empty())
+            .unwrap();
+
+        let target_uri: Uri = "http://backend.example.com/api/test".parse().unwrap();
+        let context = RequestContext {
+            client_ip: None,
+        };
+
+        proxy.modify_request_with_context(&mut req, &target_uri, context);
+
+        // Verify X-Forwarded-For header is NOT set when client_ip is None
+        assert!(req.headers().get("x-forwarded-for").is_none());
+
+        // But other headers should still be set
+        assert_eq!(
+            req.headers().get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+
+        assert_eq!(
+            req.headers().get("x-forwarded-host").unwrap().to_str().unwrap(),
+            "example.com"
+        );
     }
 }

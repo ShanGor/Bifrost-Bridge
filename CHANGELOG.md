@@ -17,7 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved code organization and documentation
 
 ### Fixed
-- N/A
+- **Client IP Detection Fix** (R014)
+  - Fixed hardcoded "127.0.0.1" client IP in reverse proxy to extract actual client IP from connection
+  - Now properly sets X-Forwarded-For header with real client IP address
+  - Critical for access logging, rate limiting, and security auditing
+  - Added comprehensive unit tests for client IP extraction
+  - Updated documentation in `docs/configuration.md`
 
 ## [0.1.0] - 2025-11-15
 

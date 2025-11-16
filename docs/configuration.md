@@ -9,6 +9,7 @@ This guide covers all configuration options for the proxy server, including comm
 - [Static File Configuration](#static-file-configuration)
 - [Multiple Mount Points](#multiple-mount-points)
 - [Configuration Inheritance](#configuration-inheritance)
+- [Reverse Proxy Headers](#reverse-proxy-headers)
 - [Examples](#examples)
 
 ## 🖥️ Command Line Interface
@@ -227,6 +228,40 @@ Mount configurations inherit values from the parent `static_files` configuration
 }
 ```
 
+## 🔧 Reverse Proxy Headers
+
+When running in reverse proxy mode, the server automatically adds several HTTP headers to forwarded requests:
+
+### Headers Added
+
+| Header | Description | Example |
+|--------|-------------|---------|
+| `X-Forwarded-For` | Client IP address (extracted from connection) | `X-Forwarded-For: 192.168.1.100` |
+| `X-Forwarded-Proto` | Protocol used by client | `X-Forwarded-Proto: https` |
+| `X-Forwarded-Host` | Original Host header | `X-Forwarded-Host: example.com` |
+| `X-Proxy-Server` | Proxy server identification | `X-Proxy-Server: rust-reverse-proxy` |
+
+### Important Notes
+
+- **Client IP Extraction:** The `X-Forwarded-For` header contains the actual client IP address extracted from the TCP connection, not a hardcoded value
+- **Backend Access:** Backend servers can use the `X-Forwarded-For` header to log the real client IP addresses
+- **Security:** The actual client IP is critical for access control, rate limiting, and security auditing
+- **Multiple Proxies:** If requests pass through multiple proxies, this header preserves the entire chain
+
+### Example Backend Usage
+
+**Node.js/Express:**
+```javascript
+const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+console.log('Client IP:', clientIP);
+```
+
+**Python/Flask:**
+```python
+client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+print(f"Client IP: {client_ip}")
+```
+
 ## 💡 Usage Examples
 
 ### Example 1: Simple SPA Server
@@ -358,5 +393,5 @@ cargo run -- \
 
 ---
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2025-11-16
 **See Also:** [Examples](./examples.md), [CLI Reference](./cli-reference.md)

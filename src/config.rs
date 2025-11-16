@@ -1,5 +1,83 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        LogLevel::Info
+    }
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogLevel::Trace => write!(f, "trace"),
+            LogLevel::Debug => write!(f, "debug"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Warn => write!(f, "warn"),
+            LogLevel::Error => write!(f, "error"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl Default for LogFormat {
+    fn default() -> Self {
+        LogFormat::Text
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogOutputType {
+    Stdout,
+    File,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogTarget {
+    #[serde(rename = "type")]
+    pub output_type: LogOutputType,
+    pub path: Option<PathBuf>,
+    pub level: Option<LogLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: Option<LogLevel>,
+    pub format: Option<LogFormat>,
+    pub targets: Option<Vec<LogTarget>>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: Some(LogLevel::Info),
+            format: Some(LogFormat::Text),
+            targets: Some(vec![LogTarget {
+                output_type: LogOutputType::Stdout,
+                path: None,
+                level: None,
+            }]),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProxyMode {
@@ -180,6 +258,9 @@ pub struct Config {
     pub proxy_username: Option<String>,
     #[serde(default)]
     pub proxy_password: Option<String>,
+    // Logging configuration
+    #[serde(default)]
+    pub logging: Option<LoggingConfig>,
 }
 
 fn default_max_header_size() -> Option<usize> {
@@ -211,6 +292,7 @@ impl Default for Config {
             relay_proxy_domain_suffixes: None,
             proxy_username: None,
             proxy_password: None,
+            logging: None,
         }
     }
 }

@@ -13,6 +13,7 @@ use hyper::body::{Bytes, Incoming};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
+use log::{info, error, debug};
 use hyper_util::rt::TokioIo;
 use hyper::header::{HOST, PROXY_AUTHORIZATION, HeaderValue};
 use std::convert::Infallible;
@@ -235,7 +236,7 @@ impl ForwardProxy {
         let listener = tokio::net::TcpListener::bind(addr).await
             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-        println!("HTTP forward proxy listening on: http://{}", addr);
+        info!("HTTP forward proxy listening on: http://{}", addr);
 
         loop {
             let (stream, remote_addr) = listener.accept().await
@@ -309,7 +310,7 @@ impl ForwardProxy {
                     )
                     .await
                 {
-                    eprintln!("Error serving connection: {}", err);
+                    error!("Error serving forward proxy connection: {}", err);
                 }
             });
         }
@@ -338,7 +339,7 @@ impl ForwardProxy {
         // Read the CONNECT request line
         let mut request_line = String::new();
         reader.read_line(&mut request_line).await?;
-        println!("CONNECT request: {}", request_line.trim());
+        info!("CONNECT request: {}", request_line.trim());
 
         // Parse the request
         let parts: Vec<&str> = request_line.trim().split(' ').collect();
@@ -394,7 +395,7 @@ impl ForwardProxy {
 
         // Connect to target
         let target_result = if let Some(relay) = relay_proxy {
-            println!("Connecting to {} via relay proxy", target_desc);
+            debug!("Connecting to {} via relay proxy", target_desc);
             ForwardProxy::connect_via_relay(
                 &relay.url,
                 &relay.auth,
@@ -402,27 +403,27 @@ impl ForwardProxy {
                 target_port,
             ).await
         } else {
-            println!("Direct connection to {}", target_desc);
+            debug!("Direct connection to {}", target_desc);
             TcpStream::connect(format!("{}:{}", target_host, target_port)).await
         };
 
         let target_stream = match target_result {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Failed to connect to target: {}", e);
+                error!("Failed to connect to target: {}", e);
                 let error_response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
                 stream.write_all(error_response.as_bytes()).await?;
                 return Err(e);
             }
         };
 
-        println!("Successfully connected to target, setting up tunnel");
+        info!("Successfully connected to target, setting up tunnel");
 
         // Send 200 OK to client
         let ok_response = "HTTP/1.1 200 Connection established\r\nProxy-agent: Rust-Proxy/1.0\r\n\r\n";
         stream.write_all(ok_response.as_bytes()).await
             .map_err(|e| {
-                eprintln!("Failed to send 200 OK response: {}", e);
+                error!("Failed to send 200 OK response: {}", e);
                 e
             })?;
 
@@ -450,11 +451,11 @@ impl ForwardProxy {
         let tcp_listener = TcpListener::bind(&addr).await
             .map_err(|e| ProxyError::Io(e))?;
 
-        println!("HTTPS forward proxy listening on: https://{}", addr);
+        info!("HTTPS forward proxy listening on: https://{}", addr);
         if connection_pool_enabled {
-            println!("Connection pool enabled (max idle per host: {})", pool_max_idle_per_host);
+            info!("Connection pool enabled (max idle per host: {})", pool_max_idle_per_host);
         } else {
-            println!("Connection pool disabled (no-pool mode)");
+            info!("Connection pool disabled (no-pool mode)");
         }
 
         loop {
@@ -503,11 +504,11 @@ impl ForwardProxy {
                                 .serve_connection(TokioIo::new(tls_stream), service)
                                 .await
                             {
-                                eprintln!("Error serving HTTPS connection: {}", e);
+                                error!("Error serving HTTPS connection: {}", e);
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error establishing TLS connection: {}", e);
+                            error!("Error establishing TLS connection: {}", e);
                         }
                     }
                 }
@@ -519,7 +520,7 @@ impl ForwardProxy {
         match self.process_request(req).await {
             Ok(response) => Ok(response),
             Err(e) => {
-                eprintln!("Proxy error: {}", e);
+                error!("Proxy error: {}", e);
                 // Return 401 Unauthorized for authentication errors
                 let status = if matches!(e, ProxyError::Auth(_)) {
                     StatusCode::UNAUTHORIZED
@@ -567,12 +568,12 @@ impl ForwardProxy {
         let relay_proxy = self.find_relay_proxy_for_domain(host);
         
         if let Some(relay) = &relay_proxy {
-            println!("HTTP request to {}://{}:{}{} via relay proxy {} (matched domain rule)", 
+            info!("HTTP request to {}://{}:{}{} via relay proxy {} (matched domain rule)", 
                     scheme, host, port, 
                     target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""),
                     relay.url);
         } else {
-            println!("HTTP request to {}://{}:{}{} (direct connection)", 
+            info!("HTTP request to {}://{}:{}{} (direct connection)", 
                     scheme, host, port, 
                     target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""));
         }
@@ -589,7 +590,7 @@ impl ForwardProxy {
                 req.headers_mut().insert(PROXY_AUTHORIZATION, auth_value);
             }
 
-            println!("Sending HTTP request to relay proxy {} for target {}", relay.url, target_uri);
+            info!("Sending HTTP request to relay proxy {} for target {}", relay.url, target_uri);
 
             // For HTTP requests through a relay proxy:
             // The request must have an absolute URI and we connect to the relay
@@ -751,7 +752,7 @@ impl ForwardProxy {
         };
 
         // Log successful response
-        println!("Successfully forwarded request to {}://{}:{} - Status: {}", scheme, host, port, response.status());
+        info!("Successfully forwarded request to {}://{}:{} - Status: {}", scheme, host, port, response.status());
 
         Ok(response)
     }
@@ -803,15 +804,15 @@ impl ForwardProxy {
         let host = authority.host().to_string();
         let port = authority.port_u16().unwrap_or(443);
 
-        println!("Handling CONNECT request to {}:{}", host, port);
+        info!("Handling CONNECT request to {}:{}", host, port);
 
         // Find matching relay proxy for this domain
         let relay_proxy = self.find_relay_proxy_for_domain(&host);
 
         if let Some(relay) = &relay_proxy {
-            println!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
+            info!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
         } else {
-            println!("Direct connection to {}:{}", host, port);
+            info!("Direct connection to {}:{}", host, port);
         }
 
         // Spawn a task to handle the upgrade and tunnel
@@ -819,7 +820,7 @@ impl ForwardProxy {
             // Wait for the connection to be upgraded
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
-                    println!("Successfully upgraded connection for {}:{}", host, port);
+                    info!("Successfully upgraded connection for {}:{}", host, port);
                     
                     // Wrap upgraded connection with TokioIo for AsyncRead/AsyncWrite
                     let upgraded_io = TokioIo::new(upgraded);
@@ -834,7 +835,7 @@ impl ForwardProxy {
                         ).await {
                             Ok(stream) => stream,
                             Err(e) => {
-                                eprintln!("Failed to connect via relay to {}:{}: {}", host, port, e);
+                                error!("Failed to connect via relay to {}:{}: {}", host, port, e);
                                 return;
                             }
                         }
@@ -842,13 +843,13 @@ impl ForwardProxy {
                         match TcpStream::connect(format!("{}:{}", host, port)).await {
                             Ok(stream) => stream,
                             Err(e) => {
-                                eprintln!("Failed to connect to {}:{}: {}", host, port, e);
+                                error!("Failed to connect to {}:{}: {}", host, port, e);
                                 return;
                             }
                         }
                     };
 
-                    println!("Successfully connected to target {}:{}", host, port);
+                    info!("Successfully connected to target {}:{}", host, port);
                     
                     // Set up bidirectional tunnel
                     let (mut client_read, mut client_write) = tokio::io::split(upgraded_io);
@@ -856,24 +857,24 @@ impl ForwardProxy {
 
                     let client_to_target = async {
                         match tokio::io::copy(&mut client_read, &mut target_write).await {
-                            Ok(bytes) => println!("Client -> Target: {} bytes for {}:{}", bytes, host, port),
-                            Err(e) => eprintln!("Error in client->target tunnel for {}:{}: {}", host, port, e),
+                            Ok(bytes) => info!("Client -> Target: {} bytes for {}:{}", bytes, host, port),
+                            Err(e) => error!("Error in client->target tunnel for {}:{}: {}", host, port, e),
                         }
                     };
 
                     let target_to_client = async {
                         match tokio::io::copy(&mut target_read, &mut client_write).await {
-                            Ok(bytes) => println!("Target -> Client: {} bytes for {}:{}", bytes, host, port),
-                            Err(e) => eprintln!("Error in target->client tunnel for {}:{}: {}", host, port, e),
+                            Ok(bytes) => info!("Target -> Client: {} bytes for {}:{}", bytes, host, port),
+                            Err(e) => error!("Error in target->client tunnel for {}:{}: {}", host, port, e),
                         }
                     };
 
                     // Run both directions concurrently
                     tokio::join!(client_to_target, target_to_client);
-                    println!("TCP tunnel closed for {}:{}", host, port);
+                    info!("TCP tunnel closed for {}:{}", host, port);
                 }
                 Err(e) => {
-                    eprintln!("Failed to upgrade connection for {}:{}: {}", host, port, e);
+                    error!("Failed to upgrade connection for {}:{}: {}", host, port, e);
                 }
             }
         });
@@ -894,7 +895,7 @@ impl ForwardProxy {
         client_addr: SocketAddr,
         target_desc: String,
     ) -> Result<(), std::io::Error> {
-        println!("Setting up bidirectional tunnel between {} and {}", client_addr, target_desc);
+        info!("Setting up bidirectional tunnel between {} and {}", client_addr, target_desc);
 
         let (client_read, client_write) = client_stream.into_split();
         let (target_read, target_write) = target_stream.into_split();
@@ -905,7 +906,7 @@ impl ForwardProxy {
             let mut client_read = client_read;
             let mut target_write = target_write;
             if let Err(e) = tokio::io::copy(&mut client_read, &mut target_write).await {
-                eprintln!("Error copying client to target: {}", e);
+                error!("Error copying client to target: {}", e);
             }
         });
 
@@ -914,14 +915,14 @@ impl ForwardProxy {
             let mut target_read = target_read;
             let mut client_write = client_write;
             if let Err(e) = tokio::io::copy(&mut target_read, &mut client_write).await {
-                eprintln!("Error copying target to client: {}", e);
+                error!("Error copying target to client: {}", e);
             }
         });
 
         // Wait for both directions to complete
         let _ = tokio::join!(c2t, t2c);
 
-        println!("Tunnel closed between {} and {}", client_addr, target_desc);
+        info!("Tunnel closed between {} and {}", client_addr, target_desc);
         Ok(())
     }
 

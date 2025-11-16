@@ -8,6 +8,7 @@ use hyper::client::conn::http1::Builder as ClientBuilder;
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::header::HOST;
 use hyper::header::HeaderName;
+use log::{info, error};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 
@@ -57,7 +58,7 @@ impl ReverseProxy {
         let listener = tokio::net::TcpListener::bind(addr).await
             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-        println!("Reverse proxy listening on: {} -> {}", addr, self.target_url);
+        info!("Reverse proxy listening on: {} -> {}", addr, self.target_url);
 
         loop {
             let (stream, remote_addr) = listener.accept().await
@@ -101,7 +102,7 @@ impl ReverseProxy {
                     )
                     .await
                 {
-                    eprintln!("Error serving connection: {}", err);
+                    error!("Error serving reverse proxy connection: {}", err);
                 }
             });
         }
@@ -112,7 +113,7 @@ impl ReverseProxy {
         match self.process_request_with_context(req, context).await {
             Ok(response) => Ok(response),
             Err(e) => {
-                eprintln!("Proxy error: {}", e);
+                error!("Proxy error: {}", e);
                 let error_response = Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .body(Full::new(Bytes::from(format!("Proxy Error: {}", e))))
@@ -157,7 +158,7 @@ impl ReverseProxy {
         // Spawn the connection task
         tokio::spawn(async move {
             if let Err(err) = conn.await {
-                eprintln!("Connection error: {}", err);
+                error!("Connection error to backend: {}", err);
             }
         });
 

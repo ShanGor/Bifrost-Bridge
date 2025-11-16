@@ -1,6 +1,6 @@
 use clap::Parser;
-use log::info;
-use bifrost_bridge::{config::{Config, ProxyMode}, proxy::ProxyFactory};
+use log::{info, error};
+use bifrost_bridge::{config::{Config, ProxyMode}, proxy::ProxyFactory, logging};
 use std::path::Path;
 use tokio::signal;
 use tokio::sync::oneshot;
@@ -77,19 +77,58 @@ struct Args {
 
     #[clap(long, value_name = "PASSWORD", help = "Password for proxy authentication (Basic Auth)")]
     proxy_password: Option<String>,
+
+    #[clap(long, value_name = "LEVEL", help = "Set logging level (trace, debug, info, warn, error)")]
+    log_level: Option<String>,
+
+    #[clap(long, value_name = "FORMAT", help = "Set log output format (text, json)")]
+    log_format: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+fn init_logging_from_config(config: &Config, args: Option<&Args>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(logging_config) = &config.logging {
+        // Use advanced logging configuration from file
+        logging::CustomLogger::init(logging_config.clone())?;
+        info!("Initialized advanced logging system with {} targets",
+              logging_config.targets.as_ref().map(|t| t.len()).unwrap_or(0));
+    } else {
+        // Fallback to CLI arguments or defaults
+        let args = args.expect("Args required when no logging config provided");
+        init_logging_from_args(args)?;
+    }
+    Ok(())
+}
 
+fn init_logging_from_args(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let log_level = args.log_level.as_deref();
+    let log_format = args.log_format.as_deref();
+
+    // Use simple env_logger with CLI arguments
+    logging::init_fallback(log_level, log_format)?;
+
+    info!("Initialized logging system - level: {}, format: {}",
+          log_level.unwrap_or("info"), log_format.unwrap_or("text"));
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse args first to get logging configuration
     let args = Args::parse();
+
+    // Initialize logging based on configuration
+    if let Some(config_file) = &args.config {
+        // Load configuration first to get logging settings
+        let config = Config::from_file(config_file)?;
+        init_logging_from_config(&config, Some(&args))?;
+    } else {
+        // Use CLI arguments for logging configuration
+        init_logging_from_args(&args)?;
+    }
 
     // Handle generate-config flag
     if let Some(config_file) = args.generate_config {
         generate_sample_config(&config_file)?;
-        println!("Sample configuration file generated: {}", config_file);
+        info!("Sample configuration file generated: {}", config_file);
         return Ok(());
     }
 
@@ -106,6 +145,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Validate configuration
     validate_config(&config)?;
 
+    // Create tokio runtime with custom thread pool if configured
+    let runtime = if let Some(worker_threads) = config.static_files.as_ref()
+        .and_then(|sf| sf.worker_threads) {
+        info!("Starting tokio runtime with {} worker threads", worker_threads);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()?
+    } else {
+        info!("Starting tokio runtime with default worker threads (CPU cores)");
+        tokio::runtime::Runtime::new()?
+    };
+
+    // Run the async main function in the configured runtime
+    runtime.block_on(async_main(config))
+}
+
+async fn async_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Create and run proxy with graceful shutdown
     info!("Starting proxy server...");
 
@@ -117,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn the server in a task
     let server_handle = tokio::spawn(async move {
         if let Err(e) = proxy.run().await {
-            eprintln!("Server error: {}", e);
+            error!("Server error: {}", e);
         }
     });
 
@@ -131,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         result = server_handle => {
             if let Err(e) = result {
-                eprintln!("Server task error: {}", e);
+                error!("Server task error: {}", e);
             }
         }
     }
@@ -232,6 +289,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         relay_proxy_domain_suffixes: None,
         proxy_username: args.proxy_username.clone(),
         proxy_password: args.proxy_password.clone(),
+        logging: None,
     };
 
     // Configure static files if specified
@@ -305,6 +363,19 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             if config.static_files.is_some() {
                 return Err("Static files are not supported in forward proxy mode".into());
             }
+        }
+    }
+
+    // Validate worker_threads configuration
+    if let Some(static_files) = &config.static_files {
+        if let Some(worker_threads) = static_files.worker_threads {
+            if worker_threads == 0 {
+                return Err("worker_threads must be greater than 0".into());
+            }
+            if worker_threads > 512 {
+                return Err("worker_threads cannot exceed 512".into());
+            }
+            info!("Configuration validated: worker_threads = {}", worker_threads);
         }
     }
 

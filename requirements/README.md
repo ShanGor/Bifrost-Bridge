@@ -21,13 +21,13 @@ This folder tracks all requirements, feature requests, and issues raised for the
 | R011 | Granular Timeout Configuration | ✅ Completed | 2025-11-15 | Replace single timeout with three distinct timeout types |
 | R012 | Basic Authentication for Forward Proxy | ✅ Completed | 2025-11-15 | Add Basic Authentication support for forward proxy clients |
 | R013 | Client IP Detection Fix | ✅ Completed | 2025-11-16 | Fix hardcoded 127.0.0.1 to extract actual client IP from connection |
-| R014 | Configurable Thread Pool | ✅ Completed | 2025-11-15 | Add worker_threads configuration to control concurrency |
+| R014 | Configurable Thread Pool | ✅ Completed | 2025-11-16 | Add worker_threads configuration to control concurrency - fully implemented with custom tokio runtime |
 
 ### 📝 **Pending Requirements**
 
 | ID | Requirement | Status | Date Raised | Description |
 |----|-------------|--------|------------|-------------|
-| R015 | Logging System | 📋 Pending | TBD | Add structured logging with configurable levels |
+| R015 | Logging System | ✅ Completed | 2025-11-16 | Add structured logging with configurable levels - comprehensive logging system fully implemented |
 | R016 | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
 | R017 | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
 | R018 | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
@@ -359,82 +359,144 @@ Manual Proxy Configuration:
 
 ### R014: Configurable Thread Pool ✅
 **Description:** Add worker_threads configuration to control concurrency
-**Implementation:** Allow configuration of the number of worker threads used by the proxy server
+**Implementation:** Fully implemented with custom tokio runtime builder and thread pool management
 **Technical Details:**
-- Added `worker_threads` field to main Config struct
-- Enhanced server initialization to use configured thread count
-- Added CLI argument `--worker-threads` for thread configuration
-- Defaults to number of CPU cores if not specified
-- Applied to both forward and reverse proxy modes
+- Replaced `#[tokio::main]` attribute with custom runtime creation in `src/main.rs`
+- Added `tokio::runtime::Builder::new_multi_thread()` with configurable worker threads
+- Implemented runtime configuration that uses `worker_threads` value when specified
+- Added comprehensive validation (must be > 0 and <= 512 threads)
+- Supports both JSON configuration and CLI argument (`--worker-threads`)
+- Logs thread pool configuration on server startup
+**Key Implementation Changes:**
+- **Main Function:** Converted from `#[tokio::main]` to sync function that creates custom runtime
+- **Runtime Builder:** Uses `tokio::runtime::Builder` to configure thread count
+- **Async Logic:** Moved all async code to separate `async_main()` function
+- **Configuration Processing:** Worker threads read from `config.static_files.worker_threads`
+- **Validation:** Added bounds checking and logging in `validate_config()`
 **Usage Examples:**
 ```bash
-# CLI
-cargo run -- --mode forward --listen 127.0.0.1:8080 --worker-threads 8
+# CLI - Custom thread count
+cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./public --worker-threads 4
 
 # JSON Configuration
 {
-  "mode": "Forward",
+  "mode": "Reverse",
   "listen_addr": "127.0.0.1:8080",
-  "worker_threads": 8
+  "static_files": {
+    "mounts": [{"path": "/", "root_dir": "./public"}],
+    "worker_threads": 4
+  }
 }
 ```
+**Runtime Behavior:**
+- **Custom Threads:** "Starting tokio runtime with X worker threads"
+- **Default Threads:** "Starting tokio runtime with default worker threads (CPU cores)"
+- **Validation:** "Configuration validated: worker_threads = X"
 **Benefits:**
-- Control resource usage based on deployment environment
-- Optimize performance for different hardware configurations
-- Better predictability in resource-constrained environments
-- Enables fine-tuning for specific workload patterns
+- Full control over server thread pool size for performance tuning
+- Better resource management in production environments
+- Ability to optimize for specific hardware configurations
+- Proper thread pool configuration for high-concurrency scenarios
+- Backward compatible (defaults to CPU core count)
 
-### R015: Logging System 📋
+### R015: Logging System ✅
 **Description:** Add structured logging with configurable levels
-**Implementation:** Integrate a comprehensive logging system with multiple output formats and filtering capabilities
+**Implementation:** Comprehensive logging system with multiple output formats, targets, and configuration options
 **Technical Details:**
-- Integration with popular Rust logging ecosystem (tracing/log crates)
-- Support for multiple log levels (trace, debug, info, warn, error)
-- Configurable output formats (plain text, JSON)
-- Multiple output targets (stdout, files, syslog)
-- CLI argument `--log-level` for runtime log level configuration
-- JSON configuration support for advanced logging setups
-- Structured logging with context and metadata
-**Planned Usage Examples:**
+- **Custom Logger Implementation:** Created `CustomLogger` in `src/logging.rs` with full feature support
+- **CLI Arguments:** Added `--log-level` and `--log-format` arguments for runtime configuration
+- **JSON Configuration:** Advanced logging configuration with targets, levels, and formats
+- **Multiple Output Formats:** Support for both text and JSON log formats
+- **Multiple Output Targets:** Support for stdout and file logging simultaneously
+- **Structured Logging:** JSON logs with timestamp, level, target, file, line, and message fields
+- **Level Filtering:** Individual target filtering (trace, debug, info, warn, error)
+- **Comprehensive Integration:** Added detailed logging throughout proxy core functionality
+**Key Components:**
+- **Logging Enums:** `LogLevel`, `LogFormat`, `LogOutputType`, `LogTarget`
+- **Configuration Struct:** `LoggingConfig` with JSON serialization support
+- **Custom Logger:** `CustomLogger` implementing `log::Log` trait with advanced features
+- **Fallback System:** `env_logger` fallback for simple configurations
+**Usage Examples:**
 ```bash
-# CLI
-cargo run -- --mode forward --listen 127.0.0.1:8080 --log-level debug
+# CLI - Basic logging with custom level
+cargo run -- --mode forward --listen 127.0.0.1:8080 --log-level debug --log-format text
 
-# JSON Configuration
+# CLI - JSON format logging
+cargo run -- --mode reverse --listen 127.0.0.1:8080 --log-level info --log-format json
+
+# Environment variable (backward compatible)
+RUST_LOG=debug cargo run -- --mode forward --listen 127.0.0.1:8080
+```
+**JSON Configuration:**
+```json
 {
-  "mode": "Forward",
+  "mode": "Reverse",
   "listen_addr": "127.0.0.1:8080",
+  "static_files": {
+    "mounts": [{"path": "/", "root_dir": "./public"}]
+  },
   "logging": {
-    "level": "info",
+    "level": "debug",
     "format": "json",
     "targets": [
+      {
+        "type": "stdout",
+        "level": "info"
+      },
       {
         "type": "file",
         "path": "./logs/proxy.log",
         "level": "debug"
-      },
-      {
-        "type": "stdout",
-        "level": "info"
       }
     ]
   }
 }
 ```
+**Log Output Examples:**
+```bash
+# Text Format
+2025-11-16 11:32:15.123 [INFO] [bifrost_bridge::proxy] [src/proxy.rs:65] Creating proxy instance for mode: Forward
+
+# JSON Format
+{
+  "timestamp": "2025-11-16T11:32:15.123Z",
+  "level": "info",
+  "target": "bifrost_bridge::proxy",
+  "module": "bifrost_bridge::proxy",
+  "file": "src/proxy.rs",
+  "line": 65,
+  "message": "Creating proxy instance for mode: Forward"
+}
+```
+**Enhanced Logging Coverage:**
+- **Proxy Factory:** Mode detection, configuration validation, TLS setup
+- **Connection Handling:** TCP/HTTPS binding, client connections, error tracking
+- **Static File Serving:** Mount resolution, file access, SPA handling
+- **Forward/Reverse Proxy:** Request routing, target communication, authentication
+- **Error Conditions:** Comprehensive error and warning logging with context
+**Dependencies Added:**
+- `chrono = { version = "0.4.38", features = ["serde"] }` for timestamp handling
+- Enhanced JSON serialization support for structured logging
 **Benefits:**
-- Better observability and debugging capabilities
-- Production-ready logging infrastructure
-- Configurable verbosity for different environments
-- Structured logs enable easier parsing and analysis
-- Multiple output options for different deployment scenarios
+- **Production Ready:** Structured JSON logs for log aggregation systems
+- **Flexible Configuration:** Both CLI and JSON configuration support
+- **Multiple Outputs:** Simultaneous logging to console and files
+- **Level Control:** Granular control over log verbosity per target
+- **Monitoring Ready:** Rich context and metadata for observability
+- **Backward Compatible:** Existing `RUST_LOG` environment variable support
+- **Performance Optimized:** Efficient async logging with minimal overhead
 
 ---
 
 ## 🎯 Next Priorities
 
-1. **High Priority:** Implement logging system (R015)
-2. **Medium Priority:** Add performance monitoring (R016)
-3. **Low Priority:** Add WebSocket support (R017)
+1. **Medium Priority:** Add performance monitoring (R016)
+2. **Low Priority:** Add WebSocket support (R017)
+
+## ✅ **Recent Implementations Completed**
+
+- **R014 (Thread Pool):** ✅ **FIXED** - Previously only configuration fields existed, now fully implemented with custom tokio runtime builder that actually uses the `worker_threads` value to configure thread pool size
+- **R015 (Logging System):** ✅ **COMPLETED** - Enhanced from basic env_logger to comprehensive structured logging system with JSON support, multiple output targets, CLI configuration, and detailed logging throughout the codebase
 
 ---
 

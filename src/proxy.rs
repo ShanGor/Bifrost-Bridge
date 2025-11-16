@@ -3,6 +3,7 @@ use crate::error::ProxyError;
 use crate::forward_proxy::ForwardProxy;
 use crate::reverse_proxy::ReverseProxy;
 use crate::static_files::StaticFileHandler;
+use log::{info, debug, warn, error};
 use hyper::{Response, StatusCode};
 use hyper::body::Bytes;
 use hyper::service::service_fn;
@@ -61,8 +62,15 @@ pub struct ProxyFactory;
 
 impl ProxyFactory {
     pub fn create_proxy(config: Config) -> Result<Box<dyn Proxy + Send>, ProxyError> {
+        info!("Creating proxy instance for mode: {:?}", config.mode);
+        debug!("Proxy configuration - listen_addr: {}, max_connections: {:?}",
+               config.listen_addr, config.max_connections);
+
         match config.mode {
             ProxyMode::Forward => {
+                info!("Initializing Forward Proxy mode");
+                debug!("Forward proxy configuration - connection_pool: {:?}, pool_max_idle: {:?}",
+                       config.connection_pool_enabled, config.pool_max_idle_per_host);
                 // Support backward compatibility with timeout_secs
                 let connect_timeout_secs = config.connect_timeout_secs
                     .or(config.timeout_secs)
@@ -109,9 +117,12 @@ impl ProxyFactory {
                 }))
             }
             ProxyMode::Reverse => {
+                info!("Initializing Reverse Proxy mode");
+
                 if config.static_files.is_some() && config.reverse_proxy_target.is_none() {
-                    // Static files only mode
+                    info!("Static files only mode (no reverse proxy target)");
                     let static_config = config.static_files.unwrap();
+                    debug!("Static files configuration - mounts: {}", static_config.mounts.len());
                     let handler = StaticFileHandler::new(static_config)?;
                     Ok(Box::new(StaticFileProxyAdapter {
                         handler,
@@ -123,6 +134,7 @@ impl ProxyFactory {
                     // Reverse proxy mode (with or without static files)
                     let target_url = config.reverse_proxy_target
                         .ok_or_else(|| ProxyError::Config("Reverse proxy target URL is required for reverse proxy mode".to_string()))?;
+                    info!("Reverse proxy target: {}", target_url);
                     // Support backward compatibility with timeout_secs
                     let connect_timeout_secs = config.connect_timeout_secs
                         .or(config.timeout_secs)
@@ -199,19 +211,24 @@ impl Proxy for StaticFileProxyAdapter {
             match (private_key, certificate) {
                 (Some(private_key_path), Some(cert_path)) => {
                     // HTTPS mode
+                    info!("Enabling HTTPS/TLS mode");
+                    debug!("Loading TLS certificate from: {}", cert_path);
+                    debug!("Loading TLS private key from: {}", private_key_path);
+
                     let tls_config = create_tls_config(&private_key_path, &cert_path)?;
                     let tls_config = Arc::new(tls_config);
                     let acceptor = TlsAcceptor::from(tls_config.clone());
 
+                    info!("Binding TCP listener to: {}", addr);
                     let tcp_listener = tokio::net::TcpListener::bind(&addr).await
                         .map_err(|e| ProxyError::Io(e))?;
 
-                    println!("HTTPS static file server listening on: https://{}", addr);
-                    println!("Certificate: {}", cert_path);
-                    println!("Private key: {}", private_key_path);
+                    info!("HTTPS static file server listening on: https://{}", addr);
+                    debug!("TLS certificate file: {}", cert_path);
+                    debug!("TLS private key file: {}", private_key_path);
 
                     loop {
-                        let (tcp_stream, _) = tcp_listener.accept().await
+                        let (tcp_stream, remote_addr) = tcp_listener.accept().await
                             .map_err(|e| ProxyError::Io(e))?;
                         let acceptor = acceptor.clone();
                         let handler_ref = handler.clone();
@@ -239,11 +256,12 @@ impl Proxy for StaticFileProxyAdapter {
                                         .serve_connection(TokioIo::new(tls_stream), service)
                                         .await
                                     {
-                                        eprintln!("Error serving connection: {}", e);
+                                        error!("Error serving TLS connection: {}", e);
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("Error establishing TLS connection: {}", e);
+                                    warn!("Error establishing TLS connection from {}: {}",
+                                          remote_addr, e);
                                 }
                             }
                         });
@@ -251,9 +269,11 @@ impl Proxy for StaticFileProxyAdapter {
                 }
                 _ => {
                     // HTTP mode
+                    info!("Running in HTTP mode (no TLS)");
+                    info!("Binding HTTP listener to: {}", addr);
                     let listener = tokio::net::TcpListener::bind(addr).await
                         .map_err(|e| ProxyError::Hyper(e.to_string()))?;
-                    println!("HTTP static file server listening on: http://{}", addr);
+                    info!("HTTP static file server listening on: http://{}", addr);
 
                     loop {
                         let (stream, _) = listener.accept().await
@@ -283,7 +303,7 @@ impl Proxy for StaticFileProxyAdapter {
                                 )
                                 .await
                             {
-                                eprintln!("Error serving connection: {}", err);
+                                error!("Error serving HTTP connection: {}", err);
                             }
                         });
                     }

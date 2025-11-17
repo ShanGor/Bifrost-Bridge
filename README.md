@@ -515,6 +515,21 @@ Potential improvements for production use:
 - WebSocket proxying
 - HTTP/2 support
 
+## Documentation
+
+- **[Configuration Guide](docs/configuration.md)** - Comprehensive configuration options
+- **[Installation Guide](docs/installation.md)** - Setup and installation instructions
+- **[Requirements](requirements/)** - Detailed requirements and implementation status
+
+## Requirements
+
+All project requirements, features, and implementation details are documented in the [requirements/](requirements/) folder with individual files for each requirement:
+
+- [Requirements Index](requirements/README.md) - Overview of all requirements
+- [R001: Multiple Static Roots](requirements/R001-multiple-static-roots.md)
+- [R021: Tokio Worker Threads](requirements/R021-tokio-worker-threads.md) - Latest implementation
+- And many more...
+
 ## License
 
 This project is licensed under the MIT License.

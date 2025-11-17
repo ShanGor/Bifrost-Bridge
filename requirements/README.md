@@ -27,13 +27,13 @@ This folder contains all requirements, feature requests, and implementation deta
 
 ### 📝 **Pending Requirements**
 
-| ID | Requirement | Status | Date Raised | Description |
-|----|-------------|--------|------------|-------------|
+| ID | Requirement | Status     | Date Raised | Description |
+|----|-------------|------------|------------|-------------|
 | [R016](R016-performance-monitoring.md) | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
 | [R017](R017-websocket-support.md) | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
 | [R018](R018-rate-limiting.md) | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
 | [R019](R019-health-check-endpoint.md) | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
-| [R020](R020-documentation-maintenance.md) | Documentation Maintenance | 📋 Pending | 2025-11-16 | Ensure documentation stays updated with code changes |
+| [R020](R020-documentation-maintenance.md) | Documentation Maintenance | 📋 Ongoing | 2025-11-16 | Ensure documentation stays updated with code changes |
 
 ## 🎯 Next Priorities
 

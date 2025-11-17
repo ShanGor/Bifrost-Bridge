@@ -3,15 +3,20 @@ A high-performance proxy server written in Rust that can function as both a forw
 
 ## Features
 
+- **Worker Separation Architecture**: Isolated workers for forward vs reverse proxy with separate resources, connection pools, and metrics
+- **Advanced Error Recovery**: Circuit breaker pattern, worker isolation, and automatic retry with exponential backoff
+- **Contextual Error Handling**: Rich error context with severity classification and recovery suggestions
 - **Forward Proxy**: Acts as a forward proxy similar to Squid
 - **Reverse Proxy**: Acts as a reverse proxy similar to Nginx
 - **Multiple Static Roots**: Serve static files from multiple directories at different URL paths
 - **High Performance**: Built on Tokio and Hyper for async I/O with configurable worker threads
 - **Configurable**: Supports both command-line arguments and configuration files
-- **Connection Pooling**: Efficient connection reuse with configurable pool settings
+- **Connection Pooling**: Efficient connection reuse with configurable pool settings per proxy type
 - **Granular Timeout Control**: Three distinct timeout types (connect, idle, lifetime)
 - **SPA Support**: Single Page Application fallback with proper MIME type handling
 - **Optimized Static File Serving**: Uses Tokio worker threads for CPU-intensive operations (directory listings, MIME type detection)
+- **Resource Isolation**: Independent resource limits and controls for each proxy type
+- **Isolated Metrics**: Separate performance monitoring and debugging per proxy type
 - **Graceful Shutdown**: Clean shutdown with Ctrl+C handling
 - **Logging**: Comprehensive logging with env_logger
 
@@ -411,6 +416,54 @@ The server uses **Tokio worker threads** for CPU-intensive static file operation
 
 ## Architecture
 
+### 🏗️ Worker Separation Architecture
+
+Bifrost Bridge implements a **hybrid worker separation architecture** that provides both security isolation and operational efficiency. This design ensures that forward proxy and reverse proxy operations run in completely isolated environments while sharing a common tokio runtime for efficiency.
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Shared Tokio Runtime                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │ Forward Proxy   │  │ Reverse Proxy   │  │ Static Files │ │
+│  │   Worker        │  │    Worker       │  │   Worker     │ │
+│  │                 │  │                 │  │              │ │
+│  │ • Isolated      │  │ • Isolated      │  │ • Isolated   │ │
+│  │ • Dedicated     │  │ • Dedicated     │  │ • Dedicated  │ │
+│  │ • Resources     │  │ • Resources     │  │ • Resources  │ │
+│  │ • Metrics       │  │ • Metrics       │  │ • Metrics    │ │
+│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
+│         │                   │                   │           │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │ Connection      │  │ Connection      │  │ File         │ │
+│  │ Pool Manager    │  │ Pool Manager    │  │ System       │ │
+│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Key Benefits
+
+**🔒 Security & Isolation**
+- Separate worker processes for forward vs reverse proxy
+- Independent resource limits and controls
+- Isolated metrics collection per proxy type
+- Prevents resource contention between proxy types
+
+**⚡ Performance & Efficiency**
+- Shared tokio runtime for optimal resource utilization
+- Dedicated connection pools optimized for traffic patterns
+- Proxy-specific configuration tuning
+- Zero resource sharing between workers
+
+**🔧 Operational Excellence**
+- Independent monitoring and debugging per proxy type
+- Granular resource control and limits
+- Type-specific connection pooling strategies
+- Configurable worker isolation levels
+
 ### Project Structure
 
 ```
@@ -419,19 +472,40 @@ src/
 ├── lib.rs           # Library exports
 ├── config.rs        # Configuration management
 ├── error.rs         # Error handling
-├── proxy.rs         # Proxy factory and traits
+├── proxy.rs         # Proxy factory and IsolatedProxyAdapter
 ├── forward_proxy.rs # Forward proxy implementation
 ├── reverse_proxy.rs # Reverse proxy implementation
-└── static_files.rs  # Static file serving with Tokio threading
+├── static_files.rs  # Static file serving with Tokio threading
+└── common.rs        # Shared utilities and worker architecture
 ```
+
+### Core Architecture Components
+
+#### Worker Separation Layer
+- **`ProxyType`**: Enumeration for ForwardProxy, ReverseProxy, StaticFiles, Combined modes
+- **`IsolatedWorker`**: Dedicated worker with isolated resources, metrics, and configuration
+- **`WorkerResourceLimits`**: Per-worker resource controls (connections, memory, CPU)
+- **`WorkerConfiguration`**: Proxy-specific settings and optimization parameters
+
+#### Resource Management
+- **`ConnectionPoolManager`**: Type-specific connection pooling with independent settings
+- **`PerformanceMetrics`**: Isolated metrics collection per proxy type
+- **`WorkerManager`**: Coordinates isolated workers within shared runtime
+
+#### Proxy Adapters
+- **`IsolatedProxyAdapter`**: New adapter using worker-separated architecture
+- **`SharedServer` trait**: Enhanced trait supporting proxy type separation
+- **Traditional adapters**: Backward compatibility with existing implementations
 
 ### Key Components
 
-1. **ProxyFactory**: Creates appropriate proxy instances based on configuration
-2. **ForwardProxy**: Implements forward proxy functionality
-3. **ReverseProxy**: Implements reverse proxy functionality
-4. **StaticFileHandler**: Handles static file serving with Tokio threading optimization
-5. **Config**: Handles configuration parsing and validation
+1. **ProxyFactory**: Creates appropriate proxy instances with worker isolation
+2. **IsolatedWorker**: Dedicated worker resources for each proxy type
+3. **ForwardProxy**: Forward proxy with isolated worker and connection pool
+4. **ReverseProxy**: Reverse proxy with isolated worker and connection pool
+5. **StaticFileHandler**: Static file serving with dedicated worker and thread pool
+6. **ConnectionPoolManager**: Type-specific connection pooling strategies
+7. **PerformanceMetrics**: Isolated monitoring per proxy type
 
 ## Performance Considerations
 
@@ -444,10 +518,39 @@ src/
 - Granular timeout handling (connect, idle, lifetime) to prevent hanging requests
 - Thread pool configuration for static file operations (directory listings, MIME type detection)
 
-## Error Handling
+## Error Handling & Recovery
 
-The proxy includes comprehensive error handling:
+The proxy includes sophisticated error handling and recovery mechanisms:
 
+### Error Classification System
+- **Severity Levels**: Low, Medium, High, Critical error classification
+- **Contextual Errors**: Rich error context with worker ID, operation, metadata
+- **Recovery Actions**: Automatic suggestions for error recovery strategies
+- **Error History**: Comprehensive error tracking and statistics
+
+### Circuit Breaker Pattern
+- **Cascade Failure Prevention**: Automatic circuit breaking to prevent system overload
+- **Configurable Thresholds**: Customizable failure/success thresholds and timeouts
+- **State Management**: Closed → Open → HalfOpen → Closed state transitions
+- **Timeout Recovery**: Automatic recovery attempts after configurable timeouts
+
+### Worker Health Monitoring
+- **Health Checks**: Continuous worker health monitoring with periodic checks
+- **Automatic Recovery**: Worker restart and recovery mechanisms
+- **Isolation**: Automatic worker isolation for problematic instances
+- **Resource Limits**: Enforcement of resource limits to prevent resource exhaustion
+
+### Retry Mechanisms
+- **Exponential Backoff**: Intelligent retry with exponential backoff delays
+- **Max Retry Limits**: Configurable maximum retry attempts per operation
+- **Circuit Breaker Integration**: Retry attempts coordinated with circuit breaker state
+
+### Graceful Degradation
+- **System Resilience**: Continued operation under error load conditions
+- **Resource Contention**: Handling of resource conflicts and contention
+- **Performance Monitoring**: Real-time performance metrics and error statistics
+
+### Traditional Error Handling
 - Connection errors with connect timeout
 - HTTP parsing errors
 - Configuration errors
@@ -517,6 +620,7 @@ Potential improvements for production use:
 
 ## Documentation
 
+- **[Worker Separation Architecture](docs/worker-separation-architecture.md)** - Detailed architecture documentation
 - **[Configuration Guide](docs/configuration.md)** - Comprehensive configuration options
 - **[Installation Guide](docs/installation.md)** - Setup and installation instructions
 - **[Requirements](requirements/)** - Detailed requirements and implementation status

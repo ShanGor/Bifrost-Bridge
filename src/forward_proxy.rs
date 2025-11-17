@@ -8,6 +8,8 @@
 
 use crate::error::ProxyError;
 use crate::config::RelayProxyConfig;
+use crate::common::{ResponseBuilder, TlsConfig};
+use rustls::ServerConfig;
 use hyper::{Request, Response, StatusCode, Uri, Method};
 use hyper::body::{Bytes, Incoming};
 use http_body_util::{BodyExt, Full};
@@ -17,14 +19,11 @@ use log::{info, error, debug};
 use hyper_util::rt::TokioIo;
 use hyper::header::{HOST, PROXY_AUTHORIZATION, HeaderValue};
 use std::convert::Infallible;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
-use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use base64::{Engine as _, engine::general_purpose};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
@@ -253,7 +252,7 @@ impl ForwardProxy {
         match (private_key, certificate) {
             (Some(private_key_path), Some(cert_path)) => {
                 // HTTPS mode
-                let tls_config = create_tls_config(&private_key_path, &cert_path)?;
+                let tls_config = TlsConfig::create_config(&private_key_path, &cert_path)?;
                 self.run_https(addr, Some(Arc::new(tls_config))).await
             }
             _ => {
@@ -790,10 +789,7 @@ impl ForwardProxy {
         // Extract host and port from CONNECT request
         let authority = match req.uri().authority() {
             Some(auth) => auth,
-            None => return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("Invalid CONNECT target")))
-                .unwrap()),
+            None => return Ok(ResponseBuilder::error(StatusCode::BAD_REQUEST, "Invalid CONNECT target")),
         };
 
         let host = authority.host().to_string();
@@ -1211,39 +1207,7 @@ impl ForwardProxy {
 
 }
 
-/// Create TLS server configuration from certificate and private key files
-fn create_tls_config(private_key_path: &str, cert_path: &str) -> Result<ServerConfig, ProxyError> {
-    let mut private_key_file = BufReader::new(
-        File::open(private_key_path)
-            .map_err(|e| ProxyError::Config(format!("Failed to open private key file: {}", e)))?
-    );
-
-    let mut cert_file = BufReader::new(
-        File::open(cert_path)
-            .map_err(|e| ProxyError::Config(format!("Failed to open certificate file: {}", e)))?
-    );
-
-    // Load certificate chain
-    let certs = rustls_pemfile::certs(&mut cert_file)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ProxyError::Config(format!("Failed to read certificate: {}", e)))?;
-
-    if certs.is_empty() {
-        return Err(ProxyError::Config("No valid certificate found".to_string()));
-    }
-
-    // Try to load private key in different formats
-    let private_key = rustls_pemfile::private_key(&mut private_key_file)
-        .map_err(|e| ProxyError::Config(format!("Failed to read private key: {}", e)))?
-        .ok_or_else(|| ProxyError::Config("No valid private key found".to_string()))?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, private_key)
-        .map_err(|e| ProxyError::Config(format!("Failed to create TLS config: {}", e)))?;
-
-    Ok(config)
-}
+// TLS configuration is now handled by TlsConfig::create_config in common.rs
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,7 @@
     "mounts": [
       {
         "path": "/ui",
-        "root_dir": "D:\\sources\\api-helper\\api-helper-frontend\\dist"
+        "root_dir": "D:\\sources\\git\\js\\ai-chat-ui\\dist"
       }
     ],
     "enable_directory_listing": false,
@@ -17,6 +17,6 @@
     "spa_mode": true,
     "spa_fallback_file": "index.html"
   },
-  "private_key": "D:\\sources\\rust\\proxy-server\\examples\\localhost.key",
-  "certificate": "D:\\sources\\rust\\proxy-server\\examples\\localhost.crt"
+  "private_key": "D:\\sources\\rust\\bifrost-bridge\\examples\\localhost.key",
+  "certificate": "D:\\sources\\rust\\bifrost-bridge\\examples\\localhost.crt"
 }

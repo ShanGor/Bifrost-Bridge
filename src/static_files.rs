@@ -1,5 +1,6 @@
 use crate::error::ProxyError;
 use crate::config::{StaticFileConfig, ResolvedStaticMount};
+use crate::common::FileStreaming;
 use hyper::{Method, Response, StatusCode};
 use hyper::body::Incoming;
 use http_body_util::Full;
@@ -290,26 +291,14 @@ impl StaticFileHandler {
             Self::guess_mime_type_static(&file_path_clone, &custom_mime_types_clone)
         }).await.map_err(|e| ProxyError::Config(format!("MIME type detection error: {}", e)))?;
 
-        let last_modified = metadata.modified()
+        let _last_modified = metadata.modified()
             .map_err(|e| ProxyError::Config(format!("Cannot get file metadata: {}", e)))?;
 
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", mime_type)
-            .header("Content-Length", metadata.len().to_string())
-            .header("Last-Modified", httpdate::fmt_http_date(last_modified))
-            .header("Cache-Control", "public, max-age=3600");
+        // Check file size and use optimized serving strategy
+        let file_size = FileStreaming::get_file_size(file_path).await?;
 
-        let body = if is_head {
-            Full::new(Bytes::new())
-        } else {
-            // Simplified approach: read file into memory for this migration
-            let contents = tokio::fs::read(file_path).await
-                .map_err(|e| ProxyError::Config(format!("Cannot read file: {}", e)))?;
-            Full::new(Bytes::from(contents))
-        };
-
-        response.body(body).map_err(|e| ProxyError::Http(e.to_string()))
+        // Use centralized optimized response with all proper headers
+        FileStreaming::create_optimized_response(file_path, &mime_type, file_size, is_head).await
     }
 
     // handle_directory is replaced by handle_directory_in_mount for multi-mount support

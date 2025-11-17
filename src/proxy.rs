@@ -128,8 +128,34 @@ impl ProxyFactory {
                         private_key: config.private_key,
                         certificate: config.certificate,
                     }))
+                } else if config.static_files.is_some() && config.reverse_proxy_target.is_some() {
+                    // Combined mode: both reverse proxy and static files
+                    info!("Combined reverse proxy + static files mode");
+                    let static_config = config.static_files.unwrap();
+                    debug!("Static files configuration - mounts: {}", static_config.mounts.len());
+                    let handler = StaticFileHandler::new(static_config)?;
+
+                    let target_url = config.reverse_proxy_target.unwrap();
+                    info!("Reverse proxy target: {}", target_url);
+                    // Support backward compatibility with timeout_secs
+                    let connect_timeout_secs = config.connect_timeout_secs
+                        .or(config.timeout_secs)
+                        .unwrap_or(10);
+                    let idle_timeout_secs = config.idle_timeout_secs
+                        .unwrap_or(90);
+                    let max_connection_lifetime_secs = config.max_connection_lifetime_secs
+                        .unwrap_or(300);
+                    let proxy = ReverseProxy::new(target_url, connect_timeout_secs, idle_timeout_secs, max_connection_lifetime_secs)?;
+
+                    Ok(Box::new(CombinedProxyAdapter {
+                        reverse_proxy: proxy,
+                        static_handler: handler,
+                        addr: config.listen_addr,
+                        private_key: config.private_key,
+                        certificate: config.certificate,
+                    }))
                 } else {
-                    // Reverse proxy mode (with or without static files)
+                    // Reverse proxy only mode
                     let target_url = config.reverse_proxy_target
                         .ok_or_else(|| ProxyError::Config("Reverse proxy target URL is required for reverse proxy mode".to_string()))?;
                     info!("Reverse proxy target: {}", target_url);
@@ -294,6 +320,206 @@ impl Proxy for StaticFileProxyAdapter {
                                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                                                         .body(Full::new(Bytes::from("Internal Server Error")))
                                                         .unwrap())
+                                                }
+                                            }
+                                        }
+                                    })
+                                )
+                                .await
+                            {
+                                error!("Error serving HTTP connection: {}", err);
+                            }
+                        });
+                    }
+                }
+            }
+        })
+    }
+}
+
+struct CombinedProxyAdapter {
+    reverse_proxy: ReverseProxy,
+    static_handler: StaticFileHandler,
+    addr: std::net::SocketAddr,
+    #[allow(dead_code)]
+    private_key: Option<String>,
+    #[allow(dead_code)]
+    certificate: Option<String>,
+}
+
+impl Proxy for CombinedProxyAdapter {
+    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+        Box::pin(async move {
+            let addr = self.addr;
+            let private_key = self.private_key;
+            let certificate = self.certificate;
+            let reverse_proxy = Arc::new(self.reverse_proxy);
+            let static_handler = Arc::new(self.static_handler);
+
+            match (private_key, certificate) {
+                (Some(private_key_path), Some(cert_path)) => {
+                    // HTTPS mode
+                    info!("Enabling HTTPS/TLS mode for combined proxy");
+                    debug!("Loading TLS certificate from: {}", cert_path);
+                    debug!("Loading TLS private key from: {}", private_key_path);
+
+                    let tls_config = create_tls_config(&private_key_path, &cert_path)?;
+                    let tls_config = Arc::new(tls_config);
+                    let acceptor = TlsAcceptor::from(tls_config.clone());
+
+                    info!("Binding TCP listener to: {}", addr);
+                    let tcp_listener = tokio::net::TcpListener::bind(&addr).await
+                        .map_err(|e| ProxyError::Io(e))?;
+
+                    info!("HTTPS combined proxy server listening on: https://{}", addr);
+                    debug!("TLS certificate file: {}", cert_path);
+                    debug!("TLS private key file: {}", private_key_path);
+
+                    loop {
+                        let (tcp_stream, remote_addr) = tcp_listener.accept().await
+                            .map_err(|e| ProxyError::Io(e))?;
+                        let acceptor = acceptor.clone();
+                        let reverse_proxy_ref = reverse_proxy.clone();
+                        let static_handler_ref = static_handler.clone();
+
+                        tokio::spawn(async move {
+                            match acceptor.accept(tcp_stream).await {
+                                Ok(tls_stream) => {
+                                    let service = service_fn(move |req| {
+                                        let reverse_proxy = reverse_proxy_ref.clone();
+                                        let static_handler = static_handler_ref.clone();
+                                        async move {
+                                            // Route request to appropriate handler
+                                            let request_path = req.uri().path();
+
+                                            // Check if request matches any static file mount
+                                            if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(request_path) {
+                                                // Serve static file
+                                                match static_handler.handle_request(&req).await {
+                                                    Ok(response) => Ok::<_, Infallible>(response),
+                                                    Err(ProxyError::NotFound(_)) => {
+                                                        // Fall back to reverse proxy if static file not found
+                                                        let context = crate::reverse_proxy::RequestContext {
+                                                            client_ip: Some(remote_addr.ip().to_string()),
+                                                        };
+                                                        match reverse_proxy.handle_request_with_context(req, context).await {
+                                                            Ok(response) => Ok::<_, Infallible>(response),
+                                                            Err(_) => {
+                                                                Ok::<_, Infallible>(Response::builder()
+                                                                    .status(StatusCode::BAD_GATEWAY)
+                                                                    .body(Full::new(Bytes::from("Proxy Error")))
+                                                                    .unwrap())
+                                                            }
+                                                        }
+                                                    },
+                                                    Err(_) => {
+                                                        Ok::<_, Infallible>(Response::builder()
+                                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                            .body(Full::new(Bytes::from("Internal Server Error")))
+                                                            .unwrap())
+                                                    }
+                                                }
+                                            } else {
+                                                // Forward to reverse proxy
+                                                let context = crate::reverse_proxy::RequestContext {
+                                                    client_ip: Some(remote_addr.ip().to_string()),
+                                                };
+                                                match reverse_proxy.handle_request_with_context(req, context).await {
+                                                    Ok(response) => Ok::<_, Infallible>(response),
+                                                    Err(_) => {
+                                                        Ok::<_, Infallible>(Response::builder()
+                                                            .status(StatusCode::BAD_GATEWAY)
+                                                            .body(Full::new(Bytes::from("Proxy Error")))
+                                                            .unwrap())
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    if let Err(e) = ServerBuilder::new()
+                                        .keep_alive(true)
+                                        .serve_connection(TokioIo::new(tls_stream), service)
+                                        .await
+                                    {
+                                        error!("Error serving TLS connection: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Error establishing TLS connection from {}: {}",
+                                          remote_addr, e);
+                                }
+                            }
+                        });
+                    }
+                }
+                _ => {
+                    // HTTP mode
+                    info!("Running in HTTP mode for combined proxy");
+                    info!("Binding HTTP listener to: {}", addr);
+                    let listener = tokio::net::TcpListener::bind(addr).await
+                        .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+                    info!("HTTP combined proxy server listening on: http://{}", addr);
+
+                    loop {
+                        let (stream, remote_addr) = listener.accept().await
+                            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+
+                        let reverse_proxy = reverse_proxy.clone();
+                        let static_handler = static_handler.clone();
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+
+                            if let Err(err) = ServerBuilder::new()
+                                .serve_connection(
+                                    io,
+                                    service_fn(move |req| {
+                                        let reverse_proxy = reverse_proxy.clone();
+                                        let static_handler = static_handler.clone();
+                                        async move {
+                                            // Route request to appropriate handler
+                                            let request_path = req.uri().path();
+
+                                            // Check if request matches any static file mount
+                                            if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(request_path) {
+                                                // Serve static file
+                                                match static_handler.handle_request(&req).await {
+                                                    Ok(response) => Ok::<_, Infallible>(response),
+                                                    Err(ProxyError::NotFound(_)) => {
+                                                        // Fall back to reverse proxy if static file not found
+                                                        let context = crate::reverse_proxy::RequestContext {
+                                                            client_ip: Some(remote_addr.ip().to_string()),
+                                                        };
+                                                        match reverse_proxy.handle_request_with_context(req, context).await {
+                                                            Ok(response) => Ok::<_, Infallible>(response),
+                                                            Err(_) => {
+                                                                Ok::<_, Infallible>(Response::builder()
+                                                                    .status(StatusCode::BAD_GATEWAY)
+                                                                    .body(Full::new(Bytes::from("Proxy Error")))
+                                                                    .unwrap())
+                                                            }
+                                                        }
+                                                    },
+                                                    Err(_) => {
+                                                        Ok::<_, Infallible>(Response::builder()
+                                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                            .body(Full::new(Bytes::from("Internal Server Error")))
+                                                            .unwrap())
+                                                    }
+                                                }
+                                            } else {
+                                                // Forward to reverse proxy
+                                                let context = crate::reverse_proxy::RequestContext {
+                                                    client_ip: Some(remote_addr.ip().to_string()),
+                                                };
+                                                match reverse_proxy.handle_request_with_context(req, context).await {
+                                                    Ok(response) => Ok::<_, Infallible>(response),
+                                                    Err(_) => {
+                                                        Ok::<_, Infallible>(Response::builder()
+                                                            .status(StatusCode::BAD_GATEWAY)
+                                                            .body(Full::new(Bytes::from("Proxy Error")))
+                                                            .unwrap())
+                                                    }
                                                 }
                                             }
                                         }

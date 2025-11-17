@@ -23,8 +23,8 @@ use url::Url;
 
 /// Wrapper to store request data including client IP
 #[derive(Clone, Debug)]
-struct RequestContext {
-    client_ip: Option<String>,
+pub struct RequestContext {
+    pub client_ip: Option<String>,
 }
 
 pub struct ReverseProxy {
@@ -109,7 +109,7 @@ impl ReverseProxy {
     }
 
   
-    async fn handle_request_with_context(&self, req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, Infallible> {
+    pub async fn handle_request_with_context(&self, req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, Infallible> {
         match self.process_request_with_context(req, context).await {
             Ok(response) => Ok(response),
             Err(e) => {

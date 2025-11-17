@@ -51,7 +51,7 @@ struct Args {
     #[clap(long, value_name = "FILE", help = "SPA fallback file name (default: index.html)")]
     spa_fallback: Option<String>,
 
-    #[clap(long, value_name = "NUM", help = "Number of worker threads for static file serving")]
+    #[clap(long, value_name = "NUM", help = "Number of worker threads for reverse proxy and static file serving (shared)")]
     worker_threads: Option<usize>,
 
     #[clap(long, value_name = "EXT:MIME", help = "Custom MIME type mapping (e.g., mjs:application/javascript), can be used multiple times")]
@@ -146,9 +146,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_config(&config)?;
 
     // Create tokio runtime with custom thread pool if configured
-    let runtime = if let Some(worker_threads) = config.static_files.as_ref()
-        .and_then(|sf| sf.worker_threads) {
-        info!("Starting tokio runtime with {} worker threads", worker_threads);
+    // Priority: static_files.worker_threads > top-level worker_threads > default
+    let worker_threads = config.static_files.as_ref()
+        .and_then(|sf| sf.worker_threads)
+        .or(config.worker_threads);
+
+    let runtime = if let Some(worker_threads) = worker_threads {
+        info!("Starting tokio runtime with {} worker threads (shared for reverse proxy and static files)", worker_threads);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .enable_all()
@@ -217,7 +221,8 @@ fn generate_sample_config(file_path: &str) -> Result<(), Box<dyn std::error::Err
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,
   "max_connection_lifetime_secs": 300,
-  "max_header_size": 16384
+  "max_header_size": 16384,
+  "worker_threads": 4
 }"#;
 
     let sample_spa = r#"{
@@ -274,6 +279,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         idle_timeout_secs: args.idle_timeout,
         max_connection_lifetime_secs: args.max_connection_lifetime,
         timeout_secs: args.timeout,
+        worker_threads: args.worker_threads,
         static_files: None,
         private_key: args.private_key.clone(),
         certificate: args.certificate.clone(),
@@ -364,6 +370,18 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Validate worker_threads configuration
+    // Check top-level worker_threads first (shared for reverse proxy + static files)
+    if let Some(worker_threads) = config.worker_threads {
+        if worker_threads == 0 {
+            return Err("worker_threads must be greater than 0".into());
+        }
+        if worker_threads > 512 {
+            return Err("worker_threads cannot exceed 512".into());
+        }
+        info!("Configuration validated: shared worker_threads = {}", worker_threads);
+    }
+
+    // Check static_files specific worker_threads (backward compatibility)
     if let Some(static_files) = &config.static_files {
         if let Some(worker_threads) = static_files.worker_threads {
             if worker_threads == 0 {
@@ -372,7 +390,7 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             if worker_threads > 512 {
                 return Err("worker_threads cannot exceed 512".into());
             }
-            info!("Configuration validated: worker_threads = {}", worker_threads);
+            info!("Configuration validated: static_files worker_threads = {} (takes priority over shared worker_threads)", worker_threads);
         }
     }
 

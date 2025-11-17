@@ -229,6 +229,9 @@ pub struct Config {
     // Legacy timeout field for backward compatibility
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    // Worker threads for reverse proxy and static file serving (shared)
+    #[serde(default)]
+    pub worker_threads: Option<usize>,
     pub static_files: Option<StaticFileConfig>,
     #[serde(default)]
     pub private_key: Option<String>,
@@ -275,6 +278,7 @@ impl Default for Config {
             idle_timeout_secs: Some(90),
             max_connection_lifetime_secs: Some(300),
             timeout_secs: None,
+            worker_threads: None,
             static_files: None,
             private_key: None,
             certificate: None,

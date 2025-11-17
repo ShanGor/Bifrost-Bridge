@@ -58,7 +58,7 @@ pub struct StaticFileHandler {
 }
 
 #[derive(Clone)]
-struct MountInfo {
+pub struct MountInfo {
     resolved_mount: ResolvedStaticMount,
     root_path: std::path::PathBuf,
     path_len: usize,
@@ -127,7 +127,7 @@ impl StaticFileHandler {
         self.handle_file(&file_path, req.method() == Method::HEAD).await
     }
 
-    fn find_mount_for_path(&self, path: &str) -> Option<(&MountInfo, String)> {
+    pub fn find_mount_for_path(&self, path: &str) -> Option<(&MountInfo, String)> {
         for mount_info in &self.mounts {
             if path.starts_with(&mount_info.resolved_mount.path) {
                 let relative_path = if mount_info.resolved_mount.path == "/" {

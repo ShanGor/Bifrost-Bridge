@@ -50,6 +50,44 @@ const HTML_DIR_PARENT_LINK: &str = r#"        <li><a href="../">📁 ../</a></li
 /// Template for directory entry in directory listing
 const HTML_DIR_ENTRY_TEMPLATE: &str = r#"        <li class="{class}"><a href="{href}">{icon}</a></li>"#;
 
+/// Helper function to detect if a file is an index file based on configuration
+fn is_index_file(path: &Path, index_files: &[String]) -> bool {
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        index_files.iter().any(|index| index.to_lowercase() == file_name.to_lowercase())
+    } else {
+        false
+    }
+}
+
+/// Helper function to detect if a file matches no-cache patterns
+fn is_no_cache_file(path: &Path, no_cache_files: &[String]) -> bool {
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        no_cache_files.iter().any(|pattern| {
+            // Support both exact matches and extension patterns like "*.js"
+            if pattern.starts_with("*.") {
+                // Extension pattern (e.g., "*.js" matches any .js file)
+                let ext = pattern.strip_prefix("*.").unwrap().to_lowercase();
+                if let Some(file_ext) = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()) {
+                    return file_ext.to_lowercase() == ext;
+                }
+            } else {
+                // Exact filename match (case-insensitive)
+                return pattern.to_lowercase() == file_name.to_lowercase();
+            }
+            false
+        })
+    } else {
+        false
+    }
+}
+
+/// Helper function to determine if no-cache headers should be used for SPA files and custom no-cache patterns
+fn should_use_no_cache_for_spa(file_path: &Path, spa_mode: bool, is_spa_fallback: bool, index_files: &[String], no_cache_files: &[String]) -> bool {
+    is_spa_fallback ||
+    (spa_mode && is_index_file(file_path, index_files)) ||
+    is_no_cache_file(file_path, no_cache_files)
+}
+
 #[derive(Clone)]
 pub struct StaticFileHandler {
     // Pre-computed mount information for faster lookup
@@ -125,7 +163,7 @@ impl StaticFileHandler {
             return self.handle_directory_in_mount(mount_info, &file_path, &relative_path, req.method() == Method::HEAD).await;
         }
 
-        self.handle_file(&file_path, req.method() == Method::HEAD).await
+        self.handle_file_with_mount_info(&file_path, req.method() == Method::HEAD, Some(mount_info), false).await
     }
 
     pub fn find_mount_for_path(&self, path: &str) -> Option<(&MountInfo, String)> {
@@ -169,7 +207,7 @@ impl StaticFileHandler {
             return Ok(self.not_found_response());
         }
 
-        self.handle_file(&fallback_path, is_head).await
+        self.handle_file_with_mount_info(&fallback_path, is_head, Some(mount_info), true).await
     }
 
     async fn handle_directory_in_mount(&self, mount_info: &MountInfo, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
@@ -178,7 +216,7 @@ impl StaticFileHandler {
             for index_file in &mount_info.resolved_mount.index_files {
                 let index_path = dir_path.join(index_file);
                 if index_path.exists() && index_path.is_file() {
-                    return self.handle_file(&index_path, is_head).await;
+                    return self.handle_file_with_mount_info(&index_path, is_head, Some(mount_info), false).await;
                 }
             }
 
@@ -277,6 +315,18 @@ impl StaticFileHandler {
     // resolve_file_path is replaced by resolve_file_path_in_mount for multi-mount support
 
     async fn handle_file(&self, file_path: &PathBuf, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
+        // Legacy method - defaults to non-SPA mode for backwards compatibility
+        self.handle_file_with_mount_info(file_path, is_head, None, false).await
+    }
+
+    /// Handle file with optional mount information for SPA-aware caching
+    pub async fn handle_file_with_mount_info(
+        &self,
+        file_path: &PathBuf,
+        is_head: bool,
+        mount_info: Option<&MountInfo>,
+        is_spa_fallback: bool,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let metadata = fs::metadata(file_path)
             .map_err(|_| ProxyError::NotFound(format!("File not found: {:?}", file_path)))?;
 
@@ -297,8 +347,27 @@ impl StaticFileHandler {
         // Check file size and use optimized serving strategy
         let file_size = FileStreaming::get_file_size(file_path).await?;
 
-        // Use centralized optimized response with all proper headers
-        FileStreaming::create_optimized_response(file_path, &mime_type, file_size, is_head).await
+        // Determine if we should use no-cache headers
+        let spa_mode = mount_info.map(|m| m.resolved_mount.spa_mode).unwrap_or(false);
+        let no_cache = if let Some(mount_info) = mount_info {
+            should_use_no_cache_for_spa(
+                file_path,
+                spa_mode,
+                is_spa_fallback,
+                &mount_info.resolved_mount.index_files,
+                &mount_info.resolved_mount.no_cache_files
+            )
+        } else {
+            should_use_no_cache_for_spa(file_path, spa_mode, is_spa_fallback, &vec![], &vec![])
+        };
+
+        // Get cache duration from configuration
+        let cache_duration = mount_info
+            .map(|m| m.resolved_mount.cache_millisecs)
+            .unwrap_or(3600);
+
+        // Use centralized optimized response with SPA-aware cache control
+        FileStreaming::create_optimized_response_with_cache(file_path, &mime_type, file_size, is_head, no_cache, cache_duration).await
     }
 
     // handle_directory is replaced by handle_directory_in_mount for multi-mount support

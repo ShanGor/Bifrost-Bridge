@@ -1,0 +1,34 @@
+{
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/app",
+        "root_dir": "./app",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "no_cache_files": ["*.html", "manifest.json"],
+        "cache_millisecs": 1800
+      },
+      {
+        "path": "/assets",
+        "root_dir": "./assets",
+        "spa_mode": false,
+        "no_cache_files": ["*.js"],
+        "cache_millisecs": 86400
+      },
+      {
+        "path": "/api",
+        "root_dir": "./api",
+        "spa_mode": false,
+        "no_cache_files": ["*.json", "*.xml"],
+        "cache_millisecs": 900
+      }
+    ],
+    "enable_directory_listing": false,
+    "index_files": ["index.html"],
+    "spa_mode": false,
+    "spa_fallback_file": "index.html",
+    "cache_millisecs": 3600,
+    "no_cache_files": []
+  }
+}

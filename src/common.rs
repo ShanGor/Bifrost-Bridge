@@ -169,6 +169,18 @@ impl FileStreaming {
         file_size: u64,
         is_head: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
+        Self::create_optimized_response_with_cache(file_path, content_type, file_size, is_head, false, 3600).await
+    }
+
+    /// Creates an optimized file response with custom cache control
+    pub async fn create_optimized_response_with_cache(
+        file_path: &Path,
+        content_type: &str,
+        file_size: u64,
+        is_head: bool,
+        no_cache: bool,
+        cache_millisecs: u64,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let body = if is_head {
             Full::new(Bytes::new())
         } else {
@@ -184,12 +196,18 @@ impl FileStreaming {
             Full::new(Bytes::from(contents))
         };
 
+        let cache_control = if no_cache {
+            "no-cache, no-store, must-revalidate".to_string()
+        } else {
+            format!("public, max-age={}", cache_millisecs)
+        };
+
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", content_type)
             .header("Content-Length", file_size.to_string())
             .header("Accept-Ranges", "bytes")
-            .header("Cache-Control", "public, max-age=3600")
+            .header("Cache-Control", cache_control)
             .body(body)
             .map_err(|e| ProxyError::Http(e.to_string()))?)
     }

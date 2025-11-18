@@ -358,6 +358,50 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 --static-dir ./dist --spa --
 - `spa_fallback_file`: Filename to serve for non-existent routes (default: `"index.html"`)
 - `root_dir`: Directory containing the built SPA assets
 - `enable_directory_listing`: Recommended to set to `false` for SPAs
+- `cache_millisecs`: Cache duration in seconds for static files (default: `3600`)
+- `no_cache_files`: Array of file patterns that should receive no-cache headers
+
+### Cache Control Configuration
+
+**Global Cache Settings:**
+```json
+{
+  "static_files": {
+    "cache_millisecs": 7200,
+    "no_cache_files": ["*.html", "*.json", "config.js"]
+  }
+}
+```
+
+**Per-Mount Cache Settings:**
+```json
+{
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/app",
+        "root_dir": "./app",
+        "spa_mode": true,
+        "cache_millisecs": 1800,
+        "no_cache_files": ["*.html", "manifest.json"]
+      },
+      {
+        "path": "/assets",
+        "root_dir": "./assets",
+        "cache_millisecs": 86400,
+        "no_cache_files": ["*.js"]
+      }
+    ]
+  }
+}
+```
+
+**No-Cache File Patterns:**
+- `*.js` - All JavaScript files (extension pattern)
+- `config.json` - Exact filename match
+- `*.html` - All HTML files
+- Patterns are case-insensitive
+- SPA index files automatically get no-cache headers in SPA mode
 
 ### CLI Arguments
 

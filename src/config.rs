@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+fn default_cache_millisecs() -> u64 {
+    3600
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -97,6 +101,10 @@ pub struct StaticMount {
     pub spa_mode: Option<bool>,
     #[serde(default)]
     pub spa_fallback_file: Option<String>,
+    #[serde(default)]
+    pub no_cache_files: Option<Vec<String>>,
+    #[serde(default)]
+    pub cache_millisecs: Option<u64>,
 }
 
 impl StaticMount {
@@ -114,6 +122,11 @@ impl StaticMount {
             spa_fallback_file: self.spa_fallback_file
                 .clone()
                 .unwrap_or_else(|| parent_config.spa_fallback_file.clone()),
+            no_cache_files: self.no_cache_files
+                .clone()
+                .unwrap_or_else(|| parent_config.no_cache_files.clone()),
+            cache_millisecs: self.cache_millisecs
+                .unwrap_or(parent_config.cache_millisecs),
         }
     }
 }
@@ -126,6 +139,8 @@ pub struct ResolvedStaticMount {
     pub index_files: Vec<String>,
     pub spa_mode: bool,
     pub spa_fallback_file: String,
+    pub no_cache_files: Vec<String>,
+    pub cache_millisecs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +153,10 @@ pub struct StaticFileConfig {
     pub worker_threads: Option<usize>,
     #[serde(default)]
     pub custom_mime_types: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub no_cache_files: Vec<String>,
+    #[serde(default = "default_cache_millisecs")]
+    pub cache_millisecs: u64,
 }
 
 // For backward compatibility
@@ -151,6 +170,8 @@ impl Default for StaticFileConfig {
                 index_files: None, // Will inherit from parent
                 spa_mode: None, // Will inherit from parent
                 spa_fallback_file: None, // Will inherit from parent
+                no_cache_files: None, // Will inherit from parent
+                cache_millisecs: None, // Will inherit from parent
             }],
             enable_directory_listing: false,
             index_files: vec!["index.html".to_string(), "index.htm".to_string()],
@@ -158,6 +179,8 @@ impl Default for StaticFileConfig {
             spa_fallback_file: "index.html".to_string(),
             worker_threads: None,
             custom_mime_types: std::collections::HashMap::new(),
+            no_cache_files: vec![],
+            cache_millisecs: 3600,
         }
     }
 }
@@ -172,6 +195,8 @@ impl StaticFileConfig {
                 index_files: None, // Will inherit from parent
                 spa_mode: Some(spa_mode), // Override SPA mode
                 spa_fallback_file: None, // Will inherit from parent
+                no_cache_files: None, // Will inherit from parent
+                cache_millisecs: None, // Will inherit from parent
             }],
             enable_directory_listing: false,
             index_files: vec!["index.html".to_string(), "index.htm".to_string()],
@@ -179,6 +204,8 @@ impl StaticFileConfig {
             spa_fallback_file: "index.html".to_string(),
             worker_threads: None,
             custom_mime_types: std::collections::HashMap::new(),
+            no_cache_files: vec![],
+            cache_millisecs: 3600,
         }
     }
 
@@ -190,6 +217,8 @@ impl StaticFileConfig {
             index_files: None, // Will inherit from parent
             spa_mode: Some(spa_mode), // Override SPA mode
             spa_fallback_file: None, // Will inherit from parent
+            no_cache_files: None, // Will inherit from parent
+            cache_millisecs: None, // Will inherit from parent
         });
     }
 

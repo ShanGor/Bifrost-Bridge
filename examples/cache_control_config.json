@@ -1,0 +1,20 @@
+{
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/",
+        "root_dir": "./public",
+        "spa_mode": true,
+        "spa_fallback_file": "index.html",
+        "no_cache_files": ["*.html"],
+        "cache_millisecs": 7200
+      }
+    ],
+    "enable_directory_listing": false,
+    "index_files": ["index.html", "index.htm"],
+    "spa_mode": true,
+    "spa_fallback_file": "index.html",
+    "cache_millisecs": 3600,
+    "no_cache_files": ["*.config", "fav.icon"]
+  }
+}

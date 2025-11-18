@@ -24,6 +24,7 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R014](R014-configurable-thread-pool.md) | Configurable Thread Pool | Add worker_threads configuration to control concurrency | 2025-11-16 |
 | [R015](R015-logging-system.md) | Comprehensive Logging System | Add structured logging with configurable levels and multiple formats | 2025-11-16 |
 | [R021](R021-tokio-worker-threads.md) | Tokio Worker Threads for Static Files | Implement Tokio-based threading for CPU-intensive static file operations | 2025-11-16 |
+| [R022](R022-advanced-cache-control.md) | Advanced Cache Control Configuration | Add flexible cache control with no_cache_files patterns and configurable cache duration | 2025-01-17 |
 
 ### 📝 **Pending Requirements**
 
@@ -65,7 +66,8 @@ requirements/
 ├── R018-rate-limiting.md              # Pending requirement
 ├── R019-health-check-endpoint.md      # Pending requirement
 ├── R020-documentation-maintenance.md  # Pending requirement
-└── R021-tokio-worker-threads.md       # Detailed requirement
+├── R021-tokio-worker-threads.md       # Detailed requirement
+└── R022-advanced-cache-control.md      # Detailed requirement
 ```
 
 ## 📚 How to Use This Documentation
@@ -77,12 +79,13 @@ requirements/
 
 ## ✅ Recent Major Achievements
 
+- **R022 (Advanced Cache Control)**: ✅ **COMPLETED** - Implemented flexible cache control with no_cache_files patterns and configurable cache duration
 - **R021 (Tokio Worker Threads)**: ✅ **COMPLETED** - Implemented Tokio-based threading for CPU-intensive static file operations
 - **R015 (Logging System)**: ✅ **COMPLETED** - Enhanced from basic env_logger to comprehensive structured logging system
 - **R014 (Configurable Thread Pool)**: ✅ **COMPLETED** - Fully implemented with custom tokio runtime builder
 
 ---
 
-**Last Updated:** 2025-11-17
+**Last Updated:** 2025-01-17
 **Maintainer:** Development Team
-**Total Requirements:** 22 (17 Completed, 5 Pending)
+**Total Requirements:** 23 (18 Completed, 5 Pending)

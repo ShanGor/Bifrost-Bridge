@@ -313,6 +313,8 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
                 spa_fallback_file: args.spa_fallback.clone().unwrap_or_else(|| "index.html".to_string()),
                 worker_threads: args.worker_threads,
                 custom_mime_types: std::collections::HashMap::new(),
+                no_cache_files: vec![],
+                cache_millisecs: 3600,
             }
         };
 

@@ -9,7 +9,8 @@
     "mounts": [
       {
         "path": "/ui",
-        "root_dir": "D:\\sources\\git\\js\\ai-chat-ui\\dist"
+        "root_dir": "D:\\sources\\git\\js\\ai-chat-ui\\dist",
+        "cache_millisecs": 9000
       }
     ],
     "enable_directory_listing": false,

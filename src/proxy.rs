@@ -4,7 +4,7 @@ use crate::error_recovery::ErrorRecoveryManager;
 use crate::forward_proxy::ForwardProxy;
 use crate::reverse_proxy::ReverseProxy;
 use crate::static_files::StaticFileHandler;
-use crate::common::{ResponseBuilder, TlsConfig, ProxyType, IsolatedWorker};
+use crate::common::{ResponseBuilder, TlsConfig, FileBody, ProxyType, IsolatedWorker};
 use log::{info, debug, warn, error};
 use hyper::{Response, StatusCode};
 use hyper::body::Bytes;
@@ -245,7 +245,7 @@ impl Proxy for StaticFileProxyAdapter {
                                             match handler.handle_request(&req).await {
                                                 Ok(response) => Ok::<_, Infallible>(response),
                                                 Err(_) => {
-                                                    Ok::<_, Infallible>(ResponseBuilder::internal_server_error())
+                                                    Ok::<_, Infallible>(ResponseBuilder::internal_server_error_file_body())
                                                 }
                                             }
                                         }
@@ -292,7 +292,7 @@ impl Proxy for StaticFileProxyAdapter {
                                             match handler.handle_request(&req).await {
                                                 Ok(response) => Ok::<_, Infallible>(response),
                                                 Err(_) => {
-                                                    Ok::<_, Infallible>(ResponseBuilder::internal_server_error())
+                                                    Ok::<_, Infallible>(ResponseBuilder::internal_server_error_file_body())
                                                 }
                                             }
                                         }
@@ -376,11 +376,16 @@ impl Proxy for CombinedProxyAdapter {
                                                             client_ip: Some(remote_addr.ip().to_string()),
                                                         };
                                                         match reverse_proxy.handle_request_with_context(req, context).await {
-                                                            Ok(response) => Ok::<_, Infallible>(response),
+                                                            Ok(response) => {
+                                                                // Convert Full<Bytes> to FileBody
+                                                                let (parts, body) = response.into_parts();
+                                                                let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
+                                                                Ok::<_, Infallible>(response_with_file_body)
+                                                            }
                                                             Err(_) => {
                                                                 Ok::<_, Infallible>(Response::builder()
                                                                     .status(StatusCode::BAD_GATEWAY)
-                                                                    .body(Full::new(Bytes::from("Proxy Error")))
+                                                                    .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
                                                                     .unwrap())
                                                             }
                                                         }
@@ -388,7 +393,7 @@ impl Proxy for CombinedProxyAdapter {
                                                     Err(_) => {
                                                         Ok::<_, Infallible>(Response::builder()
                                                             .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                            .body(Full::new(Bytes::from("Internal Server Error")))
+                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
                                                             .unwrap())
                                                     }
                                                 }
@@ -398,15 +403,21 @@ impl Proxy for CombinedProxyAdapter {
                                                     client_ip: Some(remote_addr.ip().to_string()),
                                                 };
                                                 match reverse_proxy.handle_request_with_context(req, context).await {
-                                                    Ok(response) => Ok::<_, Infallible>(response),
+                                                    Ok(response) => {
+                                                        // Convert Full<Bytes> to FileBody
+                                                        let (parts, body) = response.into_parts();
+                                                        let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
+                                                        Ok::<_, Infallible>(response_with_file_body)
+                                                    }
                                                     Err(_) => {
                                                         Ok::<_, Infallible>(Response::builder()
                                                             .status(StatusCode::BAD_GATEWAY)
-                                                            .body(Full::new(Bytes::from("Proxy Error")))
+                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
                                                             .unwrap())
                                                     }
                                                 }
                                             }
+
                                         }
                                     });
 
@@ -464,11 +475,16 @@ impl Proxy for CombinedProxyAdapter {
                                                             client_ip: Some(remote_addr.ip().to_string()),
                                                         };
                                                         match reverse_proxy.handle_request_with_context(req, context).await {
-                                                            Ok(response) => Ok::<_, Infallible>(response),
+                                                            Ok(response) => {
+                                                                // Convert Full<Bytes> to FileBody
+                                                                let (parts, body) = response.into_parts();
+                                                                let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
+                                                                Ok::<_, Infallible>(response_with_file_body)
+                                                            }
                                                             Err(_) => {
                                                                 Ok::<_, Infallible>(Response::builder()
                                                                     .status(StatusCode::BAD_GATEWAY)
-                                                                    .body(Full::new(Bytes::from("Proxy Error")))
+                                                                    .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
                                                                     .unwrap())
                                                             }
                                                         }
@@ -476,7 +492,7 @@ impl Proxy for CombinedProxyAdapter {
                                                     Err(_) => {
                                                         Ok::<_, Infallible>(Response::builder()
                                                             .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                            .body(Full::new(Bytes::from("Internal Server Error")))
+                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
                                                             .unwrap())
                                                     }
                                                 }
@@ -486,15 +502,21 @@ impl Proxy for CombinedProxyAdapter {
                                                     client_ip: Some(remote_addr.ip().to_string()),
                                                 };
                                                 match reverse_proxy.handle_request_with_context(req, context).await {
-                                                    Ok(response) => Ok::<_, Infallible>(response),
+                                                    Ok(response) => {
+                                                        // Convert Full<Bytes> to FileBody
+                                                        let (parts, body) = response.into_parts();
+                                                        let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
+                                                        Ok::<_, Infallible>(response_with_file_body)
+                                                    }
                                                     Err(_) => {
                                                         Ok::<_, Infallible>(Response::builder()
                                                             .status(StatusCode::BAD_GATEWAY)
-                                                            .body(Full::new(Bytes::from("Proxy Error")))
+                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
                                                             .unwrap())
                                                     }
                                                 }
                                             }
+
                                         }
                                     })
                                 )

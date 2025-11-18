@@ -29,6 +29,14 @@ impl ResponseBuilder {
             .unwrap()
     }
 
+    /// Creates a standard internal server error response with FileBody
+    pub fn internal_server_error_file_body() -> Response<FileBody> {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
+            .unwrap()
+    }
+
     /// Creates a proxy error response with custom message
     pub fn proxy_error(message: &str) -> Response<Full<Bytes>> {
         Response::builder()
@@ -149,6 +157,38 @@ impl Body for StreamingFileBody {
     }
 }
 
+/// Unified response body type that supports both in-memory and streaming
+pub enum FileBody {
+    InMemory(Full<Bytes>),
+    Streaming(StreamingFileBody),
+}
+
+impl Body for FileBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            FileBody::InMemory(full) => {
+                Pin::new(full).poll_frame(cx).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+            FileBody::Streaming(stream) => {
+                Pin::new(stream).poll_frame(cx).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            FileBody::InMemory(full) => full.size_hint(),
+            FileBody::Streaming(stream) => stream.size_hint(),
+        }
+    }
+}
+
 /// Zero-copy file streaming utilities to eliminate memory allocation
 pub struct FileStreaming;
 
@@ -162,7 +202,50 @@ impl FileStreaming {
         Ok(StreamingFileBody::new(file))
     }
 
-    /// Creates an optimized file response with size-aware serving strategy
+    /// Creates an optimized file response with size-aware serving strategy (NEW: returns FileBody)
+    pub async fn create_optimized_file_response(
+        file_path: &Path,
+        content_type: &str,
+        file_size: u64,
+        is_head: bool,
+        no_cache: bool,
+        cache_millisecs: u64,
+    ) -> Result<Response<FileBody>, ProxyError> {
+        let body = if is_head {
+            FileBody::InMemory(Full::new(Bytes::new()))
+        } else {
+            // Check file size to determine optimal serving strategy
+            let should_stream = Self::should_stream_file(file_size, 1024 * 1024); // 1MB threshold
+
+            if should_stream {
+                log::info!("File size {} bytes exceeds 1MB threshold, using zero-copy streaming", file_size);
+                let streaming_body = Self::create_streaming_body(file_path).await?;
+                FileBody::Streaming(streaming_body)
+            } else {
+                log::debug!("File size {} bytes under 1MB threshold, loading into memory", file_size);
+                let contents = Self::read_file_efficiently(file_path).await?;
+                FileBody::InMemory(Full::new(Bytes::from(contents)))
+            }
+        };
+
+        let cache_control = if no_cache {
+            "no-cache, no-store, must-revalidate".to_string()
+        } else {
+            format!("public, max-age={}", cache_millisecs)
+        };
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .header("Content-Length", file_size.to_string())
+            .header("Accept-Ranges", "bytes")
+            .header("Cache-Control", cache_control)
+            .body(body)
+            .map_err(|e| ProxyError::Http(e.to_string()))?)
+    }
+
+    /// Creates an optimized file response with size-aware serving strategy (LEGACY: returns Full<Bytes>)
+    /// Deprecated: Use create_optimized_file_response for streaming support
     pub async fn create_optimized_response(
         file_path: &Path,
         content_type: &str,
@@ -172,7 +255,8 @@ impl FileStreaming {
         Self::create_optimized_response_with_cache(file_path, content_type, file_size, is_head, false, 3600).await
     }
 
-    /// Creates an optimized file response with custom cache control
+    /// Creates an optimized file response with custom cache control (LEGACY: returns Full<Bytes>)
+    /// Deprecated: Use create_optimized_file_response for streaming support
     pub async fn create_optimized_response_with_cache(
         file_path: &Path,
         content_type: &str,
@@ -184,17 +268,7 @@ impl FileStreaming {
         let body = if is_head {
             Full::new(Bytes::new())
         } else {
-            // Check file size to determine optimal serving strategy
-            let should_stream = Self::should_stream_file(file_size, 1024 * 1024); // 1MB threshold
-
-            if should_stream {
-                log::info!("File size {} bytes exceeds 1MB streaming threshold, reading entire file (streaming infrastructure ready but not yet integrated with response type)", file_size);
-                // TODO: Once hyper response body types are unified, use:
-                // return Self::create_streaming_response(file_path, content_type, file_size, no_cache, cache_millisecs).await;
-            }
-
-            // For now, read files into memory (works with Full<Bytes> response type)
-            // Files >1MB will log a note about future streaming optimization
+            // For backward compatibility, always read into memory
             let contents = Self::read_file_efficiently(file_path).await?;
             Full::new(Bytes::from(contents))
         };

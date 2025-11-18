@@ -112,7 +112,13 @@ impl ProxyFactory {
                         .unwrap_or(90);
                     let max_connection_lifetime_secs = config.max_connection_lifetime_secs
                         .unwrap_or(300);
-                    let proxy = ReverseProxy::new(target_url, connect_timeout_secs, idle_timeout_secs, max_connection_lifetime_secs)?;
+                    let proxy = ReverseProxy::new_with_config(
+                        target_url,
+                        connect_timeout_secs,
+                        idle_timeout_secs,
+                        max_connection_lifetime_secs,
+                        config.reverse_proxy_config.clone(),
+                    )?;
 
                     Ok(Box::new(CombinedProxyAdapter {
                         reverse_proxy: proxy,
@@ -134,7 +140,13 @@ impl ProxyFactory {
                         .unwrap_or(90);
                     let max_connection_lifetime_secs = config.max_connection_lifetime_secs
                         .unwrap_or(300);
-                    let proxy = ReverseProxy::new(target_url, connect_timeout_secs, idle_timeout_secs, max_connection_lifetime_secs)?;
+                    let proxy = ReverseProxy::new_with_config(
+                        target_url,
+                        connect_timeout_secs,
+                        idle_timeout_secs,
+                        max_connection_lifetime_secs,
+                        config.reverse_proxy_config.clone(),
+                    )?;
                     Ok(Box::new(ReverseProxyAdapter {
                         proxy,
                         addr: config.listen_addr,

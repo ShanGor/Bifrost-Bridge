@@ -208,11 +208,17 @@ impl ForwardProxy {
         }
     }
 
-    /// Build HTTP client with user-specified configuration.
+    /// Build HTTP client for forward proxy.
     ///
-    /// Respects the connection pooling settings from the configuration:
-    /// - When pool_enabled is true: enables connection reuse with idle timeout
-    /// - When pool_enabled is false: disables pooling (creates new connection for each request)
+    /// Forward proxy pooling strategy:
+    /// - Allows connection reuse for the SAME target host during active usage
+    /// - Once a connection becomes idle (no requests for idle_timeout), it's closed
+    /// - Does NOT maintain a persistent pool of idle connections waiting
+    /// - pool_max_idle_per_host = 0: No idle connections are kept
+    /// - pool_idle_timeout: Short timeout (10-30s) to close unused connections quickly
+    ///
+    /// Example: Multiple requests to api.example.com can reuse the same connection,
+    /// but once requests stop, the connection closes after idle_timeout.
     fn build_http_client(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
@@ -225,14 +231,21 @@ impl ForwardProxy {
         
         let mut builder = Client::builder(TokioExecutor::new());
         
+        // Forward proxy strategy: pool_max_idle_per_host = 0
+        // This means: connections can be reused while active, but once idle, they close
+        // We don't maintain a "waiting pool" of idle connections
+        info!("Forward proxy: pool_max_idle_per_host=0 (no persistent idle connection pool)");
+        builder.pool_max_idle_per_host(0);
+        
         if pool_enabled {
-            info!("HTTP client: connection pooling ENABLED (idle_timeout: {}s)",
+            // Short idle timeout: close connections quickly when not in use
+            // Typical value: 10-30s (configured by user via idle_timeout_secs)
+            info!("Forward proxy: connection reuse enabled, idle connections close after {}s",
                   idle_timeout_secs);
             builder.pool_idle_timeout(Duration::from_secs(idle_timeout_secs));
-            builder.pool_timer(TokioTimer::new()); // Required for pool_idle_timeout to work
+            builder.pool_timer(TokioTimer::new());
         } else {
-            info!("HTTP client: connection pooling DISABLED (no-pool mode)");
-            builder.pool_max_idle_per_host(0); // Disable pooling
+            info!("Forward proxy: no-pool mode (new connection per request)");
         }
         
         builder

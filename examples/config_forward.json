@@ -1,7 +1,7 @@
 {
   "mode": "Forward",
   "listen_addr": "127.0.0.1:3128",
-  "max_connections": 100,
+  "max_connections": 10000,
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,
   "max_connection_lifetime_secs": 300

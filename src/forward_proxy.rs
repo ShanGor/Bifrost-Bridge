@@ -211,14 +211,19 @@ impl ForwardProxy {
     /// Build HTTP client for forward proxy.
     ///
     /// Forward proxy pooling strategy:
-    /// - Allows connection reuse for the SAME target host during active usage
-    /// - Once a connection becomes idle (no requests for idle_timeout), it's closed
-    /// - Does NOT maintain a persistent pool of idle connections waiting
-    /// - pool_max_idle_per_host = 0: No idle connections are kept
-    /// - pool_idle_timeout: Short timeout (10-30s) to close unused connections quickly
+    /// - Connection reuse ENABLED for same target host (improves performance)
+    /// - pool_idle_timeout controls when to close idle connections
+    /// - Once idle timeout expires, connections are automatically closed
+    /// - No need for pool_max_idle_per_host - let timeout do the cleanup
     ///
-    /// Example: Multiple requests to api.example.com can reuse the same connection,
-    /// but once requests stop, the connection closes after idle_timeout.
+    /// How it works:
+    /// - Multiple requests to api.example.com reuse the same connection (fast!)
+    /// - After idle_timeout (10-30s), unused connections close automatically
+    /// - No persistent "waiting pool" - connections close when truly idle
+    ///
+    /// This gives us the best of both worlds:
+    /// - Performance: Connection reuse during active traffic
+    /// - Resource efficiency: Auto-cleanup via timeout (no manual pool limits)
     fn build_http_client(
         connect_timeout_secs: u64,
         idle_timeout_secs: u64,
@@ -231,21 +236,19 @@ impl ForwardProxy {
         
         let mut builder = Client::builder(TokioExecutor::new());
         
-        // Forward proxy strategy: pool_max_idle_per_host = 0
-        // This means: connections can be reused while active, but once idle, they close
-        // We don't maintain a "waiting pool" of idle connections
-        info!("Forward proxy: pool_max_idle_per_host=0 (no persistent idle connection pool)");
-        builder.pool_max_idle_per_host(0);
-        
         if pool_enabled {
-            // Short idle timeout: close connections quickly when not in use
-            // Typical value: 10-30s (configured by user via idle_timeout_secs)
-            info!("Forward proxy: connection reuse enabled, idle connections close after {}s",
+            // Enable connection reuse with automatic timeout-based cleanup
+            // idle_timeout controls when idle connections are closed
+            // No need to set pool_max_idle_per_host - timeout handles cleanup
+            info!("Forward proxy: connection reuse enabled, idle timeout={}s (auto-cleanup)",
                   idle_timeout_secs);
             builder.pool_idle_timeout(Duration::from_secs(idle_timeout_secs));
             builder.pool_timer(TokioTimer::new());
+            // NOTE: We do NOT set pool_max_idle_per_host(0) as that disables pooling entirely!
+            // Hyper will manage the pool and close connections after idle_timeout
         } else {
             info!("Forward proxy: no-pool mode (new connection per request)");
+            builder.pool_max_idle_per_host(0); // Only disable when explicitly requested
         }
         
         builder
@@ -779,16 +782,50 @@ impl ForwardProxy {
         // Use instance-specific HTTP client that respects configuration
         let client = &self.http_client;
 
-        // Update request URI to absolute form for target
-        *req.uri_mut() = target_uri.clone();
+        // For HTTP client with HttpConnector, the URI must be in the correct format:
+        // - The URI should contain the scheme, authority, path, and query
+        // - HttpConnector will extract the host/port and connect automatically
+        // - This is different from manual TCP connection where we parse the host ourselves
+        
+        debug!("Forwarding request to target_uri: {}", target_uri);
+        debug!("  Scheme: {:?}, Authority: {:?}", target_uri.scheme(), target_uri.authority());
+        debug!("  Path: {}", target_uri.path());
+        
+        // Ensure the URI has all required components
+        let uri_to_use = if target_uri.scheme().is_some() && target_uri.authority().is_some() {
+            // Already has scheme and authority, use it as-is
+            target_uri.clone()
+        } else {
+            // This shouldn't happen after extract_target_uri, but handle it just in case
+            error!("Target URI missing scheme or authority: {}", target_uri);
+            return Err(ProxyError::Config("Target URI missing scheme or authority".to_string()));
+        };
+        
+        // Update request URI
+        *req.uri_mut() = uri_to_use.clone();
+        
+        debug!("Request method: {}, URI: {}", req.method(), req.uri());
+        debug!("Request headers: {:?}", req.headers());
 
         // Remove proxy-specific headers
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         req.headers_mut().remove("Proxy-Connection");
 
-        // Forward the request
+        // Forward the request using the pooled HTTP client
+        debug!("Sending request via HTTP client...");
         let response = client.request(req).await
-            .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
+            .map_err(|e| {
+                // Provide more detailed error information
+                error!("HTTP client error: {}", e);
+                error!("  Target was: {}", uri_to_use);
+                if e.is_connect() {
+                    error!("  Error type: Connection error (DNS failure, network unreachable, or timeout)");
+                }
+                let err_msg = format!("Failed to forward request: {}", e);
+                ProxyError::Connection(err_msg)
+            })?;
+            
+        debug!("Received response: status={}", response.status());
 
         // Convert response to Full<Bytes>
         let (parts, body) = response.into_parts();

@@ -314,11 +314,6 @@ impl StaticFileHandler {
     
     // resolve_file_path is replaced by resolve_file_path_in_mount for multi-mount support
 
-    async fn handle_file(&self, file_path: &PathBuf, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
-        // Legacy method - defaults to non-SPA mode for backwards compatibility
-        self.handle_file_with_mount_info(file_path, is_head, None, false).await
-    }
-
     /// Handle file with optional mount information for SPA-aware caching
     pub async fn handle_file_with_mount_info(
         &self,

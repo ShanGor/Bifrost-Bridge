@@ -23,6 +23,8 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R013](R013-client-ip-detection.md) | Client IP Detection Fix | Fix hardcoded 127.0.0.1 to extract actual client IP from connection | 2025-11-16 |
 | [R014](R014-configurable-thread-pool.md) | Configurable Thread Pool | Add worker_threads configuration to control concurrency | 2025-11-16 |
 | [R015](R015-logging-system.md) | Comprehensive Logging System | Add structured logging with configurable levels and multiple formats | 2025-11-16 |
+| [R016](R016-performance-monitoring.md) | Performance Monitoring | Prometheus metrics, monitoring server, and dashboards | 2025-11-17 |
+| [R017](R017-websocket-support.md) | WebSocket Support | Reverse/forward proxy upgrade handling with validation | 2025-11-17 |
 | [R021](R021-tokio-worker-threads.md) | Tokio Worker Threads for Static Files | Implement Tokio-based threading for CPU-intensive static file operations | 2025-11-16 |
 | [R022](R022-advanced-cache-control.md) | Advanced Cache Control Configuration | Add flexible cache control with no_cache_files patterns and configurable cache duration | 2025-01-17 |
 
@@ -30,16 +32,14 @@ This folder contains all requirements, feature requests, and implementation deta
 
 | ID | Requirement | Status     | Date Raised | Description |
 |----|-------------|------------|------------|-------------|
-| [R016](R016-performance-monitoring.md) | Performance Monitoring | 📋 Pending | TBD | Add metrics and performance monitoring |
-| [R017](R017-websocket-support.md) | WebSocket Support | 📋 Pending | TBD | Support WebSocket proxying |
 | [R018](R018-rate-limiting.md) | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
 | [R019](R019-health-check-endpoint.md) | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
 | [R020](R020-documentation-maintenance.md) | Documentation Maintenance | 📋 Ongoing | 2025-11-16 | Ensure documentation stays updated with code changes |
 
 ## 🎯 Next Priorities
 
-1. **Medium Priority:** Add performance monitoring (R016)
-2. **Low Priority:** Add WebSocket support (R017)
+1. **Medium Priority:** Implement rate limiting (R018)
+2. **Low Priority:** Add health check endpoints (R019)
 
 ## 📁 Project Structure
 

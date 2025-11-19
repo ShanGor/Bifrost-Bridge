@@ -16,6 +16,12 @@ use tokio::fs::File as TokioFile;
 use tokio_util::io::ReaderStream;
 use tokio_rustls::TlsAcceptor;
 use futures::Stream;
+use hyper::header::{CONNECTION, UPGRADE};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry, TextEncoder,
+};
+use prometheus::proto::MetricFamily;
 
 /// Common response builder utilities to eliminate code duplication
 pub struct ResponseBuilder;
@@ -308,15 +314,229 @@ impl FileStreaming {
     }
 }
 
+#[derive(Clone)]
+pub struct PrometheusHandles {
+    requests_total: IntCounter,
+    response_bytes_total: IntCounter,
+    files_served_total: IntCounter,
+    files_streamed_total: IntCounter,
+    connections_active: IntGauge,
+    connection_errors_total: IntCounter,
+    average_response_time_ms: IntGauge,
+    request_duration_seconds: Histogram,
+}
+
+impl PrometheusHandles {
+    fn new(
+        requests_total: IntCounter,
+        response_bytes_total: IntCounter,
+        files_served_total: IntCounter,
+        files_streamed_total: IntCounter,
+        connections_active: IntGauge,
+        connection_errors_total: IntCounter,
+        average_response_time_ms: IntGauge,
+        request_duration_seconds: Histogram,
+    ) -> Self {
+        Self {
+            requests_total,
+            response_bytes_total,
+            files_served_total,
+            files_streamed_total,
+            connections_active,
+            connection_errors_total,
+            average_response_time_ms,
+            request_duration_seconds,
+        }
+    }
+}
+
+/// Prometheus registry wrapper that owns all exported metrics
+pub struct MonitoringRegistry {
+    registry: Registry,
+    requests_total: IntCounterVec,
+    response_bytes_total: IntCounterVec,
+    files_served_total: IntCounterVec,
+    files_streamed_total: IntCounterVec,
+    connections_active: IntGaugeVec,
+    connection_errors_total: IntCounterVec,
+    average_response_time_ms: IntGaugeVec,
+    request_duration_seconds: HistogramVec,
+}
+
+impl MonitoringRegistry {
+    pub fn new() -> Self {
+        let registry = Registry::new();
+
+        let requests_total = IntCounterVec::new(
+            Opts::new("requests_total", "Total requests handled").namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("requests_total metric");
+        let response_bytes_total = IntCounterVec::new(
+            Opts::new("response_bytes_total", "Total response bytes sent").namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("response_bytes_total metric");
+        let files_served_total = IntCounterVec::new(
+            Opts::new("files_served_total", "Total static files served").namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("files_served_total metric");
+        let files_streamed_total = IntCounterVec::new(
+            Opts::new("files_streamed_total", "Total static files streamed").namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("files_streamed_total metric");
+        let connections_active = IntGaugeVec::new(
+            Opts::new("connections_active", "Current active connections").namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("connections_active metric");
+        let connection_errors_total = IntCounterVec::new(
+            Opts::new("connection_errors_total", "Total connection errors").namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("connection_errors_total metric");
+        let average_response_time_ms = IntGaugeVec::new(
+            Opts::new("average_response_time_ms", "Exponential moving average of response time in ms")
+                .namespace("bifrost"),
+            &["proxy_type"],
+        ).expect("average_response_time_ms metric");
+        let mut histogram_opts = HistogramOpts::new("request_duration_seconds", "Request duration in seconds");
+        histogram_opts.common_opts = histogram_opts.common_opts.namespace("bifrost");
+        histogram_opts.buckets = vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+            1.0, 2.5, 5.0, 10.0,
+        ];
+        let request_duration_seconds = HistogramVec::new(
+            histogram_opts,
+            &["proxy_type"],
+        ).expect("request_duration_seconds metric");
+
+        registry.register(Box::new(requests_total.clone())).expect("register requests_total");
+        registry.register(Box::new(response_bytes_total.clone())).expect("register response_bytes_total");
+        registry.register(Box::new(files_served_total.clone())).expect("register files_served_total");
+        registry.register(Box::new(files_streamed_total.clone())).expect("register files_streamed_total");
+        registry.register(Box::new(connections_active.clone())).expect("register connections_active");
+        registry.register(Box::new(connection_errors_total.clone())).expect("register connection_errors_total");
+        registry.register(Box::new(average_response_time_ms.clone())).expect("register average_response_time_ms");
+        registry.register(Box::new(request_duration_seconds.clone())).expect("register request_duration_seconds");
+
+        Self {
+            registry,
+            requests_total,
+            response_bytes_total,
+            files_served_total,
+            files_streamed_total,
+            connections_active,
+            connection_errors_total,
+            average_response_time_ms,
+            request_duration_seconds,
+        }
+    }
+
+    fn handles_for_label(&self, label: &str) -> PrometheusHandles {
+        PrometheusHandles::new(
+            self.requests_total.with_label_values(&[label]),
+            self.response_bytes_total.with_label_values(&[label]),
+            self.files_served_total.with_label_values(&[label]),
+            self.files_streamed_total.with_label_values(&[label]),
+            self.connections_active.with_label_values(&[label]),
+            self.connection_errors_total.with_label_values(&[label]),
+            self.average_response_time_ms.with_label_values(&[label]),
+            self.request_duration_seconds.with_label_values(&[label]),
+        )
+    }
+
+    pub fn create_metrics_for(&self, label: &str) -> Arc<PerformanceMetrics> {
+        Arc::new(PerformanceMetrics::with_prometheus(self.handles_for_label(label)))
+    }
+
+    pub fn gather(&self) -> Vec<MetricFamily> {
+        self.registry.gather()
+    }
+
+    pub fn encode(&self) -> Result<String, ProxyError> {
+        let families = self.gather();
+        let mut buffer = Vec::new();
+        let encoder = TextEncoder::new();
+        encoder.encode(&families, &mut buffer)
+            .map_err(|e| ProxyError::MetricsError(format!("Failed to encode Prometheus metrics: {}", e)))?;
+        String::from_utf8(buffer)
+            .map_err(|e| ProxyError::MetricsError(format!("Failed to build metrics payload: {}", e)))
+    }
+}
+
+#[derive(Clone)]
+pub struct MonitoringHandles {
+    registry: Arc<MonitoringRegistry>,
+    forward: Arc<PerformanceMetrics>,
+    reverse: Arc<PerformanceMetrics>,
+    static_files: Arc<PerformanceMetrics>,
+    combined: Arc<PerformanceMetrics>,
+}
+
+impl MonitoringHandles {
+    pub fn new() -> Self {
+        let registry = Arc::new(MonitoringRegistry::new());
+
+        let forward = registry.create_metrics_for(ProxyType::ForwardProxy.metric_label());
+        let reverse = registry.create_metrics_for(ProxyType::ReverseProxy.metric_label());
+        let static_files = registry.create_metrics_for(ProxyType::StaticFiles.metric_label());
+        let combined = registry.create_metrics_for(ProxyType::Combined.metric_label());
+
+        Self {
+            registry,
+            forward,
+            reverse,
+            static_files,
+            combined,
+        }
+    }
+
+    pub fn registry(&self) -> Arc<MonitoringRegistry> {
+        self.registry.clone()
+    }
+
+    pub fn forward_metrics(&self) -> Arc<PerformanceMetrics> {
+        self.forward.clone()
+    }
+
+    pub fn reverse_metrics(&self) -> Arc<PerformanceMetrics> {
+        self.reverse.clone()
+    }
+
+    pub fn static_metrics(&self) -> Arc<PerformanceMetrics> {
+        self.static_files.clone()
+    }
+
+    pub fn combined_metrics(&self) -> Arc<PerformanceMetrics> {
+        self.combined.clone()
+    }
+
+    pub fn metrics_for(&self, proxy_type: &ProxyType) -> Arc<PerformanceMetrics> {
+        match proxy_type {
+            ProxyType::ForwardProxy => self.forward_metrics(),
+            ProxyType::ReverseProxy => self.reverse_metrics(),
+            ProxyType::StaticFiles => self.static_metrics(),
+            ProxyType::Combined => self.combined_metrics(),
+        }
+    }
+
+    pub fn all_metrics(&self) -> Vec<(ProxyType, Arc<PerformanceMetrics>)> {
+        vec![
+            (ProxyType::ForwardProxy, self.forward_metrics()),
+            (ProxyType::ReverseProxy, self.reverse_metrics()),
+            (ProxyType::StaticFiles, self.static_metrics()),
+            (ProxyType::Combined, self.combined_metrics()),
+        ]
+    }
+}
+
 /// Advanced performance metrics collection system
 pub struct PerformanceMetrics {
-    pub requests_total: AtomicU64,
-    pub response_bytes_total: AtomicU64,
-    pub files_served: AtomicU64,
-    pub files_streamed: AtomicU64,
-    pub connections_active: AtomicU64,
-    pub connection_errors: AtomicU64,
-    pub average_response_time_ms: AtomicU64,
+    requests_total: AtomicU64,
+    response_bytes_total: AtomicU64,
+    files_served: AtomicU64,
+    files_streamed: AtomicU64,
+    connections_active: AtomicU64,
+    connection_errors: AtomicU64,
+    average_response_time_ms: AtomicU64,
+    prometheus: Option<PrometheusHandles>,
 }
 
 impl PerformanceMetrics {
@@ -329,37 +549,73 @@ impl PerformanceMetrics {
             connections_active: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             average_response_time_ms: AtomicU64::new(0),
+            prometheus: None,
         }
     }
 
+    pub fn with_prometheus(handles: PrometheusHandles) -> Self {
+        let mut metrics = Self::new();
+        metrics.prometheus = Some(handles);
+        metrics
+    }
+
+    pub fn attach_prometheus(&mut self, handles: PrometheusHandles) {
+        self.prometheus = Some(handles);
+    }
+
     pub fn increment_requests(&self) {
-        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.increment_requests_by(1);
+    }
+
+    pub fn increment_requests_by(&self, delta: u64) {
+        self.requests_total.fetch_add(delta, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.requests_total.inc_by(delta);
+        }
     }
 
     pub fn record_response_bytes(&self, bytes: u64) {
         self.response_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.response_bytes_total.inc_by(bytes);
+        }
     }
 
     pub fn increment_files_served(&self) {
         self.files_served.fetch_add(1, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.files_served_total.inc();
+        }
     }
 
     pub fn increment_files_streamed(&self) {
         self.files_streamed.fetch_add(1, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.files_streamed_total.inc();
+        }
     }
 
     pub fn increment_connections(&self) {
         self.connections_active.fetch_add(1, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.connections_active.inc();
+        }
     }
 
     pub fn decrement_connections(&self) {
         if self.connections_active.load(Ordering::Relaxed) > 0 {
             self.connections_active.fetch_sub(1, Ordering::Relaxed);
+            if let Some(handles) = &self.prometheus {
+                handles.connections_active.dec();
+            }
         }
     }
 
     pub fn increment_connection_errors(&self) {
         self.connection_errors.fetch_add(1, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.connection_errors_total.inc();
+        }
     }
 
     pub fn update_average_response_time(&self, duration_ms: u64) {
@@ -368,22 +624,60 @@ impl PerformanceMetrics {
         let alpha = 0.1; // smoothing factor
         let new_avg = (alpha * duration_ms as f64 + (1.0 - alpha) * current as f64) as u64;
         self.average_response_time_ms.store(new_avg, Ordering::Relaxed);
+        if let Some(handles) = &self.prometheus {
+            handles.average_response_time_ms.set(new_avg as i64);
+        }
+    }
+
+    pub fn record_request_duration(&self, duration_ms: u64) {
+        self.update_average_response_time(duration_ms);
+        if let Some(handles) = &self.prometheus {
+            handles.request_duration_seconds.observe(duration_ms as f64 / 1000.0);
+        }
     }
 
     pub fn get_metrics_summary(&self) -> MetricsSummary {
         MetricsSummary {
-            requests_total: self.requests_total.load(Ordering::Relaxed),
-            response_bytes_total: self.response_bytes_total.load(Ordering::Relaxed),
-            files_served: self.files_served.load(Ordering::Relaxed),
-            files_streamed: self.files_streamed.load(Ordering::Relaxed),
-            connections_active: self.connections_active.load(Ordering::Relaxed),
-            connection_errors: self.connection_errors.load(Ordering::Relaxed),
-            average_response_time_ms: self.average_response_time_ms.load(Ordering::Relaxed),
+            requests_total: self.requests_total(),
+            response_bytes_total: self.response_bytes_total(),
+            files_served: self.files_served(),
+            files_streamed: self.files_streamed(),
+            connections_active: self.connections_active(),
+            connection_errors: self.connection_errors(),
+            average_response_time_ms: self.average_response_time_ms(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         }
+    }
+
+    pub fn requests_total(&self) -> u64 {
+        self.requests_total.load(Ordering::Relaxed)
+    }
+
+    pub fn response_bytes_total(&self) -> u64 {
+        self.response_bytes_total.load(Ordering::Relaxed)
+    }
+
+    pub fn files_served(&self) -> u64 {
+        self.files_served.load(Ordering::Relaxed)
+    }
+
+    pub fn files_streamed(&self) -> u64 {
+        self.files_streamed.load(Ordering::Relaxed)
+    }
+
+    pub fn connections_active(&self) -> u64 {
+        self.connections_active.load(Ordering::Relaxed)
+    }
+
+    pub fn connection_errors(&self) -> u64 {
+        self.connection_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn average_response_time_ms(&self) -> u64 {
+        self.average_response_time_ms.load(Ordering::Relaxed)
     }
 }
 
@@ -448,7 +742,7 @@ impl RequestTimer {
 
     pub fn finish(self) {
         if let Some(ref metrics) = self.metrics {
-            metrics.update_average_response_time(self.elapsed_ms());
+            metrics.record_request_duration(self.elapsed_ms());
         }
     }
 }
@@ -457,6 +751,44 @@ impl Default for RequestTimer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Tracks active connections and ensures metrics stay consistent
+pub struct ConnectionTracker {
+    metrics: Arc<PerformanceMetrics>,
+}
+
+impl ConnectionTracker {
+    pub fn new(metrics: Arc<PerformanceMetrics>) -> Self {
+        metrics.increment_connections();
+        Self { metrics }
+    }
+}
+
+impl Drop for ConnectionTracker {
+    fn drop(&mut self) {
+        self.metrics.decrement_connections();
+    }
+}
+
+/// Determines if an HTTP request is attempting to upgrade to a WebSocket connection
+pub fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    let connection_tokens = headers
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let upgrade_value = headers
+        .get(UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    connection_tokens
+        .split(|c| c == ',' || c == ' ')
+        .any(|token| token.trim() == "upgrade") &&
+        upgrade_value == "websocket"
 }
 
 /// Efficient HTML template compilation system
@@ -1197,21 +1529,21 @@ pub trait SharedServer: Send + Sync + 'static {
     /// Check if worker can accept new connection
     fn can_accept_connection(&self) -> bool {
         let worker = self.get_worker();
-        let active_connections = worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let active_connections = worker.metrics.connections_active() as usize;
         active_connections < worker.resource_limits.max_connections
     }
 
     /// Increment connection count with proxy-specific tracking
     fn increment_connections(&self) {
         let worker = self.get_worker();
-        worker.metrics.connections_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        worker.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        worker.metrics.increment_connections();
+        worker.metrics.increment_requests();
     }
 
     /// Decrement connection count with proxy-specific tracking
     fn decrement_connections(&self) {
         let worker = self.get_worker();
-        worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        worker.metrics.decrement_connections();
     }
 
     /// Unified server implementation that works for all proxy types
@@ -1297,7 +1629,7 @@ pub trait SharedServer: Send + Sync + 'static {
                     }
 
                     // Decrement connection count when connection closes
-                    worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    worker.metrics.decrement_connections();
                 });
             }
         }
@@ -1344,7 +1676,7 @@ pub trait SharedServer: Send + Sync + 'static {
                     // Connection handling should be implemented by specific server types
 
                     // Decrement connection count when connection closes
-                    worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    worker.metrics.decrement_connections();
                 });
             }
         }
@@ -1367,6 +1699,17 @@ impl std::fmt::Display for ProxyType {
             ProxyType::ReverseProxy => write!(f, "ReverseProxy"),
             ProxyType::StaticFiles => write!(f, "StaticFiles"),
             ProxyType::Combined => write!(f, "Combined"),
+        }
+    }
+}
+
+impl ProxyType {
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            ProxyType::ForwardProxy => "forward",
+            ProxyType::ReverseProxy => "reverse",
+            ProxyType::StaticFiles => "static",
+            ProxyType::Combined => "combined",
         }
     }
 }
@@ -1400,9 +1743,23 @@ impl IsolatedWorker {
         resource_limits: WorkerResourceLimits,
         configuration: WorkerConfiguration,
     ) -> Self {
+        Self::new_with_metrics(
+            proxy_type,
+            resource_limits,
+            configuration,
+            Arc::new(PerformanceMetrics::new()),
+        )
+    }
+
+    pub fn new_with_metrics(
+        proxy_type: ProxyType,
+        resource_limits: WorkerResourceLimits,
+        configuration: WorkerConfiguration,
+        metrics: Arc<PerformanceMetrics>,
+    ) -> Self {
         Self {
             connection_pool: Arc::new(ConnectionPoolManager::new_for_proxy_type(&proxy_type)),
-            metrics: Arc::new(PerformanceMetrics::new()),
+            metrics,
             resource_limits,
             configuration,
             proxy_type,
@@ -1411,7 +1768,7 @@ impl IsolatedWorker {
 
     pub fn can_accept_connection(&self) -> bool {
         self.connection_pool.can_accept_connection() &&
-        self.metrics.connections_active.load(Ordering::Relaxed) < self.resource_limits.max_connections as u64
+        self.metrics.connections_active() < self.resource_limits.max_connections as u64
     }
 
     pub fn increment_connections(&self) {
@@ -1421,14 +1778,11 @@ impl IsolatedWorker {
 
     pub fn decrement_connections(&self) {
         self.connection_pool.decrement_connections();
-        // Don't decrement below 0
-        if self.metrics.connections_active.load(Ordering::Relaxed) > 0 {
-            self.metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.metrics.decrement_connections();
     }
 
     pub fn health_check(&self) -> WorkerHealth {
-        let active_connections = self.metrics.connections_active.load(Ordering::Relaxed);
+        let active_connections = self.metrics.connections_active();
         let max_connections = self.resource_limits.max_connections as u64;
         let connection_utilization = active_connections as f64 / max_connections as f64;
 
@@ -1755,32 +2109,38 @@ impl WorkerConfiguration {
 pub struct WorkerManager {
     workers: Vec<Arc<IsolatedWorker>>,
     global_metrics: Arc<PerformanceMetrics>,
+    monitoring: Arc<MonitoringRegistry>,
 }
 
 impl WorkerManager {
     pub fn new() -> Result<Self, ProxyError> {
+        let monitoring = Arc::new(MonitoringRegistry::new());
         let mut workers = Vec::new();
 
         // Create isolated workers for each proxy type
-        workers.push(Arc::new(IsolatedWorker::new(
+        workers.push(Arc::new(IsolatedWorker::new_with_metrics(
             ProxyType::ForwardProxy,
             WorkerResourceLimits::default(),
-            WorkerConfiguration::default()
+            WorkerConfiguration::default(),
+            monitoring.create_metrics_for(ProxyType::ForwardProxy.metric_label()),
         )));
-        workers.push(Arc::new(IsolatedWorker::new(
+        workers.push(Arc::new(IsolatedWorker::new_with_metrics(
             ProxyType::ReverseProxy,
             WorkerResourceLimits::default(),
-            WorkerConfiguration::default()
+            WorkerConfiguration::default(),
+            monitoring.create_metrics_for(ProxyType::ReverseProxy.metric_label()),
         )));
-        workers.push(Arc::new(IsolatedWorker::new(
+        workers.push(Arc::new(IsolatedWorker::new_with_metrics(
             ProxyType::StaticFiles,
             WorkerResourceLimits::default(),
-            WorkerConfiguration::default()
+            WorkerConfiguration::default(),
+            monitoring.create_metrics_for(ProxyType::StaticFiles.metric_label()),
         )));
 
         Ok(Self {
             workers,
-            global_metrics: Arc::new(PerformanceMetrics::new()),
+            global_metrics: monitoring.create_metrics_for("global"),
+            monitoring,
         })
     }
 
@@ -1804,6 +2164,10 @@ impl WorkerManager {
 
     pub fn get_global_metrics(&self) -> Arc<PerformanceMetrics> {
         self.global_metrics.clone()
+    }
+
+    pub fn get_monitoring_registry(&self) -> Arc<MonitoringRegistry> {
+        self.monitoring.clone()
     }
 }
 

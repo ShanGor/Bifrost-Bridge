@@ -6,6 +6,38 @@ fn default_cache_millisecs() -> u64 {
     3600
 }
 
+fn default_monitoring_enabled() -> bool {
+    true
+}
+
+fn default_metrics_endpoint() -> String {
+    "/metrics".to_string()
+}
+
+fn default_health_endpoint() -> String {
+    "/health".to_string()
+}
+
+fn default_status_endpoint() -> String {
+    "/status".to_string()
+}
+
+fn default_monitoring_listen_addr() -> Option<SocketAddr> {
+    "127.0.0.1:9900".parse().ok()
+}
+
+fn default_websocket_enabled() -> bool {
+    true
+}
+
+fn default_websocket_allowed_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+fn default_websocket_timeout() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -79,6 +111,58 @@ impl Default for LoggingConfig {
                 path: None,
                 level: None,
             }]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    #[serde(default = "default_monitoring_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_endpoint")]
+    pub metrics_endpoint: String,
+    #[serde(default = "default_health_endpoint")]
+    pub health_endpoint: String,
+    #[serde(default = "default_status_endpoint")]
+    pub status_endpoint: String,
+    #[serde(default)]
+    pub include_detailed_metrics: bool,
+    #[serde(default = "default_monitoring_listen_addr")]
+    pub listen_address: Option<SocketAddr>,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            metrics_endpoint: default_metrics_endpoint(),
+            health_endpoint: default_health_endpoint(),
+            status_endpoint: default_status_endpoint(),
+            include_detailed_metrics: true,
+            listen_address: default_monitoring_listen_addr(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketConfig {
+    #[serde(default = "default_websocket_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_websocket_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub supported_protocols: Vec<String>,
+    #[serde(default = "default_websocket_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: default_websocket_allowed_origins(),
+            supported_protocols: Vec::new(),
+            timeout_seconds: default_websocket_timeout(),
         }
     }
 }
@@ -362,6 +446,10 @@ pub struct Config {
     // Logging configuration
     #[serde(default)]
     pub logging: Option<LoggingConfig>,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub websocket: Option<WebSocketConfig>,
 }
 
 fn default_max_header_size() -> Option<usize> {
@@ -394,6 +482,8 @@ impl Default for Config {
             proxy_password: None,
             reverse_proxy_config: None,
             logging: None,
+            monitoring: MonitoringConfig::default(),
+            websocket: None,
         }
     }
 }

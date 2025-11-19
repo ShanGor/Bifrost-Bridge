@@ -225,7 +225,7 @@ fn bench_concurrent_worker_access(c: &mut Criterion) {
                     // Perform concurrent operations on all workers
                     for worker in &workers {
                         worker.can_accept_connection();
-                        worker.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        worker.metrics.increment_requests();
                     }
                 });
             },
@@ -418,11 +418,11 @@ fn bench_mixed_workload_scenario(c: &mut Criterion) {
                 if i % 3 == 0 {
                     forward_worker.can_accept_connection();
                     forward_worker.increment_connections();
-                    forward_worker.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    forward_worker.metrics.increment_requests();
                 } else if i % 3 == 1 {
                     reverse_worker.can_accept_connection();
                     reverse_worker.increment_connections();
-                    reverse_worker.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reverse_worker.metrics.increment_requests();
                 } else {
                     forward_worker.decrement_connections();
                     reverse_worker.decrement_connections();

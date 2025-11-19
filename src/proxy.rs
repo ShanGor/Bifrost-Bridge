@@ -4,7 +4,8 @@ use crate::error_recovery::ErrorRecoveryManager;
 use crate::forward_proxy::ForwardProxy;
 use crate::reverse_proxy::ReverseProxy;
 use crate::static_files::StaticFileHandler;
-use crate::common::{ResponseBuilder, TlsConfig, FileBody, ProxyType, IsolatedWorker};
+use crate::common::{MonitoringHandles, ResponseBuilder, TlsConfig, FileBody, ProxyType, IsolatedWorker};
+use crate::monitoring::MonitoringServer;
 use log::{info, debug, warn, error};
 use hyper::{Response, StatusCode};
 use hyper::body::Bytes;
@@ -33,7 +34,10 @@ impl ProxyFactory {
         debug!("Proxy configuration - listen_addr: {}, max_connections: {:?}",
                config.listen_addr, config.max_connections);
 
-        match config.mode {
+        let monitoring_handles = MonitoringHandles::new();
+        let monitoring_config = config.monitoring.clone();
+
+        let proxy: Box<dyn Proxy + Send> = match config.mode {
             ProxyMode::Forward => {
                 info!("Initializing Forward Proxy mode");
                 debug!("Forward proxy configuration - connection_pool: {:?}",
@@ -72,14 +76,15 @@ impl ProxyFactory {
                     relay_configs,
                     config.proxy_username,
                     config.proxy_password,
+                    config.websocket.clone(),
                 );
                 
-                Ok(Box::new(ForwardProxyAdapter {
+                Box::new(ForwardProxyAdapter {
                     proxy,
                     addr: config.listen_addr,
                     private_key: config.private_key,
                     certificate: config.certificate,
-                }))
+                })
             }
             ProxyMode::Reverse => {
                 info!("Initializing Reverse Proxy mode");
@@ -88,19 +93,21 @@ impl ProxyFactory {
                     info!("Static files only mode (no reverse proxy target)");
                     let static_config = config.static_files.unwrap();
                     debug!("Static files configuration - mounts: {}", static_config.mounts.len());
-                    let handler = StaticFileHandler::new(static_config)?;
-                    Ok(Box::new(StaticFileProxyAdapter {
+                    let handler = StaticFileHandler::new(static_config)?
+                        .with_metrics(monitoring_handles.static_metrics());
+                    Box::new(StaticFileProxyAdapter {
                         handler,
                         addr: config.listen_addr,
                         private_key: config.private_key,
                         certificate: config.certificate,
-                    }))
+                    })
                 } else if config.static_files.is_some() && config.reverse_proxy_target.is_some() {
                     // Combined mode: both reverse proxy and static files
                     info!("Combined reverse proxy + static files mode");
                     let static_config = config.static_files.unwrap();
                     debug!("Static files configuration - mounts: {}", static_config.mounts.len());
-                    let handler = StaticFileHandler::new(static_config)?;
+                    let handler = StaticFileHandler::new(static_config)?
+                        .with_metrics(monitoring_handles.static_metrics());
 
                     let target_url = config.reverse_proxy_target.unwrap();
                     info!("Reverse proxy target: {}", target_url);
@@ -118,15 +125,16 @@ impl ProxyFactory {
                         idle_timeout_secs,
                         max_connection_lifetime_secs,
                         config.reverse_proxy_config.clone(),
-                    )?;
+                        config.websocket.clone(),
+                    )?.with_metrics(monitoring_handles.reverse_metrics());
 
-                    Ok(Box::new(CombinedProxyAdapter {
+                    Box::new(CombinedProxyAdapter {
                         reverse_proxy: proxy,
                         static_handler: handler,
                         addr: config.listen_addr,
                         private_key: config.private_key,
                         certificate: config.certificate,
-                    }))
+                    })
                 } else {
                     // Reverse proxy only mode
                     let target_url = config.reverse_proxy_target
@@ -146,16 +154,58 @@ impl ProxyFactory {
                         idle_timeout_secs,
                         max_connection_lifetime_secs,
                         config.reverse_proxy_config.clone(),
-                    )?;
-                    Ok(Box::new(ReverseProxyAdapter {
+                        config.websocket.clone(),
+                    )?.with_metrics(monitoring_handles.reverse_metrics());
+                    Box::new(ReverseProxyAdapter {
                         proxy,
                         addr: config.listen_addr,
                         private_key: config.private_key,
                         certificate: config.certificate,
-                    }))
+                    })
                 }
             }
+        };
+
+        if monitoring_config.enabled {
+            let server = MonitoringServer::new(monitoring_config, monitoring_handles.clone());
+            Ok(Box::new(ProxyWithMonitoring::new(proxy, Some(server))))
+        } else {
+            Ok(proxy)
         }
+    }
+}
+
+struct ProxyWithMonitoring {
+    inner: Box<dyn Proxy + Send>,
+    monitoring: Option<MonitoringServer>,
+}
+
+impl ProxyWithMonitoring {
+    fn new(inner: Box<dyn Proxy + Send>, monitoring: Option<MonitoringServer>) -> Self {
+        Self { inner, monitoring }
+    }
+}
+
+impl Proxy for ProxyWithMonitoring {
+    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+        Box::pin(async move {
+            let ProxyWithMonitoring { inner, monitoring } = *self;
+            let monitoring_task = monitoring.map(|server| {
+                tokio::spawn(async move {
+                    if let Err(err) = server.run().await {
+                        error!("Monitoring server stopped: {}", err);
+                    }
+                })
+            });
+
+            let result = inner.run().await;
+
+            if let Some(task) = monitoring_task {
+                task.abort();
+            }
+
+            result
+        })
     }
 }
 
@@ -755,8 +805,7 @@ impl IsolatedProxyAdapter {
                     return;
                 }
 
-                worker_ref.connection_pool.increment_connections();
-                worker_ref.metrics.increment_connections();
+                worker_ref.increment_connections();
 
                 let request_timer = crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
 
@@ -771,7 +820,7 @@ impl IsolatedProxyAdapter {
                     }
                 }
 
-                worker_ref.connection_pool.decrement_connections();
+                worker_ref.decrement_connections();
             });
         }
     }
@@ -805,8 +854,7 @@ impl IsolatedProxyAdapter {
                     return;
                 }
 
-                worker_ref.connection_pool.increment_connections();
-                worker_ref.metrics.increment_connections();
+                worker_ref.increment_connections();
 
                 let request_timer = crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
 
@@ -816,7 +864,7 @@ impl IsolatedProxyAdapter {
                 debug!("HTTP connection established from {} to {}", remote_addr, worker_ref.get_proxy_type());
                 request_timer.finish();
 
-                worker_ref.connection_pool.decrement_connections();
+                worker_ref.decrement_connections();
             });
         }
     }

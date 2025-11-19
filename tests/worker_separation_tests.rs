@@ -32,8 +32,8 @@ async fn test_worker_creation_and_isolation() {
     assert_eq!(reverse_worker.proxy_type, ProxyType::ReverseProxy);
 
     // Verify metrics are separate
-    assert_eq!(forward_worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert_eq!(reverse_worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(forward_worker.metrics.connections_active(), 0);
+    assert_eq!(reverse_worker.metrics.connections_active(), 0);
 }
 
 /// Test connection limit enforcement per worker
@@ -68,7 +68,7 @@ async fn test_connection_limit_enforcement() {
     assert!(worker.can_accept_connection());
 
     // Clean up
-    while worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+    while worker.metrics.connections_active() > 0 {
         worker.decrement_connections();
     }
 }
@@ -90,18 +90,18 @@ async fn test_metrics_isolation() {
 
     // Increment metrics on forward worker
     forward_worker.increment_connections();
-    forward_worker.metrics.requests_total.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+    forward_worker.metrics.increment_requests_by(5);
 
     // Increment metrics on reverse worker
     reverse_worker.increment_connections();
-    reverse_worker.metrics.requests_total.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+    reverse_worker.metrics.increment_requests_by(10);
 
     // Verify metrics are isolated
-    assert_eq!(forward_worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(reverse_worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(forward_worker.metrics.connections_active(), 1);
+    assert_eq!(reverse_worker.metrics.connections_active(), 1);
 
-    assert_eq!(forward_worker.metrics.requests_total.load(std::sync::atomic::Ordering::Relaxed), 5);
-    assert_eq!(reverse_worker.metrics.requests_total.load(std::sync::atomic::Ordering::Relaxed), 10);
+    assert_eq!(forward_worker.metrics.requests_total(), 5);
+    assert_eq!(reverse_worker.metrics.requests_total(), 10);
 
     // Clean up
     forward_worker.decrement_connections();
@@ -188,7 +188,7 @@ async fn test_worker_health_monitoring() {
     assert!(health.is_healthy()); // Still healthy at low capacity
 
     // Clean up
-    while worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+    while worker.metrics.connections_active() > 0 {
         worker.decrement_connections();
     }
 }
@@ -210,7 +210,7 @@ async fn test_concurrent_worker_access() {
         let handle = tokio::spawn(async move {
             // Each task increments and decrements connections
             worker_clone.increment_connections();
-            worker_clone.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            worker_clone.metrics.increment_requests();
 
             // Simulate some work
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -231,8 +231,8 @@ async fn test_concurrent_worker_access() {
     assert_eq!(results.len(), 10);
 
     // Verify worker is back to initial state
-    assert_eq!(worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert_eq!(worker.metrics.requests_total.load(std::sync::atomic::Ordering::Relaxed), 10);
+    assert_eq!(worker.metrics.connections_active(), 0);
+    assert_eq!(worker.metrics.requests_total(), 10);
 }
 
 /// Test proxy type enumeration and display

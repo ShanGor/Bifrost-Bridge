@@ -16,7 +16,7 @@ use tokio::fs::File as TokioFile;
 use tokio_util::io::ReaderStream;
 use tokio_rustls::TlsAcceptor;
 use futures::Stream;
-use hyper::header::{CONNECTION, UPGRADE};
+use hyper::header::{CONNECTION, UPGRADE, RETRY_AFTER};
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     Opts, Registry, TextEncoder,
@@ -72,6 +72,24 @@ impl ResponseBuilder {
         Response::builder()
             .status(status)
             .body(Full::new(Bytes::from(message.to_string())))
+            .unwrap()
+    }
+
+    /// Creates a 429 Too Many Requests response with retry information
+    pub fn too_many_requests(rule: &str, retry_after_secs: u64) -> Response<Full<Bytes>> {
+        let mut builder = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Content-Type", "text/plain; charset=utf-8");
+
+        if retry_after_secs > 0 {
+            builder = builder.header(RETRY_AFTER, retry_after_secs.to_string());
+        }
+
+        builder
+            .body(Full::new(Bytes::from(format!(
+                "Rate limit '{}' exceeded. Please retry later.",
+                rule
+            ))))
             .unwrap()
     }
 }

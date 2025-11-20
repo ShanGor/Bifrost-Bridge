@@ -25,6 +25,7 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R015](R015-logging-system.md) | Comprehensive Logging System | Add structured logging with configurable levels and multiple formats | 2025-11-16 |
 | [R016](R016-performance-monitoring.md) | Performance Monitoring | Prometheus metrics, monitoring server, and dashboards | 2025-11-17 |
 | [R017](R017-websocket-support.md) | WebSocket Support | Reverse/forward proxy upgrade handling with validation | 2025-11-17 |
+| [R018](R018-rate-limiting.md) | Rate Limiting | Configurable per-IP throttling with tiered rules | 2025-11-19 |
 | [R021](R021-tokio-worker-threads.md) | Tokio Worker Threads for Static Files | Implement Tokio-based threading for CPU-intensive static file operations | 2025-11-16 |
 | [R022](R022-advanced-cache-control.md) | Advanced Cache Control Configuration | Add flexible cache control with no_cache_files patterns and configurable cache duration | 2025-01-17 |
 
@@ -32,14 +33,12 @@ This folder contains all requirements, feature requests, and implementation deta
 
 | ID | Requirement | Status     | Date Raised | Description |
 |----|-------------|------------|------------|-------------|
-| [R018](R018-rate-limiting.md) | Rate Limiting | 📋 Pending | TBD | Add configurable rate limiting |
-| [R019](R019-health-check-endpoint.md) | Health Check Endpoint | 📋 Pending | TBD | Add health check endpoints |
+| [R019](R019-health-check-endpoint.md) | Health Check Endpoint | ❌ Duplicated | — | Covered by R016 monitoring server |
 | [R020](R020-documentation-maintenance.md) | Documentation Maintenance | 📋 Ongoing | 2025-11-16 | Ensure documentation stays updated with code changes |
 
 ## 🎯 Next Priorities
 
-1. **Medium Priority:** Implement rate limiting (R018)
-2. **Low Priority:** Add health check endpoints (R019)
+1. **Medium Priority:** Documentation maintenance improvements (R020)
 
 ## 📁 Project Structure
 

@@ -1,6 +1,7 @@
 use crate::common::{ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, is_websocket_upgrade};
 use crate::error::ProxyError;
 use crate::config::{ReverseProxyConfig, HealthCheckConfig, WebSocketConfig};
+use crate::rate_limit::RateLimiter;
 use hyper::{Request, Response, StatusCode, Uri, Method};
 use hyper::body::{Body as _, Incoming};
 use http_body_util::{BodyExt, Full, Empty};
@@ -40,6 +41,7 @@ pub struct ReverseProxy {
     health_check_config: Option<HealthCheckConfig>,
     metrics: Arc<PerformanceMetrics>,
     websocket_config: WebSocketConfig,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl ReverseProxy {
@@ -93,6 +95,7 @@ impl ReverseProxy {
             health_check_config,
             metrics: Arc::new(PerformanceMetrics::new()),
             websocket_config: websocket_config.unwrap_or_default(),
+            rate_limiter: Arc::new(RateLimiter::new(None)),
         })
     }
 
@@ -142,6 +145,11 @@ impl ReverseProxy {
         self
     }
 
+    pub fn with_rate_limiter(mut self, rate_limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     /// Public method for handling individual requests (used by CombinedProxyAdapter)
     pub async fn handle_request_with_context(&self, req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, Infallible> {
         Self::handle_request_static(
@@ -152,6 +160,7 @@ impl ReverseProxy {
             self.preserve_host,
             Arc::new(self.websocket_config.clone()),
             self.metrics.clone(),
+            self.rate_limiter.clone(),
         ).await
     }
 
@@ -175,6 +184,7 @@ impl ReverseProxy {
         let preserve_host = self.preserve_host;
         let websocket_config = Arc::new(self.websocket_config.clone());
         let metrics = self.metrics.clone();
+        let rate_limiter = self.rate_limiter.clone();
 
         loop {
             let (stream, remote_addr) = listener.accept().await
@@ -184,6 +194,7 @@ impl ReverseProxy {
             let target_url = target_url.clone();
             let metrics = metrics.clone();
             let websocket_config = websocket_config.clone();
+            let rate_limiter = rate_limiter.clone();
 
             tokio::spawn(async move {
                 let _connection = ConnectionTracker::new(metrics.clone());
@@ -198,6 +209,7 @@ impl ReverseProxy {
                             let client_ip = Some(remote_addr.ip().to_string());
                             let metrics = metrics.clone();
                             let websocket_cfg = websocket_config.clone();
+                            let rate_limiter = rate_limiter.clone();
 
                             let context = RequestContext {
                                 client_ip: client_ip.clone(),
@@ -214,6 +226,7 @@ impl ReverseProxy {
                                     preserve_host,
                                     websocket_cfg,
                                     metrics.clone(),
+                                    rate_limiter.clone(),
                                 ).await;
 
                                 if let Some(len) = result.as_ref()
@@ -243,7 +256,30 @@ impl ReverseProxy {
         preserve_host: bool,
         websocket_config: Arc<WebSocketConfig>,
         metrics: Arc<PerformanceMetrics>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        if rate_limiter.is_enabled() {
+            if let Some(client_ip) = context.client_ip.as_deref() {
+                if let Err(hit) = rate_limiter
+                    .check_request(
+                        client_ip,
+                        req.method(),
+                        req.uri()
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or("/"),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Reverse proxy rate limit hit for {} via rule {}",
+                        client_ip, hit.rule_id
+                    );
+                    return Ok(ResponseBuilder::too_many_requests(&hit.rule_id, hit.retry_after_secs));
+                }
+            }
+        }
+
         if is_websocket_upgrade(req.headers()) {
             return Self::handle_websocket_request(req, context, http_client, target_url, preserve_host, websocket_config).await;
         }

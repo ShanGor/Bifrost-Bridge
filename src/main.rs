@@ -296,6 +296,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         logging: None,
         monitoring: bifrost_bridge::config::MonitoringConfig::default(),
         websocket: None,
+        rate_limiting: None,
     };
 
     // Configure static files if specified

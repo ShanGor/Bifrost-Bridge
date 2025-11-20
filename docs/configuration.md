@@ -159,6 +159,40 @@ Once enabled, the monitoring server exposes all three endpoints on the configure
 
 The forward proxy supports direct WebSocket upgrades (and WSS via the existing CONNECT tunnel). Reverse proxy upgrades are automatically bridged to the backend using the same configuration. Relay proxies do not yet support WebSocket upgrades.
 
+## 🚦 Rate Limiting Configuration
+
+```json
+{
+  "rate_limiting": {
+    "enabled": true,
+    "default_limit": { "limit": 200, "window_secs": 60 },
+    "rules": [
+      {
+        "id": "login-posts",
+        "limit": 20,
+        "window_secs": 60,
+        "path_prefix": "/api/login",
+        "methods": ["POST"]
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `enabled` | Boolean | Toggle rate limiting | `true` |
+| `default_limit.limit` | Number | Requests allowed per IP in the default window | Required when `default_limit` is present |
+| `default_limit.window_secs` | Number | Window length (seconds) for the default tier | Required when `default_limit` is present |
+| `rules` | Array | Additional rule definitions (per endpoint/tier) | `[]` |
+| `rules[].id` | String | Unique rule identifier for logging/metrics | — |
+| `rules[].limit` | Number | Requests allowed per window for matching requests | — |
+| `rules[].window_secs` | Number | Window size (seconds) for the rule | — |
+| `rules[].path_prefix` | String | Optional path prefix match (e.g., `/api/admin`) | Matches all paths when omitted |
+| `rules[].methods` | Array | Optional HTTP method filter (e.g., `["POST"]`) | Matches all methods when omitted |
+
+Rules are evaluated in the order defined. A request can match multiple rules: the default tier plus any endpoint-specific tiers. Every rule maintains a per-IP counter; exceeding any limit triggers an HTTP `429 Too Many Requests` response with a `Retry-After` header. Forward proxy CONNECT/WebSocket requests, reverse proxy traffic, and static file responses all share the same limiter.
+
 ## 📁 Static File Configuration
 
 ### StaticFileConfig Fields

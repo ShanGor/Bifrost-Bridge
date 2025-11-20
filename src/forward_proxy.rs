@@ -9,13 +9,14 @@
 use crate::error::ProxyError;
 use crate::config::{RelayProxyConfig, WebSocketConfig};
 use crate::common::{ResponseBuilder, TlsConfig, is_websocket_upgrade};
+use crate::rate_limit::RateLimiter;
 use rustls::ServerConfig;
 use hyper::{Request, Response, StatusCode, Uri, Method};
 use hyper::body::{Bytes, Incoming};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
-use log::{info, error, debug};
+use log::{info, error, debug, warn};
 use hyper_util::rt::TokioIo;
 use hyper::header::{HOST, ORIGIN, PROXY_AUTHORIZATION, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use std::convert::Infallible;
@@ -42,6 +43,7 @@ pub struct ForwardProxy {
     // Instance-specific HTTP client configured per ForwardProxy settings
     http_client: Arc<Client<HttpConnector, Incoming>>,
     websocket_config: WebSocketConfig,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 /// Internal structure to store relay proxy configuration with pre-computed authentication.
@@ -77,6 +79,7 @@ impl ForwardProxy {
             proxy_password: None,
             http_client: Arc::new(http_client),
             websocket_config: WebSocketConfig::default(),
+            rate_limiter: Arc::new(RateLimiter::new(None)),
         }
     }
 
@@ -108,6 +111,7 @@ impl ForwardProxy {
             proxy_password: None,
             http_client: Arc::new(http_client),
             websocket_config: WebSocketConfig::default(),
+            rate_limiter: Arc::new(RateLimiter::new(None)),
         }
     }
 
@@ -153,6 +157,7 @@ impl ForwardProxy {
             None,
             None,
             None,
+            Arc::new(RateLimiter::new(None)),
         )
     }
 
@@ -175,6 +180,7 @@ impl ForwardProxy {
         proxy_username: Option<String>,
         proxy_password: Option<String>,
         websocket_config: Option<WebSocketConfig>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         // Client approach removed - using direct TCP connections for CONNECT requests
 
@@ -212,6 +218,7 @@ impl ForwardProxy {
             proxy_password,
             http_client: Arc::new(http_client),
             websocket_config: websocket_config.unwrap_or_default(),
+            rate_limiter,
         }
     }
 
@@ -291,6 +298,7 @@ impl ForwardProxy {
         let proxy_password = self.proxy_password;
         let http_client = self.http_client; // Capture the HTTP client
         let websocket_config = self.websocket_config.clone();
+        let rate_limiter = self.rate_limiter.clone();
 
         let listener = tokio::net::TcpListener::bind(addr).await
             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
@@ -306,6 +314,8 @@ impl ForwardProxy {
             let proxy_password = proxy_password.clone();
             let http_client = http_client.clone(); // Clone the Arc for the spawn
             let websocket_config = websocket_config.clone();
+            let rate_limiter = rate_limiter.clone();
+            let client_ip = remote_addr.ip().to_string();
 
             tokio::spawn(async move {
                 // For CONNECT requests, we need to handle the tunnel manually
@@ -324,6 +334,7 @@ impl ForwardProxy {
                                 relay_proxies,
                                 proxy_username,
                                 proxy_password,
+                                rate_limiter.clone(),
                             ).await;
                             return;
                         }
@@ -345,10 +356,18 @@ impl ForwardProxy {
                             let proxy_username = proxy_username.clone();
                             let proxy_password = proxy_password.clone();
                             let websocket_config = websocket_config.clone();
+                            let rate_limiter = rate_limiter.clone();
+                            let client_ip = client_ip.clone();
                             async move {
                                 // Check if this is a CONNECT request
                                 if req.method() == Method::CONNECT {
-                                    Self::handle_connect_tunnel_static(req, relay_proxies, websocket_config.clone()).await
+                                    Self::handle_connect_tunnel_static(
+                                        req,
+                                        relay_proxies,
+                                        websocket_config.clone(),
+                                        rate_limiter.clone(),
+                                        Some(client_ip.clone()),
+                                    ).await
                                 } else {
                                     Self::handle_request_static(
                                         req,
@@ -357,6 +376,8 @@ impl ForwardProxy {
                                         proxy_username,
                                         proxy_password,
                                         websocket_config,
+                                        rate_limiter,
+                                        Some(client_ip.clone()),
                                     ).await
                                 }
                             }
@@ -376,10 +397,11 @@ impl ForwardProxy {
     /// which is necessary for proper HTTPS proxy support through relay proxies.
     async fn handle_connect_raw(
         stream: TcpStream,
-        _remote_addr: SocketAddr,
+        remote_addr: SocketAddr,
         relay_proxies: Vec<RelayProxyWithAuth>,
         _proxy_username: Option<String>,
         _proxy_password: Option<String>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Result<(), std::io::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -422,6 +444,31 @@ impl ForwardProxy {
         
         // Get the underlying stream back
         let mut stream = reader.into_inner();
+
+        if rate_limiter.is_enabled() {
+            let client_ip = remote_addr.ip().to_string();
+            if let Err(hit) = rate_limiter
+                .check_request(&client_ip, &Method::CONNECT, &target)
+                .await
+            {
+                warn!(
+                    "Forward proxy CONNECT rate limit hit for {} via rule {}",
+                    client_ip, hit.rule_id
+                );
+                let body = format!(
+                    "Rate limit '{}' exceeded. Please retry later.",
+                    hit.rule_id
+                );
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                    hit.retry_after_secs,
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await?;
+                return Ok(());
+            }
+        }
 
         // Find relay proxy if configured
         let relay_proxy = Self::find_relay_proxy_for_domain_static(&relay_proxies, &target_host);
@@ -469,7 +516,7 @@ impl ForwardProxy {
         let _ = ForwardProxy::setup_tunnel_with_lifetime(
             stream,
             target_stream,
-            _remote_addr,
+            remote_addr,
             target_desc,
             Duration::from_secs(300), // Static method uses default 300s
         ).await;
@@ -484,6 +531,7 @@ impl ForwardProxy {
         let connection_pool_enabled = self.connection_pool_enabled;
         let http_client = self.http_client; // Capture the HTTP client
         let websocket_config = self.websocket_config.clone();
+        let rate_limiter = self.rate_limiter.clone();
         let tls_acceptor = if let Some(config) = tls_config {
             Some(TlsAcceptor::from(config))
         } else {
@@ -501,7 +549,7 @@ impl ForwardProxy {
         }
 
         loop {
-            let (tcp_stream, _) = tcp_listener.accept().await
+            let (tcp_stream, remote_addr) = tcp_listener.accept().await
                 .map_err(|e| ProxyError::Io(e))?;
 
             let relay_proxies = relay_proxies.clone();
@@ -510,6 +558,8 @@ impl ForwardProxy {
             let tls_acceptor = tls_acceptor.clone();
             let http_client = http_client.clone(); // Clone the Arc for the spawn
             let websocket_config = websocket_config.clone();
+            let rate_limiter = rate_limiter.clone();
+            let client_ip = remote_addr.ip().to_string();
 
             tokio::spawn(async move {
                 if let Some(acceptor) = tls_acceptor {
@@ -523,10 +573,18 @@ impl ForwardProxy {
                                 let proxy_username = proxy_username.clone();
                                 let proxy_password = proxy_password.clone();
                                 let websocket_config = websocket_config.clone();
+                                let rate_limiter = rate_limiter.clone();
+                                let client_ip = client_ip.clone();
                                 async move {
                                     // Check if this is a CONNECT request
                                     if req.method() == Method::CONNECT {
-                                        ForwardProxy::handle_connect_tunnel_static(req, relay_proxies, websocket_config.clone()).await
+                                        ForwardProxy::handle_connect_tunnel_static(
+                                            req,
+                                            relay_proxies,
+                                            websocket_config.clone(),
+                                            rate_limiter.clone(),
+                                            Some(client_ip.clone()),
+                                        ).await
                                     } else {
                                         ForwardProxy::handle_request_static(
                                             req,
@@ -535,6 +593,8 @@ impl ForwardProxy {
                                             proxy_username,
                                             proxy_password,
                                             websocket_config,
+                                            rate_limiter,
+                                            Some(client_ip.clone()),
                                         ).await
                                     }
                                 }
@@ -557,8 +617,8 @@ impl ForwardProxy {
         }
     }
 
-    async fn handle_request(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-        match self.process_request(req).await {
+    async fn handle_request(&self, req: Request<Incoming>, client_ip: Option<String>) -> Result<Response<Full<Bytes>>, Infallible> {
+        match self.process_request(req, client_ip).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 error!("Proxy error: {}", e);
@@ -585,11 +645,29 @@ impl ForwardProxy {
         }
     }
 
-    async fn process_request(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, ProxyError> {
+    async fn process_request(&self, req: Request<Incoming>, client_ip: Option<String>) -> Result<Response<Full<Bytes>>, ProxyError> {
         self.verify_authentication(&req)?;
 
+        if let Some(ip) = client_ip.as_deref() {
+            if let Err(hit) = self
+                .rate_limiter
+                .check_request(
+                    ip,
+                    req.method(),
+                    req.uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or("/"),
+                )
+                .await
+            {
+                warn!("Forward proxy rate limit hit for {} via rule {}", ip, hit.rule_id);
+                return Ok(ResponseBuilder::too_many_requests(&hit.rule_id, hit.retry_after_secs));
+            }
+        }
+
         if *req.method() == Method::CONNECT {
-            return match self.handle_connect_tunnel(req).await {
+            return match self.handle_connect_tunnel(req, client_ip).await {
                 Ok(response) => Ok(response),
                 Err(_) => unreachable!(),
             };
@@ -690,7 +768,7 @@ impl ForwardProxy {
         Self::finalize_standard_response(response).await
     }
 
-    async fn handle_connect_tunnel(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    async fn handle_connect_tunnel(&self, req: Request<Incoming>, _client_ip: Option<String>) -> Result<Response<Full<Bytes>>, Infallible> {
         let authority = match req.uri().authority() {
             Some(auth) => auth,
             None => return Ok(ResponseBuilder::error(StatusCode::BAD_REQUEST, "Invalid CONNECT target")),
@@ -1355,6 +1433,8 @@ impl ForwardProxy {
         proxy_username: Option<String>,
         proxy_password: Option<String>,
         websocket_config: WebSocketConfig,
+        rate_limiter: Arc<RateLimiter>,
+        client_ip: Option<String>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Create a temporary proxy instance for request handling
         // Note: HTTP client is passed in, not using instance's client
@@ -1366,8 +1446,9 @@ impl ForwardProxy {
             proxy_password,
             http_client,
             websocket_config,
+            rate_limiter,
         };
-        proxy.handle_request(req).await
+        proxy.handle_request(req, client_ip).await
     }
 
     /// Static helper to handle CONNECT tunnels
@@ -1375,6 +1456,8 @@ impl ForwardProxy {
         req: Request<Incoming>,
         relay_proxies: Vec<RelayProxyWithAuth>,
         websocket_config: WebSocketConfig,
+        rate_limiter: Arc<RateLimiter>,
+        client_ip: Option<String>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // For CONNECT, we don't need the HTTP client
         let proxy = ForwardProxy {
@@ -1385,8 +1468,9 @@ impl ForwardProxy {
             proxy_password: None,
             http_client: Arc::new(Self::build_http_client(10, 90, true)),
             websocket_config,
+            rate_limiter,
         };
-        proxy.handle_connect_tunnel(req).await
+        proxy.handle_connect_tunnel(req, client_ip).await
     }
 
 }

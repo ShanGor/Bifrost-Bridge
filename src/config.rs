@@ -26,6 +26,10 @@ fn default_monitoring_listen_addr() -> Option<SocketAddr> {
     "127.0.0.1:9900".parse().ok()
 }
 
+fn default_rate_limiting_enabled() -> bool {
+    true
+}
+
 fn default_websocket_enabled() -> bool {
     true
 }
@@ -142,6 +146,33 @@ impl Default for MonitoringConfig {
             listen_address: default_monitoring_listen_addr(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitingConfig {
+    #[serde(default = "default_rate_limiting_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_limit: Option<RateLimitWindowConfig>,
+    #[serde(default)]
+    pub rules: Vec<RateLimitRuleConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitWindowConfig {
+    pub limit: u64,
+    pub window_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitRuleConfig {
+    pub id: String,
+    pub limit: u64,
+    pub window_secs: u64,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +481,8 @@ pub struct Config {
     pub monitoring: MonitoringConfig,
     #[serde(default)]
     pub websocket: Option<WebSocketConfig>,
+    #[serde(default)]
+    pub rate_limiting: Option<RateLimitingConfig>,
 }
 
 fn default_max_header_size() -> Option<usize> {
@@ -484,6 +517,7 @@ impl Default for Config {
             logging: None,
             monitoring: MonitoringConfig::default(),
             websocket: None,
+            rate_limiting: None,
         }
     }
 }

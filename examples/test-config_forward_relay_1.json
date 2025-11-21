@@ -25,5 +25,9 @@
         "baidu.com"
       ]
     }
-  ]
+  ],
+  "monitoring": {
+    "enabled": true,
+    "listen_address": "127.0.0.1:9902"
+  }
 }

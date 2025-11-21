@@ -17,5 +17,9 @@
     }
   ],
   "proxy_username": "admin",
-  "proxy_password": "secret123"
+  "proxy_password": "secret123",
+  "monitoring": {
+    "enabled": true,
+    "listen_address": "127.0.0.1:9901"
+  }
 }

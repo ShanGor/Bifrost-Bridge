@@ -292,6 +292,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         relay_proxy_domain_suffixes: None,
         proxy_username: args.proxy_username.clone(),
         proxy_password: args.proxy_password.clone(),
+        reverse_proxy_config: None,
         logging: None,
     };
 

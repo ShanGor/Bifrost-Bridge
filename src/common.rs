@@ -29,6 +29,14 @@ impl ResponseBuilder {
             .unwrap()
     }
 
+    /// Creates a standard internal server error response with FileBody
+    pub fn internal_server_error_file_body() -> Response<FileBody> {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
+            .unwrap()
+    }
+
     /// Creates a proxy error response with custom message
     pub fn proxy_error(message: &str) -> Response<Full<Bytes>> {
         Response::builder()
@@ -149,6 +157,38 @@ impl Body for StreamingFileBody {
     }
 }
 
+/// Unified response body type that supports both in-memory and streaming
+pub enum FileBody {
+    InMemory(Full<Bytes>),
+    Streaming(StreamingFileBody),
+}
+
+impl Body for FileBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match &mut *self {
+            FileBody::InMemory(full) => {
+                Pin::new(full).poll_frame(cx).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+            FileBody::Streaming(stream) => {
+                Pin::new(stream).poll_frame(cx).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            FileBody::InMemory(full) => full.size_hint(),
+            FileBody::Streaming(stream) => stream.size_hint(),
+        }
+    }
+}
+
 /// Zero-copy file streaming utilities to eliminate memory allocation
 pub struct FileStreaming;
 
@@ -162,7 +202,50 @@ impl FileStreaming {
         Ok(StreamingFileBody::new(file))
     }
 
-    /// Creates an optimized file response with size-aware serving strategy
+    /// Creates an optimized file response with size-aware serving strategy (NEW: returns FileBody)
+    pub async fn create_optimized_file_response(
+        file_path: &Path,
+        content_type: &str,
+        file_size: u64,
+        is_head: bool,
+        no_cache: bool,
+        cache_millisecs: u64,
+    ) -> Result<Response<FileBody>, ProxyError> {
+        let body = if is_head {
+            FileBody::InMemory(Full::new(Bytes::new()))
+        } else {
+            // Check file size to determine optimal serving strategy
+            let should_stream = Self::should_stream_file(file_size, 1024 * 1024); // 1MB threshold
+
+            if should_stream {
+                log::info!("File size {} bytes exceeds 1MB threshold, using zero-copy streaming", file_size);
+                let streaming_body = Self::create_streaming_body(file_path).await?;
+                FileBody::Streaming(streaming_body)
+            } else {
+                log::debug!("File size {} bytes under 1MB threshold, loading into memory", file_size);
+                let contents = Self::read_file_efficiently(file_path).await?;
+                FileBody::InMemory(Full::new(Bytes::from(contents)))
+            }
+        };
+
+        let cache_control = if no_cache {
+            "no-cache, no-store, must-revalidate".to_string()
+        } else {
+            format!("public, max-age={}", cache_millisecs)
+        };
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .header("Content-Length", file_size.to_string())
+            .header("Accept-Ranges", "bytes")
+            .header("Cache-Control", cache_control)
+            .body(body)
+            .map_err(|e| ProxyError::Http(e.to_string()))?)
+    }
+
+    /// Creates an optimized file response with size-aware serving strategy (LEGACY: returns Full<Bytes>)
+    /// Deprecated: Use create_optimized_file_response for streaming support
     pub async fn create_optimized_response(
         file_path: &Path,
         content_type: &str,
@@ -172,7 +255,8 @@ impl FileStreaming {
         Self::create_optimized_response_with_cache(file_path, content_type, file_size, is_head, false, 3600).await
     }
 
-    /// Creates an optimized file response with custom cache control
+    /// Creates an optimized file response with custom cache control (LEGACY: returns Full<Bytes>)
+    /// Deprecated: Use create_optimized_file_response for streaming support
     pub async fn create_optimized_response_with_cache(
         file_path: &Path,
         content_type: &str,
@@ -184,14 +268,7 @@ impl FileStreaming {
         let body = if is_head {
             Full::new(Bytes::new())
         } else {
-            // Check file size to determine optimal serving strategy
-            let should_stream = Self::should_stream_file(file_size, 1024 * 1024); // 1MB threshold
-
-            if should_stream {
-                log::debug!("File size {} exceeds streaming threshold, using efficient read", file_size);
-            }
-
-            // Use centralized file reading utility for future optimization
+            // For backward compatibility, always read into memory
             let contents = Self::read_file_efficiently(file_path).await?;
             Full::new(Bytes::from(contents))
         };
@@ -1139,131 +1216,137 @@ pub trait SharedServer: Send + Sync + 'static {
 
     /// Unified server implementation that works for all proxy types
     /// This eliminates the duplicated HTTP/HTTPS server loops
-    async fn run_shared_server(&self) -> Result<(), ProxyError> {
-        let handler = self.get_handler();
-        let addr = self.get_addr();
-        let (private_key, certificate) = self.get_tls_paths();
+    fn run_shared_server(&self) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send {
+        async {
+            let handler = self.get_handler();
+            let addr = self.get_addr();
+            let (private_key, certificate) = self.get_tls_paths();
 
-        match (private_key, certificate) {
-            (Some(private_key_path), Some(cert_path)) => {
-                self.run_https_server(handler, addr, &private_key_path, &cert_path).await
-            }
-            _ => {
-                self.run_http_server(handler, addr).await
+            match (private_key, certificate) {
+                (Some(private_key_path), Some(cert_path)) => {
+                    self.run_https_server(handler, addr, &private_key_path, &cert_path).await
+                }
+                _ => {
+                    self.run_http_server(handler, addr).await
+                }
             }
         }
     }
 
     /// Run HTTPS server with TLS
-    async fn run_https_server<H>(
+    fn run_https_server<H>(
         &self,
         handler: Arc<H>,
         addr: SocketAddr,
         private_key_path: &str,
         cert_path: &str,
-    ) -> Result<(), ProxyError>
+    ) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send
     where
         H: Send + Sync + 'static + ?Sized,
     {
-        log::info!("Enabling HTTPS/TLS mode");
-        log::debug!("Loading TLS certificate from: {}", cert_path);
-        log::debug!("Loading TLS private key from: {}", private_key_path);
+        async move {
+            log::info!("Enabling HTTPS/TLS mode");
+            log::debug!("Loading TLS certificate from: {}", cert_path);
+            log::debug!("Loading TLS private key from: {}", private_key_path);
 
-        let tls_config = TlsConfig::create_config(private_key_path, cert_path)?;
-        let tls_config = Arc::new(tls_config);
-        let acceptor = TlsAcceptor::from(tls_config.clone());
+            let tls_config = TlsConfig::create_config(private_key_path, cert_path)?;
+            let tls_config = Arc::new(tls_config);
+            let acceptor = TlsAcceptor::from(tls_config.clone());
 
-        log::info!("Binding TCP listener to: {}", addr);
-        let tcp_listener = tokio::net::TcpListener::bind(&addr).await
-            .map_err(|e| ProxyError::Io(e))?;
-
-        log::info!("HTTPS server listening on: https://{}", addr);
-        log::debug!("TLS certificate file: {}", cert_path);
-        log::debug!("TLS private key file: {}", private_key_path);
-
-        loop {
-            let (tcp_stream, remote_addr) = tcp_listener.accept().await
+            log::info!("Binding TCP listener to: {}", addr);
+            let tcp_listener = tokio::net::TcpListener::bind(&addr).await
                 .map_err(|e| ProxyError::Io(e))?;
 
-            // Check connection limits before accepting
-            if !self.can_accept_connection() {
-                log::warn!("Connection limit reached for {:?}, rejecting connection from: {}",
-                          self.get_proxy_type(), remote_addr);
-                drop(tcp_stream);
-                continue;
-            }
+            log::info!("HTTPS server listening on: https://{}", addr);
+            log::debug!("TLS certificate file: {}", cert_path);
+            log::debug!("TLS private key file: {}", private_key_path);
 
-            let acceptor = acceptor.clone();
-            let _handler_clone = Arc::clone(&handler);
-            let proxy_type = self.get_proxy_type();
-            let worker = self.get_worker().clone();
+            loop {
+                let (tcp_stream, remote_addr) = tcp_listener.accept().await
+                    .map_err(|e| ProxyError::Io(e))?;
 
-            // Track connection count
-            self.increment_connections();
-
-            tokio::spawn(async move {
-                let _timer = RequestTimer::new();
-                log::debug!("TLS connection established from: {} for {:?}", remote_addr, proxy_type);
-
-                match acceptor.accept(tcp_stream).await {
-                    Ok(_tls_stream) => {
-                        log::debug!("TLS handshake successful from: {}", remote_addr);
-                        // Connection handling should be implemented by specific server types
-                        // For now, we just count the connection and close it
-                    }
-                    Err(e) => {
-                        log::error!("TLS handshake failed from {}: {}", remote_addr, e);
-                    }
+                // Check connection limits before accepting
+                if !self.can_accept_connection() {
+                    log::warn!("Connection limit reached for {:?}, rejecting connection from: {}",
+                              self.get_proxy_type(), remote_addr);
+                    drop(tcp_stream);
+                    continue;
                 }
 
-                // Decrement connection count when connection closes
-                worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            });
+                let acceptor = acceptor.clone();
+                let _handler_clone = Arc::clone(&handler);
+                let proxy_type = self.get_proxy_type();
+                let worker = self.get_worker().clone();
+
+                // Track connection count
+                self.increment_connections();
+
+                tokio::spawn(async move {
+                    let _timer = RequestTimer::new();
+                    log::debug!("TLS connection established from: {} for {:?}", remote_addr, proxy_type);
+
+                    match acceptor.accept(tcp_stream).await {
+                        Ok(_tls_stream) => {
+                            log::debug!("TLS handshake successful from: {}", remote_addr);
+                            // Connection handling should be implemented by specific server types
+                            // For now, we just count the connection and close it
+                        }
+                        Err(e) => {
+                            log::error!("TLS handshake failed from {}: {}", remote_addr, e);
+                        }
+                    }
+
+                    // Decrement connection count when connection closes
+                    worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
         }
     }
 
     /// Run HTTP server without TLS
-    async fn run_http_server<H>(
+    fn run_http_server<H>(
         &self,
         handler: Arc<H>,
         addr: SocketAddr,
-    ) -> Result<(), ProxyError>
+    ) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send
     where
         H: Send + Sync + 'static + ?Sized,
     {
-        log::info!("Binding TCP listener to: {}", addr);
-        let tcp_listener = tokio::net::TcpListener::bind(&addr).await
-            .map_err(|e| ProxyError::Io(e))?;
-
-        log::info!("HTTP server listening on: http://{}", addr);
-
-        loop {
-            let (tcp_stream, remote_addr) = tcp_listener.accept().await
+        async move {
+            log::info!("Binding TCP listener to: {}", addr);
+            let tcp_listener = tokio::net::TcpListener::bind(&addr).await
                 .map_err(|e| ProxyError::Io(e))?;
 
-            // Check connection limits before accepting
-            if !self.can_accept_connection() {
-                log::warn!("Connection limit reached for {:?}, rejecting connection from: {}",
-                          self.get_proxy_type(), remote_addr);
-                drop(tcp_stream);
-                continue;
+            log::info!("HTTP server listening on: http://{}", addr);
+
+            loop {
+                let (tcp_stream, remote_addr) = tcp_listener.accept().await
+                    .map_err(|e| ProxyError::Io(e))?;
+
+                // Check connection limits before accepting
+                if !self.can_accept_connection() {
+                    log::warn!("Connection limit reached for {:?}, rejecting connection from: {}",
+                              self.get_proxy_type(), remote_addr);
+                    drop(tcp_stream);
+                    continue;
+                }
+
+                let _handler_clone = Arc::clone(&handler);
+                let proxy_type = self.get_proxy_type();
+                let worker = self.get_worker().clone();
+
+                // Track connection count
+                self.increment_connections();
+
+                tokio::spawn(async move {
+                    let _timer = RequestTimer::new();
+                    log::debug!("HTTP connection established from: {} for {:?}", remote_addr, proxy_type);
+                    // Connection handling should be implemented by specific server types
+
+                    // Decrement connection count when connection closes
+                    worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                });
             }
-
-            let _handler_clone = Arc::clone(&handler);
-            let proxy_type = self.get_proxy_type();
-            let worker = self.get_worker().clone();
-
-            // Track connection count
-            self.increment_connections();
-
-            tokio::spawn(async move {
-                let _timer = RequestTimer::new();
-                log::debug!("HTTP connection established from: {} for {:?}", remote_addr, proxy_type);
-                // Connection handling should be implemented by specific server types
-
-                // Decrement connection count when connection closes
-                worker.metrics.connections_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            });
         }
     }
 }

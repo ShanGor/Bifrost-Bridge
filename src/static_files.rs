@@ -1,6 +1,6 @@
 use crate::error::ProxyError;
 use crate::config::{StaticFileConfig, ResolvedStaticMount};
-use crate::common::FileStreaming;
+use crate::common::{FileStreaming, FileBody};
 use hyper::{Method, Response, StatusCode};
 use hyper::body::Incoming;
 use http_body_util::Full;
@@ -128,12 +128,12 @@ impl StaticFileHandler {
         })
     }
 
-    pub async fn handle_request(&self, req: &hyper::Request<Incoming>) -> Result<Response<Full<Bytes>>, ProxyError> {
+    pub async fn handle_request(&self, req: &hyper::Request<Incoming>) -> Result<Response<FileBody>, ProxyError> {
         if req.method() != &Method::GET && req.method() != &Method::HEAD {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .header("Allow", "GET, HEAD")
-                .body(Full::new(Bytes::new()))
+                .body(FileBody::InMemory(Full::new(Bytes::new())))
                 .map_err(|e| ProxyError::Http(e.to_string()))?);
         }
 
@@ -199,7 +199,7 @@ impl StaticFileHandler {
         Ok(requested_path)
     }
 
-    async fn handle_spa_fallback_in_mount(&self, mount_info: &MountInfo, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
+    async fn handle_spa_fallback_in_mount(&self, mount_info: &MountInfo, is_head: bool) -> Result<Response<FileBody>, ProxyError> {
         let fallback_path = mount_info.root_path.join(&mount_info.resolved_mount.spa_fallback_file);
 
         // Check if fallback file exists
@@ -210,7 +210,7 @@ impl StaticFileHandler {
         self.handle_file_with_mount_info(&fallback_path, is_head, Some(mount_info), true).await
     }
 
-    async fn handle_directory_in_mount(&self, mount_info: &MountInfo, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
+    async fn handle_directory_in_mount(&self, mount_info: &MountInfo, dir_path: &PathBuf, request_path: &str, is_head: bool) -> Result<Response<FileBody>, ProxyError> {
         if !mount_info.resolved_mount.enable_directory_listing {
             // Try to serve index files for directories
             for index_file in &mount_info.resolved_mount.index_files {
@@ -231,7 +231,7 @@ impl StaticFileHandler {
         self.generate_directory_listing_in_mount(dir_path, request_path, is_head).await
     }
 
-    async fn generate_directory_listing_in_mount(&self, dir_path: &Path, request_path: &str, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
+    async fn generate_directory_listing_in_mount(&self, dir_path: &Path, request_path: &str, is_head: bool) -> Result<Response<FileBody>, ProxyError> {
         let dir_path_clone = dir_path.to_path_buf();
         let request_path_clone = request_path.to_string();
 
@@ -298,9 +298,9 @@ impl StaticFileHandler {
 
         let content_length = html.len();
         let body = if is_head {
-            Full::new(Bytes::new())
+            FileBody::InMemory(Full::new(Bytes::new()))
         } else {
-            Full::new(Bytes::from(html))
+            FileBody::InMemory(Full::new(Bytes::from(html)))
         };
 
         Ok(Response::builder()
@@ -314,11 +314,6 @@ impl StaticFileHandler {
     
     // resolve_file_path is replaced by resolve_file_path_in_mount for multi-mount support
 
-    async fn handle_file(&self, file_path: &PathBuf, is_head: bool) -> Result<Response<Full<Bytes>>, ProxyError> {
-        // Legacy method - defaults to non-SPA mode for backwards compatibility
-        self.handle_file_with_mount_info(file_path, is_head, None, false).await
-    }
-
     /// Handle file with optional mount information for SPA-aware caching
     pub async fn handle_file_with_mount_info(
         &self,
@@ -326,7 +321,7 @@ impl StaticFileHandler {
         is_head: bool,
         mount_info: Option<&MountInfo>,
         is_spa_fallback: bool,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+    ) -> Result<Response<FileBody>, ProxyError> {
         let metadata = fs::metadata(file_path)
             .map_err(|_| ProxyError::NotFound(format!("File not found: {:?}", file_path)))?;
 
@@ -366,8 +361,8 @@ impl StaticFileHandler {
             .map(|m| m.resolved_mount.cache_millisecs)
             .unwrap_or(3600);
 
-        // Use centralized optimized response with SPA-aware cache control
-        FileStreaming::create_optimized_response_with_cache(file_path, &mime_type, file_size, is_head, no_cache, cache_duration).await
+        // Use centralized optimized response with SPA-aware cache control and streaming support
+        FileStreaming::create_optimized_file_response(file_path, &mime_type, file_size, is_head, no_cache, cache_duration).await
     }
 
     // handle_directory is replaced by handle_directory_in_mount for multi-mount support
@@ -376,11 +371,11 @@ impl StaticFileHandler {
 
     
     /// Generates a 404 Not Found response
-    fn not_found_response(&self) -> Response<Full<Bytes>> {
+    fn not_found_response(&self) -> Response<FileBody> {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Content-Type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from(HTML_404_TEMPLATE)))
+            .body(FileBody::InMemory(Full::new(Bytes::from(HTML_404_TEMPLATE))))
             .unwrap()
     }
 

@@ -89,6 +89,75 @@ pub enum ProxyMode {
     Reverse,
 }
 
+/// Health check configuration for reverse proxy connection pool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Health check interval in seconds (default: 30s)
+    #[serde(default = "default_health_check_interval")]
+    pub interval_secs: u64,
+    /// Health check endpoint (e.g., "/health", "/ping")
+    /// If not set, uses TCP connection check
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Timeout for health check in seconds (default: 5s)
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_health_check_interval() -> u64 {
+    30
+}
+
+fn default_health_check_timeout() -> u64 {
+    5
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 30,
+            endpoint: None,
+            timeout_secs: 5,
+        }
+    }
+}
+
+/// Reverse proxy specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReverseProxyConfig {
+    /// Maximum idle connections to keep per backend host
+    /// 0 = no pooling (create new connection per request)
+    /// 1-50 = maintain connection pool for better performance
+    /// Default: 10
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
+    /// Pool idle timeout in seconds (how long to keep idle connections)
+    /// Default: 90s
+    #[serde(default = "default_pool_idle_timeout")]
+    pub pool_idle_timeout_secs: u64,
+    /// Health check configuration (optional)
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    10
+}
+
+fn default_pool_idle_timeout() -> u64 {
+    90
+}
+
+impl Default for ReverseProxyConfig {
+    fn default() -> Self {
+        Self {
+            pool_max_idle_per_host: 10,
+            pool_idle_timeout_secs: 90,
+            health_check: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticMount {
     pub path: String,        // URL path prefix (e.g., "/app", "/api", "/assets")
@@ -287,6 +356,9 @@ pub struct Config {
     pub proxy_username: Option<String>,
     #[serde(default)]
     pub proxy_password: Option<String>,
+    // Reverse proxy specific configuration
+    #[serde(default)]
+    pub reverse_proxy_config: Option<ReverseProxyConfig>,
     // Logging configuration
     #[serde(default)]
     pub logging: Option<LoggingConfig>,
@@ -320,6 +392,7 @@ impl Default for Config {
             relay_proxy_domain_suffixes: None,
             proxy_username: None,
             proxy_password: None,
+            reverse_proxy_config: None,
             logging: None,
         }
     }

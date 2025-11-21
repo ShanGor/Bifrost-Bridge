@@ -1,0 +1,16 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "reverse_proxy_target": "http://backend:3000",
+  "reverse_proxy_config": {
+    "pool_max_idle_per_host": 20,
+    "pool_idle_timeout_secs": 90,
+    "health_check": {
+      "interval_secs": 30,
+      "endpoint": "/health",
+      "timeout_secs": 5
+    }
+  },
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90
+}

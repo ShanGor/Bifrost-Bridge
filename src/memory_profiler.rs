@@ -69,8 +69,8 @@ impl MemoryProfiler {
 
         for worker in &self.workers {
             // Count connections and requests
-            stats.total_connections += worker.metrics.connections_active.load(std::sync::atomic::Ordering::Relaxed);
-            stats.total_requests += worker.metrics.requests_total.load(std::sync::atomic::Ordering::Relaxed);
+            stats.total_connections += worker.metrics.connections_active();
+            stats.total_requests += worker.metrics.requests_total();
 
             // Estimate memory usage for each component
             stats.metrics_memory_estimate_mb += Self::estimate_metrics_memory();
@@ -240,7 +240,7 @@ mod tests {
         ));
 
         worker.increment_connections();
-        worker.metrics.requests_total.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+        worker.metrics.increment_requests_by(100);
 
         profiler.add_worker(worker);
 

@@ -1,12 +1,13 @@
 use crate::error::ProxyError;
 use crate::config::{StaticFileConfig, ResolvedStaticMount};
-use crate::common::{FileStreaming, FileBody};
+use crate::common::{FileStreaming, FileBody, PerformanceMetrics};
 use hyper::{Method, Response, StatusCode};
 use hyper::body::Incoming;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // HTML Templates - extracted as constants for maintainability and performance
 
@@ -94,6 +95,7 @@ pub struct StaticFileHandler {
     mounts: Vec<MountInfo>,
     // Custom MIME type mappings
     custom_mime_types: std::collections::HashMap<String, String>,
+    metrics: Arc<PerformanceMetrics>,
 }
 
 #[derive(Clone)]
@@ -125,7 +127,13 @@ impl StaticFileHandler {
         Ok(Self {
             mounts,
             custom_mime_types: config.custom_mime_types,
+            metrics: Arc::new(PerformanceMetrics::new()),
         })
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<PerformanceMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     pub async fn handle_request(&self, req: &hyper::Request<Incoming>) -> Result<Response<FileBody>, ProxyError> {
@@ -361,8 +369,27 @@ impl StaticFileHandler {
             .map(|m| m.resolved_mount.cache_millisecs)
             .unwrap_or(3600);
 
+        let should_stream = FileStreaming::should_stream_file(file_size, 1024 * 1024);
+
         // Use centralized optimized response with SPA-aware cache control and streaming support
-        FileStreaming::create_optimized_file_response(file_path, &mime_type, file_size, is_head, no_cache, cache_duration).await
+        let response = FileStreaming::create_optimized_file_response(
+            file_path,
+            &mime_type,
+            file_size,
+            is_head,
+            no_cache,
+            cache_duration,
+        ).await?;
+
+        if !is_head {
+            self.metrics.increment_files_served();
+            if should_stream {
+                self.metrics.increment_files_streamed();
+            }
+            self.metrics.record_response_bytes(file_size);
+        }
+
+        Ok(response)
     }
 
     // handle_directory is replaced by handle_directory_in_mount for multi-mount support

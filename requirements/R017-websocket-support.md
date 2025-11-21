@@ -1,6 +1,6 @@
 # R017: WebSocket Support
 
-**Status:** 📋 Pending
+**Status:** ✅ Completed
 **Date Raised:** TBD
 **Category:** Protocol Support
 
@@ -22,14 +22,14 @@ Support WebSocket proxying to enable real-time communication through the proxy s
 - Origin validation
 - Protocol filtering
 
-## 📋 Implementation Plan
+## ✅ Implementation Summary
 
-1. **Protocol Detection**: Detect WebSocket upgrade requests
-2. **Connection Handling**: Implement WebSocket tunneling
-3. **Routing**: Add WebSocket-specific routing logic
-4. **Security**: Implement origin and protocol validation
+- Added automatic detection of `Upgrade: websocket` requests and bridged them end-to-end using Hyper's upgrade API for both forward and reverse proxy modes.
+- Reverse proxy now validates `Origin` and `Sec-WebSocket-Protocol` headers against the new configuration block before establishing tunnels, and streams bytes between client and backend using Tokio's bidirectional copy.
+- Forward proxy supports direct HTTP(S) WebSocket upgrades (WSS via CONNECT already worked) and rejects relay-configured routes until dedicated handling is implemented.
+- Shared `websocket` configuration controls allowed origins, subprotocols, and per-tunnel timeouts, and is exposed alongside monitoring config in `docs/configuration.md`.
 
-## 🔧 Configuration (Planned)
+## 🔧 Configuration
 
 ```json
 {

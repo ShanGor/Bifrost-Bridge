@@ -294,6 +294,9 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         proxy_password: args.proxy_password.clone(),
         reverse_proxy_config: None,
         logging: None,
+        monitoring: bifrost_bridge::config::MonitoringConfig::default(),
+        websocket: None,
+        rate_limiting: None,
     };
 
     // Configure static files if specified

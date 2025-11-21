@@ -109,6 +109,89 @@ cargo run -- --help
 | `connection_pool_enabled` | Boolean | Enable HTTP connection pooling for forward proxy | `true` |
 | `pool_max_idle_per_host` | Number | Maximum idle connections per host for connection pooling | `10` |
 | `worker_separation` | Object | Worker separation configuration (see below) | `null` |
+| `monitoring` | Object | Monitoring endpoints configuration (see below) | Enabled with default endpoints |
+
+## 📡 Monitoring Configuration
+
+```json
+{
+  "monitoring": {
+    "enabled": true,
+    "listen_address": "127.0.0.1:9900",
+    "metrics_endpoint": "/metrics",
+    "health_endpoint": "/health",
+    "status_endpoint": "/status",
+    "include_detailed_metrics": true
+  }
+}
+```
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `enabled` | Boolean | Toggle the monitoring server on/off | `true` |
+| `listen_address` | String | Address for the monitoring HTTP server | `127.0.0.1:9900` |
+| `metrics_endpoint` | String | Prometheus-compatible metrics endpoint | `"/metrics"` |
+| `health_endpoint` | String | JSON health endpoint for load balancers | `"/health"` |
+| `status_endpoint` | String | Human-friendly HTML dashboard | `"/status"` |
+| `include_detailed_metrics` | Boolean | Include extended fields in future responses | `true` |
+
+Once enabled, the monitoring server exposes all three endpoints on the configured `listen_address`. The `/metrics` endpoint is safe for Prometheus scrapes, `/health` is optimized for fast JSON responses, and `/status` renders the built-in dashboard.
+
+## 🌐 WebSocket Configuration
+
+```json
+{
+  "websocket": {
+    "enabled": true,
+    "allowed_origins": ["*"],
+    "supported_protocols": ["chat", "notification"],
+    "timeout_seconds": 300
+  }
+}
+```
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `enabled` | Boolean | Toggle WebSocket proxying | `true` |
+| `allowed_origins` | Array | Allowed `Origin` values (`"*"` permits all) | `["*"]` |
+| `supported_protocols` | Array | Allowed `Sec-WebSocket-Protocol` values (empty = any) | `[]` |
+| `timeout_seconds` | Number | Idle timeout for upgraded tunnels | `300` |
+
+The forward proxy supports direct WebSocket upgrades (and WSS via the existing CONNECT tunnel). Reverse proxy upgrades are automatically bridged to the backend using the same configuration. Relay proxies do not yet support WebSocket upgrades.
+
+## 🚦 Rate Limiting Configuration
+
+```json
+{
+  "rate_limiting": {
+    "enabled": true,
+    "default_limit": { "limit": 200, "window_secs": 60 },
+    "rules": [
+      {
+        "id": "login-posts",
+        "limit": 20,
+        "window_secs": 60,
+        "path_prefix": "/api/login",
+        "methods": ["POST"]
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `enabled` | Boolean | Toggle rate limiting | `true` |
+| `default_limit.limit` | Number | Requests allowed per IP in the default window | Required when `default_limit` is present |
+| `default_limit.window_secs` | Number | Window length (seconds) for the default tier | Required when `default_limit` is present |
+| `rules` | Array | Additional rule definitions (per endpoint/tier) | `[]` |
+| `rules[].id` | String | Unique rule identifier for logging/metrics | — |
+| `rules[].limit` | Number | Requests allowed per window for matching requests | — |
+| `rules[].window_secs` | Number | Window size (seconds) for the rule | — |
+| `rules[].path_prefix` | String | Optional path prefix match (e.g., `/api/admin`) | Matches all paths when omitted |
+| `rules[].methods` | Array | Optional HTTP method filter (e.g., `["POST"]`) | Matches all methods when omitted |
+
+Rules are evaluated in the order defined. A request can match multiple rules: the default tier plus any endpoint-specific tiers. Every rule maintains a per-IP counter; exceeding any limit triggers an HTTP `429 Too Many Requests` response with a `Retry-After` header. Forward proxy CONNECT/WebSocket requests, reverse proxy traffic, and static file responses all share the same limiter.
 
 ## 📁 Static File Configuration
 

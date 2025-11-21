@@ -9,6 +9,8 @@ pub mod common;
 pub mod config_validation;
 pub mod memory_profiler;
 pub mod error_recovery;
+pub mod monitoring;
+pub mod rate_limit;
 
 pub use config::{Config, ProxyMode};
 pub use error::ProxyError;

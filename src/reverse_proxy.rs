@@ -1,11 +1,13 @@
+use crate::common::{ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, is_websocket_upgrade};
 use crate::error::ProxyError;
-use crate::config::{ReverseProxyConfig, HealthCheckConfig};
+use crate::config::{ReverseProxyConfig, HealthCheckConfig, WebSocketConfig};
+use crate::rate_limit::RateLimiter;
 use hyper::{Request, Response, StatusCode, Uri, Method};
-use hyper::body::Incoming;
+use hyper::body::{Body as _, Incoming};
 use http_body_util::{BodyExt, Full, Empty};
 use hyper::body::Bytes;
 use hyper::server::conn::http1::Builder as ServerBuilder;
-use hyper::header::HOST;
+use hyper::header::{HOST, ORIGIN};
 use hyper::header::HeaderName;
 use log::{info, error, warn, debug};
 use hyper::service::service_fn;
@@ -13,6 +15,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::sync::Arc;
+use tokio::io::copy_bidirectional;
 
 // Custom header names for X-Forwarded-* headers
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -36,6 +39,9 @@ pub struct ReverseProxy {
     http_client: Arc<Client<HttpConnector, Incoming>>,
     // Health check configuration
     health_check_config: Option<HealthCheckConfig>,
+    metrics: Arc<PerformanceMetrics>,
+    websocket_config: WebSocketConfig,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl ReverseProxy {
@@ -47,6 +53,7 @@ impl ReverseProxy {
             idle_timeout_secs,
             max_connection_lifetime_secs,
             None,
+            None,
         )
     }
 
@@ -57,6 +64,7 @@ impl ReverseProxy {
         _idle_timeout_secs: u64,
         _max_connection_lifetime_secs: u64,
         reverse_proxy_config: Option<ReverseProxyConfig>,
+        websocket_config: Option<WebSocketConfig>,
     ) -> Result<Self, ProxyError> {
         let url = Url::parse(&target_url)
             .map_err(|e| ProxyError::Url(e))?;
@@ -85,6 +93,9 @@ impl ReverseProxy {
             preserve_host: true,
             http_client: Arc::new(http_client),
             health_check_config,
+            metrics: Arc::new(PerformanceMetrics::new()),
+            websocket_config: websocket_config.unwrap_or_default(),
+            rate_limiter: Arc::new(RateLimiter::new(None)),
         })
     }
 
@@ -129,6 +140,16 @@ impl ReverseProxy {
         self
     }
 
+    pub fn with_metrics(mut self, metrics: Arc<PerformanceMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, rate_limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     /// Public method for handling individual requests (used by CombinedProxyAdapter)
     pub async fn handle_request_with_context(&self, req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, Infallible> {
         Self::handle_request_static(
@@ -137,6 +158,9 @@ impl ReverseProxy {
             self.http_client.clone(),
             self.target_url.clone(),
             self.preserve_host,
+            Arc::new(self.websocket_config.clone()),
+            self.metrics.clone(),
+            self.rate_limiter.clone(),
         ).await
     }
 
@@ -158,6 +182,9 @@ impl ReverseProxy {
         let http_client = self.http_client.clone();
         let target_url = self.target_url.clone();
         let preserve_host = self.preserve_host;
+        let websocket_config = Arc::new(self.websocket_config.clone());
+        let metrics = self.metrics.clone();
+        let rate_limiter = self.rate_limiter.clone();
 
         loop {
             let (stream, remote_addr) = listener.accept().await
@@ -165,8 +192,12 @@ impl ReverseProxy {
 
             let http_client = http_client.clone();
             let target_url = target_url.clone();
+            let metrics = metrics.clone();
+            let websocket_config = websocket_config.clone();
+            let rate_limiter = rate_limiter.clone();
 
             tokio::spawn(async move {
+                let _connection = ConnectionTracker::new(metrics.clone());
                 let io = TokioIo::new(stream);
 
                 if let Err(err) = ServerBuilder::new()
@@ -176,19 +207,35 @@ impl ReverseProxy {
                             let http_client = http_client.clone();
                             let target_url = target_url.clone();
                             let client_ip = Some(remote_addr.ip().to_string());
+                            let metrics = metrics.clone();
+                            let websocket_cfg = websocket_config.clone();
+                            let rate_limiter = rate_limiter.clone();
 
                             let context = RequestContext {
                                 client_ip: client_ip.clone(),
                             };
 
                             async move {
-                                Self::handle_request_static(
+                                metrics.increment_requests();
+                                let timer = RequestTimer::with_metrics(metrics.clone());
+                                let result = Self::handle_request_static(
                                     req,
                                     context,
                                     http_client,
                                     target_url,
                                     preserve_host,
-                                ).await
+                                    websocket_cfg,
+                                    metrics.clone(),
+                                    rate_limiter.clone(),
+                                ).await;
+
+                                if let Some(len) = result.as_ref()
+                                    .ok()
+                                    .and_then(|response| response.body().size_hint().exact()) {
+                                    metrics.record_response_bytes(len as u64);
+                                }
+                                timer.finish();
+                                result
                             }
                         })
                     )
@@ -207,7 +254,36 @@ impl ReverseProxy {
         http_client: Arc<Client<HttpConnector, Incoming>>,
         target_url: Url,
         preserve_host: bool,
+        websocket_config: Arc<WebSocketConfig>,
+        metrics: Arc<PerformanceMetrics>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        if rate_limiter.is_enabled() {
+            if let Some(client_ip) = context.client_ip.as_deref() {
+                if let Err(hit) = rate_limiter
+                    .check_request(
+                        client_ip,
+                        req.method(),
+                        req.uri()
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or("/"),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Reverse proxy rate limit hit for {} via rule {}",
+                        client_ip, hit.rule_id
+                    );
+                    return Ok(ResponseBuilder::too_many_requests(&hit.rule_id, hit.retry_after_secs));
+                }
+            }
+        }
+
+        if is_websocket_upgrade(req.headers()) {
+            return Self::handle_websocket_request(req, context, http_client, target_url, preserve_host, websocket_config).await;
+        }
+
         match Self::process_request_static(req, context, http_client, target_url, preserve_host).await {
             Ok(response) => Ok(response),
             Err(e) => {
@@ -216,6 +292,7 @@ impl ReverseProxy {
                     .status(StatusCode::BAD_GATEWAY)
                     .body(Full::new(Bytes::from(format!("Proxy Error: {}", e))))
                     .unwrap();
+                metrics.increment_connection_errors();
                 Ok(error_response)
             }
         }
@@ -223,17 +300,126 @@ impl ReverseProxy {
 
     /// Process request using HTTP client with connection pooling
     async fn process_request_static(
-        mut req: Request<Incoming>,
+        req: Request<Incoming>,
         context: RequestContext,
         http_client: Arc<Client<HttpConnector, Incoming>>,
         target_url: Url,
         preserve_host: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        // Build target URI
+        let prepared = Self::rewrite_backend_request(req, &context, &target_url, preserve_host, false)?;
+
+        let response = http_client.request(prepared).await
+            .map_err(|e| ProxyError::Http(format!("Failed to forward request: {}", e)))?;
+
+        Self::finalize_backend_response(response, false).await
+    }
+
+    async fn handle_websocket_request(
+        mut req: Request<Incoming>,
+        context: RequestContext,
+        http_client: Arc<Client<HttpConnector, Incoming>>,
+        target_url: Url,
+        preserve_host: bool,
+        websocket_config: Arc<WebSocketConfig>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        if let Err(reason) = Self::validate_websocket_headers(req.headers(), &websocket_config) {
+            return Ok(ResponseBuilder::error(StatusCode::FORBIDDEN, &reason));
+        }
+
+        let client_upgrade = hyper::upgrade::on(&mut req);
+        let prepared_request = match Self::rewrite_backend_request(req, &context, &target_url, preserve_host, true) {
+            Ok(request) => request,
+            Err(e) => {
+                error!("WebSocket request rewrite failed: {}", e);
+                return Ok(ResponseBuilder::error(StatusCode::BAD_GATEWAY, "Invalid WebSocket request"));
+            }
+        };
+
+        let mut backend_response = match http_client.request(prepared_request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("WebSocket backend request failed: {}", e);
+                return Ok(ResponseBuilder::error(StatusCode::BAD_GATEWAY, "WebSocket backend error"));
+            }
+        };
+
+        if backend_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return match Self::finalize_backend_response(backend_response, false).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    error!("Failed to finalize backend response: {}", e);
+                    Ok(ResponseBuilder::error(StatusCode::BAD_GATEWAY, "WebSocket backend error"))
+                }
+            };
+        }
+
+        let backend_upgrade = hyper::upgrade::on(&mut backend_response);
+        let (parts, _) = backend_response.into_parts();
+        let switch_response = Response::from_parts(parts, Full::new(Bytes::new()));
+
+        tokio::spawn(async move {
+            match (client_upgrade.await, backend_upgrade.await) {
+                (Ok(client_stream), Ok(backend_stream)) => {
+                    let mut client_io = TokioIo::new(client_stream);
+                    let mut backend_io = TokioIo::new(backend_stream);
+                    if let Err(e) = copy_bidirectional(&mut client_io, &mut backend_io).await {
+                        error!("WebSocket tunnel error: {}", e);
+                    }
+                }
+                (Err(e), _) => error!("Client WebSocket upgrade failed: {}", e),
+                (_, Err(e)) => error!("Backend WebSocket upgrade failed: {}", e),
+            }
+        });
+
+        Ok(switch_response)
+    }
+
+    fn validate_websocket_headers(headers: &hyper::HeaderMap, config: &WebSocketConfig) -> Result<(), String> {
+        if !config.enabled {
+            return Err("WebSocket support is disabled".to_string());
+        }
+
+        if config.allowed_origins.iter().all(|o| o != "*") {
+            let origin = headers.get(ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "Origin header is required for WebSocket requests".to_string())?;
+
+            if !config.allowed_origins.iter().any(|allowed| allowed.eq_ignore_ascii_case(origin)) {
+                return Err("Origin not allowed".to_string());
+            }
+        }
+
+        if !config.supported_protocols.is_empty() {
+            let offered = headers.get("Sec-WebSocket-Protocol")
+                .and_then(|v| v.to_str().ok())
+                .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                .unwrap_or_else(|| Vec::new());
+
+            if offered.is_empty() {
+                return Err("WebSocket subprotocol required".to_string());
+            }
+
+            let supported = config.supported_protocols.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>();
+            if !offered.iter().any(|offer| supported.iter().any(|allowed| allowed == &offer.to_ascii_lowercase())) {
+                return Err("Unsupported WebSocket subprotocol".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn rewrite_backend_request(
+        mut req: Request<Incoming>,
+        context: &RequestContext,
+        target_url: &Url,
+        preserve_host: bool,
+        keep_upgrade: bool,
+    ) -> Result<Request<Incoming>, ProxyError> {
         let path_and_query = req.uri().path_and_query()
             .ok_or_else(|| ProxyError::Config("Invalid URI path".to_string()))?;
 
-        let target_url_string = format!("{}{}",
+        let target_url_string = format!(
+            "{}{}",
             target_url.as_str().trim_end_matches('/'),
             path_and_query.as_str()
         );
@@ -241,20 +427,17 @@ impl ReverseProxy {
         let target_uri: Uri = target_url_string.parse()
             .map_err(|e: hyper::http::uri::InvalidUri| ProxyError::Uri(e.to_string()))?;
 
-        // Modify request
         let original_host = req.headers().get(HOST).cloned();
         *req.uri_mut() = target_uri.clone();
 
         let headers = req.headers_mut();
 
-        // Handle Host header
         if !preserve_host {
             if let Some(authority) = target_uri.authority() {
                 headers.insert(HOST, authority.to_string().parse().unwrap());
             }
         }
 
-        // Add X-Forwarded-* headers
         if let Some(client_ip) = &context.client_ip {
             headers.insert(X_FORWARDED_FOR.clone(), client_ip.parse().unwrap());
         }
@@ -263,39 +446,48 @@ impl ReverseProxy {
             headers.insert(X_FORWARDED_HOST.clone(), host);
         }
 
-        // Remove hop-by-hop headers
-        headers.remove("Connection");
+        Self::strip_request_headers(headers, keep_upgrade);
+        Ok(req)
+    }
+
+    fn strip_request_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool) {
+        if !keep_upgrade {
+            headers.remove("Connection");
+            headers.remove("Upgrade");
+        }
         headers.remove("Keep-Alive");
         headers.remove("Proxy-Authenticate");
         headers.remove("Proxy-Authorization");
         headers.remove("TE");
         headers.remove("Trailers");
         headers.remove("Transfer-Encoding");
-        headers.remove("Upgrade");
+    }
 
-        // Send request through HTTP client (with connection pooling)
-        let response = http_client.request(req).await
-            .map_err(|e| ProxyError::Http(format!("Failed to forward request: {}", e)))?;
-
-        // Convert response
-        let (parts, body) = response.into_parts();
+    async fn finalize_backend_response(
+        response: Response<Incoming>,
+        keep_upgrade: bool,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+        let (mut parts, body) = response.into_parts();
         let body_bytes = body.collect().await
             .map_err(|e| ProxyError::Http(format!("Failed to collect response body: {}", e)))?;
 
-        // Modify response
-        let mut modified_parts = parts;
-        let headers = &mut modified_parts.headers;
-        headers.remove("Connection");
+        Self::strip_response_headers(&mut parts.headers, keep_upgrade);
+        parts.headers.insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
+
+        Ok(Response::from_parts(parts, Full::new(body_bytes.to_bytes())))
+    }
+
+    fn strip_response_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool) {
+        if !keep_upgrade {
+            headers.remove("Connection");
+            headers.remove("Upgrade");
+        }
         headers.remove("Keep-Alive");
         headers.remove("Proxy-Authenticate");
         headers.remove("Proxy-Authorization");
         headers.remove("TE");
         headers.remove("Trailers");
         headers.remove("Transfer-Encoding");
-        headers.remove("Upgrade");
-        headers.insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
-
-        Ok(Response::from_parts(modified_parts, Full::new(body_bytes.to_bytes())))
     }
 
     /// Health check loop (runs in background)

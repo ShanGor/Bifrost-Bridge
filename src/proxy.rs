@@ -4,7 +4,9 @@ use crate::error_recovery::ErrorRecoveryManager;
 use crate::forward_proxy::ForwardProxy;
 use crate::reverse_proxy::ReverseProxy;
 use crate::static_files::StaticFileHandler;
-use crate::common::{ResponseBuilder, TlsConfig, FileBody, ProxyType, IsolatedWorker};
+use crate::common::{MonitoringHandles, ResponseBuilder, TlsConfig, FileBody, ProxyType, IsolatedWorker};
+use crate::monitoring::MonitoringServer;
+use crate::rate_limit::{RateLimiter, RateLimitHit};
 use log::{info, debug, warn, error};
 use hyper::{Response, StatusCode};
 use hyper::body::Bytes;
@@ -33,7 +35,11 @@ impl ProxyFactory {
         debug!("Proxy configuration - listen_addr: {}, max_connections: {:?}",
                config.listen_addr, config.max_connections);
 
-        match config.mode {
+        let monitoring_handles = MonitoringHandles::new();
+        let monitoring_config = config.monitoring.clone();
+        let rate_limiter = Arc::new(RateLimiter::new(config.rate_limiting.clone()));
+
+        let proxy: Box<dyn Proxy + Send> = match config.mode {
             ProxyMode::Forward => {
                 info!("Initializing Forward Proxy mode");
                 debug!("Forward proxy configuration - connection_pool: {:?}",
@@ -72,14 +78,16 @@ impl ProxyFactory {
                     relay_configs,
                     config.proxy_username,
                     config.proxy_password,
+                    config.websocket.clone(),
+                    rate_limiter.clone(),
                 );
                 
-                Ok(Box::new(ForwardProxyAdapter {
+                Box::new(ForwardProxyAdapter {
                     proxy,
                     addr: config.listen_addr,
                     private_key: config.private_key,
                     certificate: config.certificate,
-                }))
+                })
             }
             ProxyMode::Reverse => {
                 info!("Initializing Reverse Proxy mode");
@@ -88,19 +96,22 @@ impl ProxyFactory {
                     info!("Static files only mode (no reverse proxy target)");
                     let static_config = config.static_files.unwrap();
                     debug!("Static files configuration - mounts: {}", static_config.mounts.len());
-                    let handler = StaticFileHandler::new(static_config)?;
-                    Ok(Box::new(StaticFileProxyAdapter {
+                    let handler = StaticFileHandler::new(static_config)?
+                        .with_metrics(monitoring_handles.static_metrics());
+                    Box::new(StaticFileProxyAdapter {
                         handler,
                         addr: config.listen_addr,
                         private_key: config.private_key,
                         certificate: config.certificate,
-                    }))
+                        rate_limiter: rate_limiter.clone(),
+                    })
                 } else if config.static_files.is_some() && config.reverse_proxy_target.is_some() {
                     // Combined mode: both reverse proxy and static files
                     info!("Combined reverse proxy + static files mode");
                     let static_config = config.static_files.unwrap();
                     debug!("Static files configuration - mounts: {}", static_config.mounts.len());
-                    let handler = StaticFileHandler::new(static_config)?;
+                    let handler = StaticFileHandler::new(static_config)?
+                        .with_metrics(monitoring_handles.static_metrics());
 
                     let target_url = config.reverse_proxy_target.unwrap();
                     info!("Reverse proxy target: {}", target_url);
@@ -118,15 +129,19 @@ impl ProxyFactory {
                         idle_timeout_secs,
                         max_connection_lifetime_secs,
                         config.reverse_proxy_config.clone(),
-                    )?;
+                        config.websocket.clone(),
+                    )?
+                    .with_metrics(monitoring_handles.reverse_metrics())
+                    .with_rate_limiter(rate_limiter.clone());
 
-                    Ok(Box::new(CombinedProxyAdapter {
+                    Box::new(CombinedProxyAdapter {
                         reverse_proxy: proxy,
                         static_handler: handler,
                         addr: config.listen_addr,
                         private_key: config.private_key,
                         certificate: config.certificate,
-                    }))
+                        rate_limiter: rate_limiter.clone(),
+                    })
                 } else {
                     // Reverse proxy only mode
                     let target_url = config.reverse_proxy_target
@@ -146,16 +161,60 @@ impl ProxyFactory {
                         idle_timeout_secs,
                         max_connection_lifetime_secs,
                         config.reverse_proxy_config.clone(),
-                    )?;
-                    Ok(Box::new(ReverseProxyAdapter {
+                        config.websocket.clone(),
+                    )?
+                    .with_metrics(monitoring_handles.reverse_metrics())
+                    .with_rate_limiter(rate_limiter.clone());
+                    Box::new(ReverseProxyAdapter {
                         proxy,
                         addr: config.listen_addr,
                         private_key: config.private_key,
                         certificate: config.certificate,
-                    }))
+                    })
                 }
             }
+        };
+
+        if monitoring_config.enabled {
+            let server = MonitoringServer::new(monitoring_config, monitoring_handles.clone());
+            Ok(Box::new(ProxyWithMonitoring::new(proxy, Some(server))))
+        } else {
+            Ok(proxy)
         }
+    }
+}
+
+struct ProxyWithMonitoring {
+    inner: Box<dyn Proxy + Send>,
+    monitoring: Option<MonitoringServer>,
+}
+
+impl ProxyWithMonitoring {
+    fn new(inner: Box<dyn Proxy + Send>, monitoring: Option<MonitoringServer>) -> Self {
+        Self { inner, monitoring }
+    }
+}
+
+impl Proxy for ProxyWithMonitoring {
+    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+        Box::pin(async move {
+            let ProxyWithMonitoring { inner, monitoring } = *self;
+            let monitoring_task = monitoring.map(|server| {
+                tokio::spawn(async move {
+                    if let Err(err) = server.run().await {
+                        error!("Monitoring server stopped: {}", err);
+                    }
+                })
+            });
+
+            let result = inner.run().await;
+
+            if let Some(task) = monitoring_task {
+                task.abort();
+            }
+
+            result
+        })
     }
 }
 
@@ -201,6 +260,26 @@ struct StaticFileProxyAdapter {
     addr: SocketAddr,
     private_key: Option<String>,
     certificate: Option<String>,
+    rate_limiter: Arc<RateLimiter>,
+}
+
+impl StaticFileProxyAdapter {
+    fn rate_limited_response(hit: &RateLimitHit) -> Response<FileBody> {
+        let mut builder = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Content-Type", "text/plain; charset=utf-8");
+
+        if hit.retry_after_secs > 0 {
+            builder = builder.header("Retry-After", hit.retry_after_secs.to_string());
+        }
+
+        builder
+            .body(FileBody::InMemory(Full::new(Bytes::from(format!(
+                "Rate limit '{}' exceeded. Please retry later.",
+                hit.rule_id
+            )))))
+            .unwrap()
+    }
 }
 
 impl Proxy for StaticFileProxyAdapter {
@@ -210,6 +289,7 @@ impl Proxy for StaticFileProxyAdapter {
             let addr = self.addr;
             let private_key = self.private_key;
             let certificate = self.certificate;
+            let rate_limiter = self.rate_limiter.clone();
 
             match (private_key, certificate) {
                 (Some(private_key_path), Some(cert_path)) => {
@@ -235,13 +315,36 @@ impl Proxy for StaticFileProxyAdapter {
                             .map_err(|e| ProxyError::Io(e))?;
                         let acceptor = acceptor.clone();
                         let handler_ref = handler.clone();
+                        let rate_limiter = rate_limiter.clone();
+                        let client_ip = remote_addr.ip().to_string();
 
                         tokio::spawn(async move {
                             match acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
                                     let service = service_fn(move |req| {
                                         let handler = handler_ref.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let client_ip = client_ip.clone();
                                         async move {
+                                            if let Err(hit) = rate_limiter
+                                                .check_request(
+                                                    &client_ip,
+                                                    req.method(),
+                                                    req.uri()
+                                                        .path_and_query()
+                                                        .map(|pq| pq.as_str())
+                                                        .unwrap_or("/"),
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Static HTTPS rate limit hit for {} via rule {}",
+                                                    client_ip, hit.rule_id
+                                                );
+                                                return Ok::<_, Infallible>(
+                                                    StaticFileProxyAdapter::rate_limited_response(&hit),
+                                                );
+                                            }
                                             match handler.handle_request(&req).await {
                                                 Ok(response) => Ok::<_, Infallible>(response),
                                                 Err(_) => {
@@ -276,10 +379,12 @@ impl Proxy for StaticFileProxyAdapter {
                     info!("HTTP static file server listening on: http://{}", addr);
 
                     loop {
-                        let (stream, _) = listener.accept().await
+                        let (stream, remote_addr) = listener.accept().await
                             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
                         let handler = handler.clone();
+                        let rate_limiter = rate_limiter.clone();
+                        let client_ip = remote_addr.ip().to_string();
                         tokio::spawn(async move {
                             let io = TokioIo::new(stream);
 
@@ -288,7 +393,28 @@ impl Proxy for StaticFileProxyAdapter {
                                     io,
                                     service_fn(move |req| {
                                         let handler = handler.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let client_ip = client_ip.clone();
                                         async move {
+                                            if let Err(hit) = rate_limiter
+                                                .check_request(
+                                                    &client_ip,
+                                                    req.method(),
+                                                    req.uri()
+                                                        .path_and_query()
+                                                        .map(|pq| pq.as_str())
+                                                        .unwrap_or("/"),
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Static HTTP rate limit hit for {} via rule {}",
+                                                    client_ip, hit.rule_id
+                                                );
+                                                return Ok::<_, Infallible>(
+                                                    StaticFileProxyAdapter::rate_limited_response(&hit),
+                                                );
+                                            }
                                             match handler.handle_request(&req).await {
                                                 Ok(response) => Ok::<_, Infallible>(response),
                                                 Err(_) => {
@@ -318,6 +444,7 @@ struct CombinedProxyAdapter {
     private_key: Option<String>,
     #[allow(dead_code)]
     certificate: Option<String>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl Proxy for CombinedProxyAdapter {
@@ -328,6 +455,7 @@ impl Proxy for CombinedProxyAdapter {
             let certificate = self.certificate;
             let reverse_proxy = Arc::new(self.reverse_proxy);
             let static_handler = Arc::new(self.static_handler);
+            let rate_limiter = self.rate_limiter.clone();
 
             match (private_key, certificate) {
                 (Some(private_key_path), Some(cert_path)) => {
@@ -354,6 +482,8 @@ impl Proxy for CombinedProxyAdapter {
                         let acceptor = acceptor.clone();
                         let reverse_proxy_ref = reverse_proxy.clone();
                         let static_handler_ref = static_handler.clone();
+                        let rate_limiter = rate_limiter.clone();
+                        let client_ip = remote_addr.ip().to_string();
 
                         tokio::spawn(async move {
                             match acceptor.accept(tcp_stream).await {
@@ -361,12 +491,32 @@ impl Proxy for CombinedProxyAdapter {
                                     let service = service_fn(move |req| {
                                         let reverse_proxy = reverse_proxy_ref.clone();
                                         let static_handler = static_handler_ref.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let client_ip = client_ip.clone();
                                         async move {
                                             // Route request to appropriate handler
                                             let request_path = req.uri().path();
 
                                             // Check if request matches any static file mount
                                             if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(request_path) {
+                                                if let Err(hit) = rate_limiter
+                                                    .check_request(
+                                                        &client_ip,
+                                                        req.method(),
+                                                        req.uri()
+                                                            .path_and_query()
+                                                            .map(|pq| pq.as_str())
+                                                            .unwrap_or("/"),
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Combined HTTPS rate limit hit for {} via rule {}",
+                                                        client_ip, hit.rule_id
+                                                    );
+                                                    return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
+                                                }
+
                                                 // Serve static file
                                                 match static_handler.handle_request(&req).await {
                                                     Ok(response) => Ok::<_, Infallible>(response),
@@ -451,6 +601,8 @@ impl Proxy for CombinedProxyAdapter {
 
                         let reverse_proxy = reverse_proxy.clone();
                         let static_handler = static_handler.clone();
+                        let rate_limiter = rate_limiter.clone();
+                        let client_ip = remote_addr.ip().to_string();
                         tokio::spawn(async move {
                             let io = TokioIo::new(stream);
 
@@ -460,12 +612,32 @@ impl Proxy for CombinedProxyAdapter {
                                     service_fn(move |req| {
                                         let reverse_proxy = reverse_proxy.clone();
                                         let static_handler = static_handler.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let client_ip = client_ip.clone();
                                         async move {
                                             // Route request to appropriate handler
                                             let request_path = req.uri().path();
 
                                             // Check if request matches any static file mount
                                             if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(request_path) {
+                                                if let Err(hit) = rate_limiter
+                                                    .check_request(
+                                                        &client_ip,
+                                                        req.method(),
+                                                        req.uri()
+                                                            .path_and_query()
+                                                            .map(|pq| pq.as_str())
+                                                            .unwrap_or("/"),
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Combined HTTP rate limit hit for {} via rule {}",
+                                                        client_ip, hit.rule_id
+                                                    );
+                                                    return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
+                                                }
+
                                                 // Serve static file
                                                 match static_handler.handle_request(&req).await {
                                                     Ok(response) => Ok::<_, Infallible>(response),
@@ -755,8 +927,7 @@ impl IsolatedProxyAdapter {
                     return;
                 }
 
-                worker_ref.connection_pool.increment_connections();
-                worker_ref.metrics.increment_connections();
+                worker_ref.increment_connections();
 
                 let request_timer = crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
 
@@ -771,7 +942,7 @@ impl IsolatedProxyAdapter {
                     }
                 }
 
-                worker_ref.connection_pool.decrement_connections();
+                worker_ref.decrement_connections();
             });
         }
     }
@@ -805,8 +976,7 @@ impl IsolatedProxyAdapter {
                     return;
                 }
 
-                worker_ref.connection_pool.increment_connections();
-                worker_ref.metrics.increment_connections();
+                worker_ref.increment_connections();
 
                 let request_timer = crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
 
@@ -816,7 +986,7 @@ impl IsolatedProxyAdapter {
                 debug!("HTTP connection established from {} to {}", remote_addr, worker_ref.get_proxy_type());
                 request_timer.finish();
 
-                worker_ref.connection_pool.decrement_connections();
+                worker_ref.decrement_connections();
             });
         }
     }

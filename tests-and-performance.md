@@ -1,13 +1,31 @@
-# Performance Test Commands and Report
+# Functional and Performance Tests
 
+## Functional Test for Relay Proxy
+```bash
+./target/release/bifrost-bridge --config ./examples/test-config_forward_relay_2.json &
+./target/release/bifrost-bridge --config ./examples/test-config_forward_relay_1.json &
+
+curl -i --proxy http://127.0.0.1:3128 http://google.com
+curl -i --proxy http://127.0.0.1:3128 https://google.com
+curl -i --proxy http://127.0.0.1:3128 http://www.google.com
+curl -i --proxy http://127.0.0.1:3128 https://www.google.com
+curl -i --proxy http://127.0.0.1:3128 http://baidu.com
+curl -i --proxy http://127.0.0.1:3128 https://baidu.com
+curl -i --proxy http://127.0.0.1:3128 http://www.baidu.com
+curl -i --proxy http://127.0.0.1:3128 https://www.baidu.com
+```
+
+## Performance Test for Forward Proxy
 ```bash
 hey -m POST -T "text/plain" -d "hello world, what they fuk you are doing now? i have no idea ffmpeg -i input.mp4 -i output.mp3 -map 0:v -map 1:a -c:v copy -c:a aac output.mp4" -c 50 -n 100000 -q 1000 -x http://localhost:3128  http://localhost:3030/echo.size
 ```
 
+## Performance Test for Static-File-Serving Comparing to Nginx
+**Conclusion**: Bifrost-Bridge is 2.46x faster than Nginx.
 
-## 100k request to the same static file comparing Nginx;
+### 100k request to the same static file comparing Nginx;
 
-### Nginx Results
+#### Nginx Results
 ```sh
 >hey -m GET -c 100 -n 100000 -q 1000 http://localhost/ui/index.html
 
@@ -57,7 +75,7 @@ Error distribution:
 
 ```
 
-### Bifrost Bridge results
+#### Bifrost Bridge results
 ```sh
 >hey -m GET -c 100 -n 100000 -q 1000 http://localhost:8088/ui/index.html
 

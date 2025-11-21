@@ -31,6 +31,8 @@ cargo run -- --help
 | `--mode` | `-m` | Proxy mode: `forward` or `reverse` | `--mode reverse` |
 | `--listen` | `-l` | Listen address for the server | `--listen 127.0.0.1:8080` |
 | `--config` | `-c` | Path to JSON configuration file | `--config config.json` |
+| `--target` | `-t` | Target URL for reverse proxy | `--target http://backend:3000` |
+| `--generate-config` | | Generate sample configuration file | `--generate-config config.json` |
 
 ### Static File Options
 
@@ -38,22 +40,26 @@ cargo run -- --help
 |----------|-------------|---------|
 | `--static-dir` | Single static directory (legacy) | `--static-dir ./public` |
 | `--spa` | Enable SPA mode for single directory | `--spa` |
+| `--spa-fallback` | SPA fallback file name | `--spa-fallback index.html` |
 | `--mount` | Mount static directory at path | `--mount /app:./dist` |
 | `--worker-threads` | Number of worker threads for static file serving | `--worker-threads 8` |
+| `--mime-type` | Custom MIME type mapping | `--mime-type mjs:application/javascript` |
 
-### Connection Options
+### Timeout Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--max-connections` | Maximum concurrent connections | `1000` |
-| `--timeout-secs` | Connection timeout in seconds | `30` |
+| `--connect-timeout` | Connection timeout in seconds | None |
+| `--idle-timeout` | Idle timeout in seconds | None |
+| `--max-connection-lifetime` | Maximum connection lifetime in seconds | None |
+| `--timeout` | Request timeout in seconds (deprecated) | None |
 
 ### Proxy Options
 
 | Argument | Description | Example |
 |----------|-------------|---------|
-| `--forward-proxy-port` | Port for forward proxy mode | `--forward-proxy-port 3128` |
-| `--reverse-proxy-target` | Target URL for reverse proxy | `--reverse-proxy-target http://backend:3000` |
+| `--proxy-username` | Username for proxy authentication | `--proxy-username admin` |
+| `--proxy-password` | Password for proxy authentication | `--proxy-password secret` |
 
 ### HTTPS Options
 
@@ -68,6 +74,14 @@ cargo run -- --help
 |----------|-------------|---------|
 | `--no-connection-pool` | Disable connection pooling (no-pool mode) | `--no-connection-pool` |
 | `--pool-max-idle` | Maximum idle connections per host for connection pooling | `--pool-max-idle 20` |
+
+### Advanced Options
+
+| Argument | Description | Example |
+|----------|-------------|---------|
+| `--max-header-size` | Maximum HTTP header size in bytes | `--max-header-size 8192` |
+| `--log-level` | Set logging level (trace, debug, info, warn, error) | `--log-level debug` |
+| `--log-format` | Set log output format (text, json) | `--log-format json` |
 
 ## 📄 JSON Configuration
 
@@ -108,8 +122,41 @@ cargo run -- --help
 | `certificate` | String | Path to PEM format certificate file for HTTPS | `null` |
 | `connection_pool_enabled` | Boolean | Enable HTTP connection pooling for forward proxy | `true` |
 | `pool_max_idle_per_host` | Number | Maximum idle connections per host for connection pooling | `10` |
-| `worker_separation` | Object | Worker separation configuration (see below) | `null` |
+| `logging` | Object | Logging configuration (see below) | Default console logging |
 | `monitoring` | Object | Monitoring endpoints configuration (see below) | Enabled with default endpoints |
+
+## 📝 Logging Configuration
+
+```json
+{
+  "logging": {
+    "level": "info",
+    "format": "text",
+    "targets": [
+      {
+        "type": "stdout",
+        "level": "info"
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `level` | String | Global logging level (trace, debug, info, warn, error) | `info` |
+| `format` | String | Log output format (text, json) | `text` |
+| `targets` | Array | List of logging output targets | `[{type: "stdout"}]` |
+
+### Log Target Fields
+
+| Field | Type | Description | Required |
+|-------|------|-------------|----------|
+| `type` | String | Output type: `stdout` or `file` | ✅ Yes |
+| `path` | String | File path (required when type is `file`) | ❌ No |
+| `level` | String | Override level for this target | ❌ No |
+
+**Note:** CLI arguments (`--log-level`, `--log-format`) are used as fallback when no logging configuration is provided in the JSON file.
 
 ## 📡 Monitoring Configuration
 
@@ -234,116 +281,6 @@ Each mount in the `mounts` array supports the following fields:
 | `spa_fallback_file` | String | ❌ No | SPA fallback file for this mount |
 
 **Note:** MIME type mappings are configured at the top-level `static_files` level and are inherited by all mounts automatically.
-
-## 👥 Worker Separation Configuration
-
-When `mode` is set to `"Combined"`, you can configure isolated workers for different proxy types:
-
-### WorkerSeparationConfig Fields
-
-| Field | Type | Description | Default |
-|-------|------|-------------|---------|
-| `forward_proxy` | Object | Forward proxy worker configuration | `null` |
-| `reverse_proxy` | Object | Reverse proxy worker configuration | `null` |
-| `static_files` | Object | Static files worker configuration | `null` |
-
-### Individual Worker Configuration
-
-Each worker type supports the following configuration:
-
-#### Forward Proxy Worker
-
-```json
-{
-  "forward_proxy": {
-    "enabled": true,
-    "listen_addr": "127.0.0.1:3128",
-    "max_connections": 1000,
-    "resource_limits": {
-      "max_memory_mb": 512,
-      "max_cpu_percent": 50.0,
-      "connection_timeout_secs": 10,
-      "idle_timeout_secs": 90,
-      "max_connection_lifetime_secs": 300
-    },
-    "connection_pool": {
-      "max_idle_per_host": 50,
-      "pool_timeout_secs": 300,
-      "connection_pool_enabled": true
-    }
-  }
-}
-```
-
-#### Reverse Proxy Worker
-
-```json
-{
-  "reverse_proxy": {
-    "enabled": true,
-    "listen_addr": "127.0.0.1:8080",
-    "target": "http://backend.example.com:3000",
-    "max_connections": 2000,
-    "resource_limits": {
-      "max_memory_mb": 1024,
-      "max_cpu_percent": 80.0,
-      "connection_timeout_secs": 5,
-      "idle_timeout_secs": 60,
-      "max_connection_lifetime_secs": 600
-    },
-    "connection_pool": {
-      "max_idle_per_host": 100,
-      "pool_timeout_secs": 600,
-      "connection_pool_enabled": true
-    }
-  }
-}
-```
-
-#### Static Files Worker
-
-```json
-{
-  "static_files": {
-    "enabled": true,
-    "listen_addr": "127.0.0.1:9000",
-    "max_connections": 500,
-    "worker_threads": 8,
-    "resource_limits": {
-      "max_memory_mb": 256,
-      "max_cpu_percent": 30.0,
-      "connection_timeout_secs": 30,
-      "idle_timeout_secs": 30
-    },
-    "mounts": [
-      {
-        "path": "/",
-        "root_dir": "./public",
-        "spa_mode": true,
-        "enable_directory_listing": false
-      }
-    ]
-  }
-}
-```
-
-#### Worker Resource Limits
-
-| Field | Type | Description | Default |
-|-------|------|-------------|---------|
-| `max_memory_mb` | Number | Maximum memory usage in MB | `512` |
-| `max_cpu_percent` | Number | Maximum CPU usage percentage | `50.0` |
-| `connection_timeout_secs` | Number | Connection timeout in seconds | `10` |
-| `idle_timeout_secs` | Number | Idle connection timeout in seconds | `90` |
-| `max_connection_lifetime_secs` | Number | Maximum connection lifetime in seconds | `300` |
-
-#### Worker Connection Pool
-
-| Field | Type | Description | Default |
-|-------|------|-------------|---------|
-| `max_idle_per_host` | Number | Maximum idle connections per host | `10` |
-| `pool_timeout_secs` | Number | Connection pool timeout in seconds | `300` |
-| `connection_pool_enabled` | Boolean | Enable connection pooling | `true` |
 
 ## 🔗 Multiple Mount Points
 
@@ -584,184 +521,37 @@ cargo run -- \
 }
 ```
 
-### Example 5: Worker Separation with Combined Mode
+### Example 5: Development with Logging
 
-This example shows how to configure multiple isolated workers in combined mode, with each proxy type running in its own isolated environment:
-
-```json
-{
-  "mode": "Combined",
-  "worker_separation": {
-    "forward_proxy": {
-      "enabled": true,
-      "listen_addr": "127.0.0.1:3128",
-      "max_connections": 1000,
-      "resource_limits": {
-        "max_memory_mb": 512,
-        "max_cpu_percent": 50.0,
-        "connection_timeout_secs": 10,
-        "idle_timeout_secs": 90,
-        "max_connection_lifetime_secs": 300
-      },
-      "connection_pool": {
-        "max_idle_per_host": 50,
-        "pool_timeout_secs": 300,
-        "connection_pool_enabled": true
-      }
-    },
-    "reverse_proxy": {
-      "enabled": true,
-      "listen_addr": "127.0.0.1:8080",
-      "target": "http://api.backend.com:3000",
-      "max_connections": 2000,
-      "resource_limits": {
-        "max_memory_mb": 1024,
-        "max_cpu_percent": 80.0,
-        "connection_timeout_secs": 5,
-        "idle_timeout_secs": 60,
-        "max_connection_lifetime_secs": 600
-      },
-      "connection_pool": {
-        "max_idle_per_host": 100,
-        "pool_timeout_secs": 600,
-        "connection_pool_enabled": true
-      },
-      "static_files": {
-        "mounts": [
-          {
-            "path": "/docs",
-            "root_dir": "./api-docs",
-            "enable_directory_listing": true
-          }
-        ]
-      }
-    },
-    "static_files": {
-      "enabled": true,
-      "listen_addr": "127.0.0.1:9000",
-      "max_connections": 500,
-      "worker_threads": 8,
-      "resource_limits": {
-        "max_memory_mb": 256,
-        "max_cpu_percent": 30.0,
-        "connection_timeout_secs": 30,
-        "idle_timeout_secs": 30
-      },
-      "mounts": [
-        {
-          "path": "/app",
-          "root_dir": "./frontend/dist",
-          "spa_mode": true,
-          "enable_directory_listing": false
-        },
-        {
-          "path": "/assets",
-          "root_dir": "./static",
-          "enable_directory_listing": false
-        }
-      ]
-    }
-  }
-}
-```
-
-### Example 6: High-Security Worker Separation
-
-This example demonstrates strict resource isolation and security controls for enterprise environments:
+This example shows a development setup with custom logging configuration:
 
 ```json
 {
-  "mode": "Combined",
-  "worker_separation": {
-    "forward_proxy": {
-      "enabled": true,
-      "listen_addr": "0.0.0.0:3128",
-      "max_connections": 500,
-      "resource_limits": {
-        "max_memory_mb": 256,
-        "max_cpu_percent": 25.0,
-        "connection_timeout_secs": 5,
-        "idle_timeout_secs": 30,
-        "max_connection_lifetime_secs": 120
-      },
-      "connection_pool": {
-        "max_idle_per_host": 10,
-        "pool_timeout_secs": 120,
-        "connection_pool_enabled": true
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:3000",
+  "logging": {
+    "level": "debug",
+    "format": "text",
+    "targets": [
+      {
+        "type": "stdout",
+        "level": "info"
       }
-    },
-    "reverse_proxy": {
-      "enabled": true,
-      "listen_addr": "0.0.0.0:443",
-      "target": "https://internal.service:8443",
-      "max_connections": 1000,
-      "resource_limits": {
-        "max_memory_mb": 512,
-        "max_cpu_percent": 60.0,
-        "connection_timeout_secs": 3,
-        "idle_timeout_secs": 45,
-        "max_connection_lifetime_secs": 300
-      },
-      "connection_pool": {
-        "max_idle_per_host": 25,
-        "pool_timeout_secs": 300,
-        "connection_pool_enabled": true
-      }
-    }
+    ]
   },
-  "private_key": "/etc/ssl/private/proxy.key",
-  "certificate": "/etc/ssl/certs/proxy.crt"
-}
-```
-
-### Example 7: Development Environment with Worker Separation
-
-This example shows a development setup with relaxed limits for debugging and testing:
-
-```json
-{
-  "mode": "Combined",
-  "worker_separation": {
-    "forward_proxy": {
-      "enabled": true,
-      "listen_addr": "127.0.0.1:3128",
-      "max_connections": 100,
-      "resource_limits": {
-        "max_memory_mb": 128,
-        "max_cpu_percent": 80.0,
-        "connection_timeout_secs": 30,
-        "idle_timeout_secs": 300,
-        "max_connection_lifetime_secs": 3600
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/",
+        "root_dir": "./dist",
+        "spa_mode": true
       }
-    },
-    "reverse_proxy": {
-      "enabled": true,
-      "listen_addr": "127.0.0.1:8080",
-      "target": "http://localhost:3000",
-      "max_connections": 200,
-      "resource_limits": {
-        "max_memory_mb": 256,
-        "max_cpu_percent": 80.0,
-        "connection_timeout_secs": 15,
-        "idle_timeout_secs": 300,
-        "max_connection_lifetime_secs": 3600
-      },
-      "static_files": {
-        "mounts": [
-          {
-            "path": "/",
-            "root_dir": "./dist",
-            "spa_mode": true,
-            "enable_directory_listing": false
-          }
-        ]
-      }
-    }
+    ]
   }
 }
 ```
 
 ---
 
-**Last Updated:** 2025-11-17
-**See Also:** [Worker Separation Architecture](./worker-separation-architecture.md), [Examples](./examples.md), [CLI Reference](./cli-reference.md)
+**Last Updated:** 2025-11-21
+**See Also:** [Examples](../examples/), [CLI Reference](../README.md)

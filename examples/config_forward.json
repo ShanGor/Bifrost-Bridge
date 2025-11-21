@@ -4,7 +4,7 @@
   "max_connections": 10000,
   "connect_timeout_secs": 10,
   "connection_pool_enabled": true,
-  "pool-max-idle":  20,
+  "pool_max_idle_per_host": 20,
   "idle_timeout_secs": 90,
   "max_connection_lifetime_secs": 300
 }

@@ -222,8 +222,8 @@ curl -I http://127.0.0.1:8080/
 ## 📚 Next Steps
 
 - Read the [Configuration Guide](./configuration.md) for advanced options
-- Check [Examples](./examples.md) for more scenarios
-- Review [Architecture](./architecture.md) for understanding internals
+- Check [Configuration Examples](../examples/) for more scenarios
+- Review [Error Recovery Architecture](./error-recovery-architecture.md) for understanding internals
 - See [Development Guide](./development.md) for contributing
 
 ---

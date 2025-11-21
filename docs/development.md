@@ -361,7 +361,7 @@ tar -czf proxy-server-v0.2.0-linux-x64.tar.gz target/release/proxy-server
    ```bash
    # Update relevant docs
    edit docs/configuration.md
-   edit docs/examples.md
+   # Add new examples to examples/ directory
    ```
 
 3. **Update Examples**

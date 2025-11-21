@@ -31,9 +31,9 @@ echo "RXXX: New feature description" >> ../requirements/README.md
 
 # 2. Update relevant documentation
 edit configuration.md    # If config changes
-edit examples.md        # Add new examples
+# Add new examples to ../examples/ directory
 edit quick-start.md     # Update quick start
-edit api.md             # If API changes
+# Add API changes to configuration.md if relevant
 ```
 
 #### [ ] Configuration Changes
@@ -128,7 +128,7 @@ CHANGED_FILES=$(git diff --cached --name-only)
 if echo "$CHANGED_FILES" | grep -q "src/"; then
     echo "📝 Source code changes detected. Please ensure documentation is updated:"
     echo "  - [ ] docs/configuration.md if config changed"
-    echo "  - [ ] docs/examples.md if new examples needed"
+    echo "  - [ ] Add new examples to examples/ directory if needed"
     echo "  - [ ] CHANGELOG.md for version tracking"
     echo "  - [ ] requirements/README.md for requirements log"
 

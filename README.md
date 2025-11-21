@@ -3,22 +3,15 @@ A high-performance proxy server written in Rust that can function as both a forw
 
 ## Features
 
-- **Worker Separation Architecture**: Isolated workers for forward vs reverse proxy with separate resources, connection pools, and metrics
-- **Advanced Error Recovery**: Circuit breaker pattern, worker isolation, and automatic retry with exponential backoff
-- **Contextual Error Handling**: Rich error context with severity classification and recovery suggestions
-- **Forward Proxy**: Acts as a forward proxy similar to Squid
-- **Reverse Proxy**: Acts as a reverse proxy similar to Nginx
-- **Multiple Static Roots**: Serve static files from multiple directories at different URL paths
-- **High Performance**: Built on Tokio and Hyper for async I/O with configurable worker threads
-- **Configurable**: Supports both command-line arguments and configuration files
-- **Connection Pooling**: Efficient connection reuse with configurable pool settings per proxy type
-- **Granular Timeout Control**: Three distinct timeout types (connect, idle, lifetime)
-- **SPA Support**: Single Page Application fallback with proper MIME type handling
-- **Optimized Static File Serving**: Uses Tokio worker threads for CPU-intensive operations (directory listings, MIME type detection)
-- **Resource Isolation**: Independent resource limits and controls for each proxy type
-- **Isolated Metrics**: Separate performance monitoring and debugging per proxy type
-- **Graceful Shutdown**: Clean shutdown with Ctrl+C handling
-- **Logging**: Comprehensive logging with env_logger
+- **Forward proxy mode** with HTTP/HTTPS CONNECT support, relay proxies, auth, and connection pooling
+- **Reverse proxy mode** with connection pooling, configurable headers, and optional backend health checks
+- **Static file server** with SPA fallback, multiple mount points, custom MIME types, and TLS support
+- **Combined reverse proxy + static handler** so static routes and backend routes share a single listener
+- **Tokio-based runtime** with configurable worker thread count for reverse proxy + static workloads
+- **Granular timeout and limit controls** (connect/idle/lifetime timeouts, header size, connection caps)
+- **Rate limiting & monitoring hooks** via the built-in rate limiter and optional Prometheus endpoint
+- **CLI and JSON configuration** plus sample config generator and logging customization
+- **Graceful shutdown & logging** with Ctrl+C handling and env_logger/CustomLogger backends
 
 ## Installation
 
@@ -460,53 +453,32 @@ The server uses **Tokio worker threads** for CPU-intensive static file operation
 
 ## Architecture
 
-### 🏗️ Worker Separation Architecture
+### Overview
 
-Bifrost Bridge implements a **hybrid worker separation architecture** that provides both security isolation and operational efficiency. This design ensures that forward proxy and reverse proxy operations run in completely isolated environments while sharing a common tokio runtime for efficiency.
+Bifrost Bridge runs a single multi-threaded Tokio runtime per process. At startup the CLI/config data
+is converted into a `Config`, then `ProxyFactory` instantiates the one adapter that matches that mode:
 
-#### Architecture Overview
+- **Forward proxy** – `ForwardProxyAdapter` binds a listener and drives `ForwardProxy`.
+- **Reverse proxy** – `ReverseProxyAdapter` binds a listener and drives `ReverseProxy`.
+- **Static-only** – `StaticFileProxyAdapter` serves mount points and SPA fallbacks.
+- **Combined reverse + static** – `CombinedProxyAdapter` routes requests between the reverse proxy
+  and the `StaticFileHandler` so both share the same port.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Shared Tokio Runtime                      │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
-│  │ Forward Proxy   │  │ Reverse Proxy   │  │ Static Files │ │
-│  │   Worker        │  │    Worker       │  │   Worker     │ │
-│  │                 │  │                 │  │              │ │
-│  │ • Isolated      │  │ • Isolated      │  │ • Isolated   │ │
-│  │ • Dedicated     │  │ • Dedicated     │  │ • Dedicated  │ │
-│  │ • Resources     │  │ • Resources     │  │ • Resources  │ │
-│  │ • Metrics       │  │ • Metrics       │  │ • Metrics    │ │
-│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
-│         │                   │                   │           │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
-│  │ Connection      │  │ Connection      │  │ File         │ │
-│  │ Pool Manager    │  │ Pool Manager    │  │ System       │ │
-│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│           Tokio Runtime                                        │
+├────────────────────────────────────────────────────────────────┤
+│ ProxyFactory                                                   │
+│   ├ ForwardProxyAdapter  ─▶ ForwardProxy                       │
+│   ├ ReverseProxyAdapter  ─▶ ReverseProxy                       │
+│   ├ StaticFileProxyAdapter ─▶ StaticFileHandler                │
+│   └ CombinedProxyAdapter ─▶ ReverseProxy + StaticFileHandler   │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-#### Key Benefits
-
-**🔒 Security & Isolation**
-- Separate worker processes for forward vs reverse proxy
-- Independent resource limits and controls
-- Isolated metrics collection per proxy type
-- Prevents resource contention between proxy types
-
-**⚡ Performance & Efficiency**
-- Shared tokio runtime for optimal resource utilization
-- Dedicated connection pools optimized for traffic patterns
-- Proxy-specific configuration tuning
-- Zero resource sharing between workers
-
-**🔧 Operational Excellence**
-- Independent monitoring and debugging per proxy type
-- Granular resource control and limits
-- Type-specific connection pooling strategies
-- Configurable worker isolation levels
+All adapters share the same runtime, connection limits, and logging pipeline. Reverse proxy mode can
+optionally embed the static handler; forward proxy mode cannot. Monitoring/rate limiting hooks are
+enabled per adapter when configuration requests them.
 
 ### Project Structure
 
@@ -525,31 +497,18 @@ src/
 
 ### Core Architecture Components
 
-#### Worker Separation Layer
-- **`ProxyType`**: Enumeration for ForwardProxy, ReverseProxy, StaticFiles, Combined modes
-- **`IsolatedWorker`**: Dedicated worker with isolated resources, metrics, and configuration
-- **`WorkerResourceLimits`**: Per-worker resource controls (connections, memory, CPU)
-- **`WorkerConfiguration`**: Proxy-specific settings and optimization parameters
+#### Proxy Layer
+- **`ProxyFactory`**: Reads the `Config` and constructs the adapter for forward, reverse, static, or combined mode.
+- **`ForwardProxy`**: Handles HTTP/HTTPS proxying with optional relay proxies, authentication, and connection pooling.
+- **`ReverseProxy`**: Proxies to a single backend with pooling, optional health checks, and rate limiting hooks.
+- **`StaticFileHandler`** / **`StaticFileProxyAdapter`**: Serves mounted directories, SPA fallbacks, and TLS/static HTTP modes.
+- **`CombinedProxyAdapter`**: Shares one listener while routing static paths to the handler and everything else to the reverse proxy.
 
-#### Resource Management
-- **`ConnectionPoolManager`**: Type-specific connection pooling with independent settings
-- **`PerformanceMetrics`**: Isolated metrics collection per proxy type
-- **`WorkerManager`**: Coordinates isolated workers within shared runtime
-
-#### Proxy Adapters
-- **`IsolatedProxyAdapter`**: New adapter using worker-separated architecture
-- **`SharedServer` trait**: Enhanced trait supporting proxy type separation
-- **Traditional adapters**: Backward compatibility with existing implementations
-
-### Key Components
-
-1. **ProxyFactory**: Creates appropriate proxy instances with worker isolation
-2. **IsolatedWorker**: Dedicated worker resources for each proxy type
-3. **ForwardProxy**: Forward proxy with isolated worker and connection pool
-4. **ReverseProxy**: Reverse proxy with isolated worker and connection pool
-5. **StaticFileHandler**: Static file serving with dedicated worker and thread pool
-6. **ConnectionPoolManager**: Type-specific connection pooling strategies
-7. **PerformanceMetrics**: Isolated monitoring per proxy type
+#### Resource & Connection Management
+- **Connection pooling**: Forward proxy can enable/disable pooling per CLI option; reverse proxy exposes per-host pool sizing and idle timeouts.
+- **Rate limiting**: Shared `RateLimiter` enforces per-adapter rules when configured.
+- **Monitoring**: `MonitoringServer` can export Prometheus metrics; adapters pass metrics handles to reverse/static handlers when monitoring is enabled.
+- **Tokio runtime threads**: `worker_threads` controls the number of runtime worker threads for reverse/static workloads (forward mode uses the default runtime).
 
 ## Performance Considerations
 
@@ -564,42 +523,27 @@ src/
 
 ## Error Handling & Recovery
 
-The proxy includes sophisticated error handling and recovery mechanisms:
+The running server relies on explicit timeouts, status-code mapping, and logging to surface problems.
+Most failures are reported back to the client (e.g., `502 Bad Gateway` from the reverse proxy or
+`429 Too Many Requests` from the rate limiter) and always logged with context.
 
-### Error Classification System
-- **Severity Levels**: Low, Medium, High, Critical error classification
-- **Contextual Errors**: Rich error context with worker ID, operation, metadata
-- **Recovery Actions**: Automatic suggestions for error recovery strategies
-- **Error History**: Comprehensive error tracking and statistics
+### Built-in Safeguards
+- **Configuration validation** rejects invalid listen addresses, missing reverse targets, or
+  unsupported flag combinations before the runtime starts.
+- **Timeout enforcement** (`connect`, `idle`, `max_connection_lifetime`) ensures both proxy modes
+  tear down unhealthy connections automatically.
+- **Reverse proxy resilience**: Backend errors propagate as HTTP errors while the proxy keeps its
+  listener alive; optional health checks monitor the backend.
+- **Static handler responses**: Unsupported methods return 405, missing files return 404, and SPA
+  fallbacks keep SPAs functional without custom error logic.
+- **Rate limiting**: When enabled, the shared rate limiter responds with `429` and optional
+  `Retry-After` headers so abusive clients back off.
 
-### Circuit Breaker Pattern
-- **Cascade Failure Prevention**: Automatic circuit breaking to prevent system overload
-- **Configurable Thresholds**: Customizable failure/success thresholds and timeouts
-- **State Management**: Closed → Open → HalfOpen → Closed state transitions
-- **Timeout Recovery**: Automatic recovery attempts after configurable timeouts
-
-### Worker Health Monitoring
-- **Health Checks**: Continuous worker health monitoring with periodic checks
-- **Automatic Recovery**: Worker restart and recovery mechanisms
-- **Isolation**: Automatic worker isolation for problematic instances
-- **Resource Limits**: Enforcement of resource limits to prevent resource exhaustion
-
-### Retry Mechanisms
-- **Exponential Backoff**: Intelligent retry with exponential backoff delays
-- **Max Retry Limits**: Configurable maximum retry attempts per operation
-- **Circuit Breaker Integration**: Retry attempts coordinated with circuit breaker state
-
-### Graceful Degradation
-- **System Resilience**: Continued operation under error load conditions
-- **Resource Contention**: Handling of resource conflicts and contention
-- **Performance Monitoring**: Real-time performance metrics and error statistics
-
-### Traditional Error Handling
-- Connection errors with connect timeout
-- HTTP parsing errors
-- Configuration errors
-- Timeout errors (connect, idle, lifetime)
-- Forward error responses to clients
+### Operational Visibility
+- **Structured logging**: env_logger or the custom logging backend captures request outcomes and
+  startup/shutdown events.
+- **Monitoring server**: When enabled in config, Prometheus metrics expose connection counts,
+  request timing, and rate-limiter events for the reverse/static adapters.
 
 ## Logging
 
@@ -664,10 +608,14 @@ Potential improvements for production use:
 
 ## Documentation
 
-- **[Worker Separation Architecture](docs/worker-separation-architecture.md)** - Detailed architecture documentation
-- **[Configuration Guide](docs/configuration.md)** - Comprehensive configuration options
+- **[Configuration Guide](docs/configuration.md)** - Comprehensive configuration options (CLI and JSON)
+- **[Quick Start Guide](docs/quick-start.md)** - Get started quickly with examples
 - **[Installation Guide](docs/installation.md)** - Setup and installation instructions
+- **[HTTPS Setup Guide](docs/https-setup.md)** - SSL/TLS configuration
+- **[Error Recovery Architecture](docs/error-recovery-architecture.md)** - Error handling and recovery mechanisms
+- **[Development Guide](docs/development.md)** - Development setup and guidelines
 - **[Requirements](requirements/)** - Detailed requirements and implementation status
+- **[Configuration Examples](examples/)** - Ready-to-use configuration file examples
 
 ## Requirements
 

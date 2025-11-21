@@ -2,8 +2,8 @@
 
 ## Functional Test for Relay Proxy
 ```bash
-./target/release/bifrost-bridge --config ./examples/test-config_forward_relay_2.json &
 ./target/release/bifrost-bridge --config ./examples/test-config_forward_relay_1.json &
+./target/release/bifrost-bridge --config ./examples/test-config_forward_relay_2.json &
 
 curl -i --proxy http://127.0.0.1:3128 http://google.com
 curl -i --proxy http://127.0.0.1:3128 https://google.com

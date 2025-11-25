@@ -495,7 +495,13 @@ impl ForwardProxy {
         let target_stream = match target_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to connect to target: {}", e);
+                error!(
+                    "Failed to connect to target {} for client {} (request '{}'): {}",
+                    target_desc,
+                    remote_addr,
+                    request_line.trim(),
+                    e
+                );
                 let error_response = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
                 stream.write_all(error_response.as_bytes()).await?;
                 return Err(e);

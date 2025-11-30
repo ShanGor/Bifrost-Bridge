@@ -70,7 +70,7 @@ impl ForwardProxy {
             idle_timeout_secs,
             true,
         );
-        
+
         Self {
             connection_pool_enabled: true,
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
@@ -102,7 +102,7 @@ impl ForwardProxy {
             idle_timeout_secs,
             connection_pool_enabled,
         );
-        
+
         Self {
             connection_pool_enabled,
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
@@ -247,9 +247,9 @@ impl ForwardProxy {
         connector.set_connect_timeout(Some(Duration::from_secs(connect_timeout_secs)));
         connector.set_keepalive(Some(Duration::from_secs(idle_timeout_secs)));
         connector.set_nodelay(true); // Disable Nagle's algorithm for better latency
-        
+
         let mut builder = Client::builder(TokioExecutor::new());
-        
+
         if pool_enabled {
             // Enable connection reuse with automatic timeout-based cleanup
             // idle_timeout controls when idle connections are closed
@@ -264,7 +264,7 @@ impl ForwardProxy {
             info!("Forward proxy: no-pool mode (new connection per request)");
             builder.pool_max_idle_per_host(0); // Only disable when explicitly requested
         }
-        
+
         builder
             .http2_only(false)
             .build(connector)
@@ -406,7 +406,7 @@ impl ForwardProxy {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let mut reader = BufReader::new(stream);
-        
+
         // Read the CONNECT request line
         let mut request_line = String::new();
         reader.read_line(&mut request_line).await?;
@@ -441,7 +441,7 @@ impl ForwardProxy {
                 break;
             }
         }
-        
+
         // Get the underlying stream back
         let mut stream = reader.into_inner();
 
@@ -508,7 +508,7 @@ impl ForwardProxy {
             }
         };
 
-        info!("Successfully connected to target, setting up tunnel");
+        debug!("Successfully connected to target, setting up tunnel");
 
         // Send 200 OK to client
         let ok_response = "HTTP/1.1 200 Connection established\r\nProxy-agent: Rust-Proxy/1.0\r\n\r\n";
@@ -783,21 +783,21 @@ impl ForwardProxy {
         let host = authority.host().to_string();
         let port = authority.port_u16().unwrap_or(443);
 
-        info!("Handling CONNECT request to {}:{}", host, port);
+        debug!("Handling CONNECT request to {}:{}", host, port);
 
         let relay_proxy = self.find_relay_proxy_for_domain(&host);
         let max_lifetime = self.max_connection_lifetime;
 
         if let Some(relay) = &relay_proxy {
-            info!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
+            debug!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
         } else {
-            info!("Direct connection to {}:{}", host, port);
+            debug!("Direct connection to {}:{}", host, port);
         }
 
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
-                    info!("Successfully upgraded connection for {}:{}", host, port);
+                    debug!("Successfully upgraded connection for {}:{}", host, port);
 
                     let upgraded_io = TokioIo::new(upgraded);
 
@@ -824,21 +824,21 @@ impl ForwardProxy {
                         }
                     };
 
-                    info!("Successfully connected to target {}:{}", host, port);
+                    debug!("Successfully connected to target {}:{}", host, port);
 
                     let (mut client_read, mut client_write) = tokio::io::split(upgraded_io);
                     let (mut target_read, mut target_write) = target_stream.into_split();
 
                     let client_to_target = async {
                         match tokio::io::copy(&mut client_read, &mut target_write).await {
-                            Ok(bytes) => info!("Client -> Target: {} bytes for {}:{}", bytes, host, port),
+                            Ok(bytes) => debug!("Client -> Target: {} bytes for {}:{}", bytes, host, port),
                             Err(e) => error!("Error in client->target tunnel for {}:{}: {}", host, port, e),
                         }
                     };
 
                     let target_to_client = async {
                         match tokio::io::copy(&mut target_read, &mut client_write).await {
-                            Ok(bytes) => info!("Target -> Client: {} bytes for {}:{}", bytes, host, port),
+                            Ok(bytes) => debug!("Target -> Client: {} bytes for {}:{}", bytes, host, port),
                             Err(e) => error!("Error in target->client tunnel for {}:{}: {}", host, port, e),
                         }
                     };
@@ -849,10 +849,10 @@ impl ForwardProxy {
 
                     match tokio::time::timeout(max_lifetime, tunnel_future).await {
                         Ok(_) => {
-                            info!("TCP tunnel closed normally for {}:{}", host, port);
+                            debug!("TCP tunnel closed normally for {}:{}", host, port);
                         }
                         Err(_) => {
-                            info!(
+                            debug!(
                                 "TCP tunnel max lifetime ({:?}) reached for {}:{}, closing connection",
                                 max_lifetime, host, port
                             );
@@ -906,7 +906,7 @@ impl ForwardProxy {
                         }
                     };
                     if timeout(tunnel_timeout, tunnel).await.is_err() {
-                        info!("WebSocket tunnel timeout reached for {}", target_desc);
+                        debug!("WebSocket tunnel timeout reached for {}", target_desc);
                     }
                 }
                 (Err(e), _) => error!("Client WebSocket upgrade failed: {}", e),
@@ -986,7 +986,7 @@ impl ForwardProxy {
                         }
                     };
                     if timeout(tunnel_timeout, tunnel).await.is_err() {
-                        info!("WebSocket relay tunnel timeout reached for {}", target_desc);
+                        debug!("WebSocket relay tunnel timeout reached for {}", target_desc);
                     }
                 }
                 Err(e) => error!("Client WebSocket upgrade failed: {}", e),
@@ -1155,7 +1155,7 @@ impl ForwardProxy {
         target_desc: String,
         max_lifetime: Duration,
     ) -> Result<(), std::io::Error> {
-        info!(
+        debug!(
             "Setting up bidirectional tunnel between {} and {} (max_lifetime: {:?})",
             client_addr, target_desc, max_lifetime
         );
@@ -1169,11 +1169,11 @@ impl ForwardProxy {
 
         match tokio::time::timeout(max_lifetime, tunnel_future).await {
             Ok(result) => {
-                info!("Tunnel closed normally between {} and {}", client_addr, target_desc);
+                debug!("Tunnel closed normally between {} and {}", client_addr, target_desc);
                 result
             }
             Err(_) => {
-                info!(
+                debug!(
                     "Tunnel max lifetime reached ({:?}), closing connection between {} and {}",
                     max_lifetime, client_addr, target_desc
                 );
@@ -1188,7 +1188,7 @@ impl ForwardProxy {
         client_addr: SocketAddr,
         target_desc: String,
     ) -> Result<(), std::io::Error> {
-        info!(
+        debug!(
             "Setting up bidirectional tunnel between {} and {}",
             client_addr, target_desc
         );
@@ -1214,7 +1214,7 @@ impl ForwardProxy {
 
         let _ = tokio::join!(c2t, t2c);
 
-        info!("Tunnel closed between {} and {}", client_addr, target_desc);
+        debug!("Tunnel closed between {} and {}", client_addr, target_desc);
         Ok(())
     }
 
@@ -1509,21 +1509,21 @@ mod tests {
     fn test_no_proxy_pattern_matching() {
         // Test exact domain match
         assert!(ForwardProxy::matches_no_proxy_pattern("example.com", &["example.com".to_string()]));
-        
+
         // Test subdomain match with plain domain
         assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &["example.com".to_string()]));
-        
+
         // Test wildcard pattern
         assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &["*.example.com".to_string()]));
         assert!(!ForwardProxy::matches_no_proxy_pattern("example.com", &["*.example.com".to_string()]));
-        
+
         // Test dot prefix pattern
         assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &[".example.com".to_string()]));
         assert!(!ForwardProxy::matches_no_proxy_pattern("example.com", &[".example.com".to_string()]));
-        
+
         // Test no match
         assert!(!ForwardProxy::matches_no_proxy_pattern("other.com", &["example.com".to_string()]));
-        
+
         // Test case insensitivity
         assert!(ForwardProxy::matches_no_proxy_pattern("EXAMPLE.COM", &["example.com".to_string()]));
     }

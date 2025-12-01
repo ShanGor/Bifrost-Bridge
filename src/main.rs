@@ -1,9 +1,17 @@
 use clap::Parser;
 use log::{info, error};
-use bifrost_bridge::{config::{Config, ProxyMode}, proxy::ProxyFactory, logging};
+use bifrost_bridge::{
+    config::{Config, ProxyMode},
+    logging,
+    proxy::ProxyFactory,
+    secrets::{config_has_encrypted_values, SecretManager},
+};
 use std::path::Path;
 use tokio::signal;
 use tokio::sync::oneshot;
+use std::io::Read;
+
+const ENCRYPT_STDIN_PLACEHOLDER: &str = "__BIFROST_STDIN__";
 
 #[derive(Parser)]
 #[clap(
@@ -83,6 +91,18 @@ struct Args {
 
     #[clap(long, value_name = "FORMAT", help = "Set log output format (text, json)")]
     log_format: Option<String>,
+
+    #[clap(long, help = "Initialize the ~/.bifrost encryption key and exit")]
+    init_encryption_key: bool,
+
+    #[clap(
+        long,
+        value_name = "PAYLOAD",
+        num_args = 0..=1,
+        default_missing_value = ENCRYPT_STDIN_PLACEHOLDER,
+        help = "Encrypt a secret payload; omit PAYLOAD to read from stdin"
+    )]
+    encrypt: Option<String>,
 }
 
 fn init_logging_from_config(config: &Config, args: Option<&Args>) -> Result<(), Box<dyn std::error::Error>> {
@@ -125,6 +145,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_logging_from_args(&args)?;
     }
 
+    if args.init_encryption_key && args.encrypt.is_some() {
+        return Err("Cannot use --init-encryption-key and --encrypt simultaneously".into());
+    }
+
+    if args.init_encryption_key {
+        let manager = SecretManager::new()?;
+        manager.init_encryption_key(false)?;
+        return Ok(());
+    }
+
+    if let Some(payload_spec) = &args.encrypt {
+        let manager = SecretManager::new()?;
+        let payload = if payload_spec == ENCRYPT_STDIN_PLACEHOLDER {
+            read_secret_from_stdin()?
+        } else {
+            payload_spec.clone().into_bytes()
+        };
+        if payload.is_empty() {
+            return Err("Secret payload cannot be empty".into());
+        }
+        let token = manager.encrypt_payload(&payload)?;
+        println!("{}", token);
+        return Ok(());
+    }
+
     // Handle generate-config flag
     if let Some(config_file) = args.generate_config {
         generate_sample_config(&config_file)?;
@@ -133,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load configuration
-    let config = if let Some(config_file) = &args.config {
+    let mut config = if let Some(config_file) = &args.config {
         if !Path::new(config_file).exists() {
             return Err(format!("Configuration file not found: {}", config_file).into());
         }
@@ -141,6 +186,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         create_config_from_args(&args)?
     };
+
+    if config_has_encrypted_values(&config) {
+        let manager = SecretManager::new()?;
+        manager.apply_to_config(&mut config)?;
+    }
 
     // Validate configuration
     validate_config(&config)?;
@@ -199,6 +249,18 @@ async fn async_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("👋 Proxy server stopped. Goodbye!");
     Ok(())
+}
+
+fn read_secret_from_stdin() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    std::io::stdin().read_to_end(&mut buffer)?;
+    while matches!(buffer.last(), Some(b) if *b == b'\n' || *b == b'\r') {
+        buffer.pop();
+    }
+    if buffer.is_empty() {
+        return Err("Secret payload cannot be empty".into());
+    }
+    Ok(buffer)
 }
 
 fn generate_sample_config(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {

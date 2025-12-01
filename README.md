@@ -12,6 +12,7 @@ A high-performance proxy server written in Rust that can function as both a forw
 - **Rate limiting & monitoring hooks** via the built-in rate limiter and optional Prometheus endpoint
 - **CLI and JSON configuration** plus sample config generator and logging customization
 - **Graceful shutdown & logging** with Ctrl+C handling and env_logger/CustomLogger backends
+- **Encrypted configuration secrets** with AES-256 `{encrypted}` payloads backed by a masked key on disk
 
 ## Installation
 
@@ -73,7 +74,43 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 \
   --mount "/admin:/path/to/admin-panel" \
   --mount "/docs:/path/to/documentation" \
   --worker-threads 6
+
+# Initialize the local encryption key (writes to ~/.bifrost)
+cargo run -- --init-encryption-key
+
+# Encrypt a secret (reads from stdin when value omitted)
+echo "relay-secret" | cargo run -- --encrypt
 ```
+
+### Secret Encryption Workflow
+
+1. **Initialize Key Material**  
+   Run `cargo run -- --init-encryption-key` once per machine. This creates `~/.bifrost/master_key.*` files with a masked AES-256 key (3 fragments + XOR mask) and enforces `0700` permissions.
+
+2. **Encrypt Secrets**  
+   Use `cargo run -- --encrypt <payload>` to encrypt short secrets. When `<payload>` is omitted the CLI reads from stdin, so you can pipe secrets from external tools:
+   ```bash
+   $ echo "relayPassword!" | cargo run -- --encrypt
+   {encrypted}QmFzZTY0Tm9uY2VDb2RlCg==
+   ```
+   Copy the full `{encrypted}...` token.
+
+3. **Reference in Config**  
+   Place the token anywhere a secret is expected in `config.json`, for example:
+   ```json
+   {
+     "relay_proxies": [{
+       "relay_proxy_url": "https://relay.internal:8443",
+       "relay_proxy_username": "service",
+       "relay_proxy_password": "{encrypted}QmFzZTY0Tm9uY2VDb2RlCg=="
+     }]
+   }
+   ```
+
+4. **Automatic Decryption**  
+   When the proxy boots it scans configuration fields for the `{encrypted}` prefix, reconstructs the AES key from `~/.bifrost`, decrypts secrets before use, and emits Prometheus counters plus logs for observability.
+
+> **Tip:** Set the `BIFROST_SECRET_HOME` environment variable to override the default `~/.bifrost` directory—handy during testing.
 
 ### Multiple Static Roots
 

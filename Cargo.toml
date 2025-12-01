@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-bridge"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 
 [dependencies]
@@ -33,6 +33,10 @@ mime_guess = "2.0.5"
 flate2 = "1.0"
 num_cpus = "1.0"
 prometheus = "0.13"
+aes-gcm = "0.10"
+rand = "0.8"
+dirs = "5.0"
+zeroize = "1.8"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

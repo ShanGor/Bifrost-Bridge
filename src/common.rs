@@ -1,4 +1,5 @@
 use crate::error::ProxyError;
+use crate::secrets::register_secret_metrics;
 use hyper::{Response, StatusCode, body::{Body, Frame}};
 use hyper::body::Bytes;
 use http_body_util::Full;
@@ -433,6 +434,7 @@ impl MonitoringRegistry {
         registry.register(Box::new(connection_errors_total.clone())).expect("register connection_errors_total");
         registry.register(Box::new(average_response_time_ms.clone())).expect("register average_response_time_ms");
         registry.register(Box::new(request_duration_seconds.clone())).expect("register request_duration_seconds");
+        register_secret_metrics(&registry);
 
         Self {
             registry,

@@ -28,6 +28,7 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R018](R018-rate-limiting.md) | Rate Limiting | Configurable per-IP throttling with tiered rules | 2025-11-19 |
 | [R021](R021-tokio-worker-threads.md) | Tokio Worker Threads for Static Files | Implement Tokio-based threading for CPU-intensive static file operations | 2025-11-16 |
 | [R022](R022-advanced-cache-control.md) | Advanced Cache Control Configuration | Add flexible cache control with no_cache_files patterns and configurable cache duration | 2025-01-17 |
+| [R024](R024-secret-encryption.md) | Encrypted Secret Management | Add key generation + encrypted secrets workflow for configurations | 2025-02-14 |
 
 ### 📝 **Pending Requirements**
 
@@ -66,7 +67,9 @@ requirements/
 ├── R019-health-check-endpoint.md      # Pending requirement
 ├── R020-documentation-maintenance.md  # Pending requirement
 ├── R021-tokio-worker-threads.md       # Detailed requirement
-└── R022-advanced-cache-control.md      # Detailed requirement
+├── R022-advanced-cache-control.md      # Detailed requirement
+├── R023-connection-pooling-optimization.md # Detailed requirement
+└── R024-secret-encryption.md           # Detailed requirement
 ```
 
 ## 📚 How to Use This Documentation
@@ -85,6 +88,6 @@ requirements/
 
 ---
 
-**Last Updated:** 2025-01-17
+**Last Updated:** 2025-02-14
 **Maintainer:** Development Team
-**Total Requirements:** 23 (18 Completed, 5 Pending)
+**Total Requirements:** 24 (19 Completed, 5 Pending)

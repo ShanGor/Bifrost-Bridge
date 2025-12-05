@@ -1,0 +1,21 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8088",
+  "max_connections": 10000,
+  "worker_threads": 8,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/",
+        "root_dir": "D:\\sources"
+      }
+    ],
+    "enable_directory_listing": true,
+    "index_files": ["index.html", "index.htm"],
+    "spa_mode": false,
+    "spa_fallback_file": "index.html"
+  }
+}

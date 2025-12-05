@@ -49,7 +49,7 @@ const HTML_DIR_LISTING_FOOTER: &str = r#"    </ul>
 const HTML_DIR_PARENT_LINK: &str = r#"        <li><a href="../">📁 ../</a></li>"#;
 
 /// Template for directory entry in directory listing
-const HTML_DIR_ENTRY_TEMPLATE: &str = r#"        <li class="{class}"><a href="{href}">{icon}</a></li>"#;
+const HTML_DIR_ENTRY_TEMPLATE: &str = r#"        <li class="{class}"><a href="{href}">{icon} {file_name}</a></li>"#;
 
 /// Helper function to detect if a file is an index file based on configuration
 fn is_index_file(path: &Path, index_files: &[String]) -> bool {
@@ -286,8 +286,9 @@ impl StaticFileHandler {
                 let entry_html = HTML_DIR_ENTRY_TEMPLATE
                     .replace("{class}", class)
                     .replace("{href}", &href)
-                    .replace("{icon}", icon);
-                
+                    .replace("{icon}", icon)
+                    .replace("{file_name}", &file_name_str);
+
                 html.push_str(&entry_html);
                 html.push('\n');
             }
@@ -319,7 +320,7 @@ impl StaticFileHandler {
             .map_err(|e| ProxyError::Http(e.to_string()))?)
     }
 
-    
+
     // resolve_file_path is replaced by resolve_file_path_in_mount for multi-mount support
 
     /// Handle file with optional mount information for SPA-aware caching
@@ -396,7 +397,7 @@ impl StaticFileHandler {
 
     // handle_spa_fallback is replaced by handle_spa_fallback_in_mount for multi-mount support
 
-    
+
     /// Generates a 404 Not Found response
     fn not_found_response(&self) -> Response<FileBody> {
         Response::builder()
@@ -409,7 +410,7 @@ impl StaticFileHandler {
     fn is_asset_file(&self, path: &str) -> bool {
         // Check if the path has an asset file extension
         if let Some(extension) = Path::new(path).extension().and_then(|ext| ext.to_str()) {
-            matches!(extension.to_lowercase().as_str(), 
+            matches!(extension.to_lowercase().as_str(),
                 "js" | "css" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" |
                 "woff" | "woff2" | "ttf" | "eot" | "pdf" | "zip" | "json" | "xml" |
                 "mp4" | "webm" | "mp3" | "wav")
@@ -434,7 +435,7 @@ impl StaticFileHandler {
 
         // Add charset for text-based MIME types
         let mime_str = mime.as_ref();
-        if mime_str.starts_with("text/") || 
+        if mime_str.starts_with("text/") ||
            mime_str == "application/json" ||
            mime_str == "application/xml" {
             format!("{}; charset=utf-8", mime_str)
@@ -459,7 +460,7 @@ mod tests {
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.js"), &custom_mime_types), "text/javascript; charset=utf-8");
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.png"), &custom_mime_types), "image/png");
         assert_eq!(StaticFileHandler::guess_mime_type_static(&PathBuf::from("test.unknown"), &custom_mime_types), "application/octet-stream");
-        
+
         // Test custom MIME type override
         let mut custom_mime_types = std::collections::HashMap::new();
         custom_mime_types.insert("custom".to_string(), "application/x-custom".to_string());

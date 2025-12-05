@@ -10,7 +10,7 @@
     {
       "relay_proxy_url": "http://127.0.0.1:3129",
       "relay_proxy_username": "admin",
-      "relay_proxy_password": "secret123",
+      "relay_proxy_password": "{encrypted}biju9SRMl6RBy5Ys59vvi2Vb8wqz0945vpLJQD6F1fWXUX0JRaRR",
       "relay_proxy_domains": [
         "google.com",
         ".google.com",
@@ -20,7 +20,7 @@
     {
       "relay_proxy_url": "http://127.0.0.1:3129",
       "relay_proxy_username": "admin",
-      "relay_proxy_password": "secret123",
+      "relay_proxy_password": "hello-world",
       "relay_proxy_domains": [
         "baidu.com"
       ]

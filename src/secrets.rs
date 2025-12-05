@@ -6,7 +6,9 @@ use prometheus::{IntCounter, Opts, Registry};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::{atomic::{AtomicBool, Ordering}, OnceLock};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -304,15 +306,13 @@ impl SecretManager {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn enforce_permissions(&self, path: &Path) -> Result<(), SecretError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = fs::metadata(path)?;
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(SecretError::InsecurePermissions);
-            }
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(SecretError::InsecurePermissions);
         }
         Ok(())
     }

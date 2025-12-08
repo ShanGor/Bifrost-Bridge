@@ -1,30 +1,38 @@
-use crate::common::{ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, is_websocket_upgrade};
+use crate::common::{
+    ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, is_websocket_upgrade,
+};
+use crate::config::{
+    HealthCheckConfig, ReverseProxyConfig, ReverseProxyRouteConfig, RoutePredicateConfig,
+    WebSocketConfig,
+};
 use crate::error::ProxyError;
-use crate::config::{ReverseProxyConfig, HealthCheckConfig, WebSocketConfig};
 use crate::rate_limit::RateLimiter;
-use hyper::{Request, Response, StatusCode, Uri, Method};
-use hyper::body::{Body as _, Incoming};
-use http_body_util::{BodyExt, Full, Empty};
-use hyper::body::Bytes;
+use chrono::{DateTime, FixedOffset, Utc};
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::{Body as _, Bytes, Incoming};
+use hyper::header::{HeaderName, HOST, ORIGIN};
 use hyper::server::conn::http1::Builder as ServerBuilder;
-use hyper::header::{HOST, ORIGIN};
-use hyper::header::HeaderName;
-use log::{info, error, warn, debug};
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use ipnet::IpNet;
+use log::{debug, error, info, warn};
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
+use tokio::time::Duration;
+use url::form_urlencoded;
+use url::Url;
 
 // Custom header names for X-Forwarded-* headers
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 static X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use tokio::time::Duration;
-use url::Url;
 
 /// Wrapper to store request data including client IP
 #[derive(Clone, Debug)]
@@ -32,12 +40,596 @@ pub struct RequestContext {
     pub client_ip: Option<String>,
 }
 
+#[derive(Clone)]
+struct WeightMeta {
+    group: String,
+    weight: u32,
+}
+
+#[derive(Clone)]
+struct CompiledRoute {
+    id: String,
+    target: Url,
+    priority: i32,
+    predicates: Vec<Predicate>,
+    weight: Option<WeightMeta>,
+    original_index: usize,
+}
+
+#[derive(Clone)]
+struct WeightedEntry {
+    route_index: usize,
+    weight: u32,
+}
+
+struct WeightedGroup {
+    entries: Vec<WeightedEntry>,
+    counter: AtomicU64,
+}
+
+struct RouteMatcher {
+    routes: Vec<CompiledRoute>,
+    weighted_groups: HashMap<String, WeightedGroup>,
+}
+
+impl RouteMatcher {
+    fn new(route_configs: Vec<ReverseProxyRouteConfig>) -> Result<Self, ProxyError> {
+        if route_configs.is_empty() {
+            return Err(ProxyError::Config(
+                "At least one reverse proxy route must be defined".to_string(),
+            ));
+        }
+
+        let mut ids = HashSet::new();
+        let mut routes = Vec::new();
+        let mut weighted_groups: HashMap<String, Vec<WeightedEntry>> = HashMap::new();
+
+        for (idx, cfg) in route_configs.into_iter().enumerate() {
+            if !ids.insert(cfg.id.clone()) {
+                return Err(ProxyError::Config(format!(
+                    "Duplicate reverse proxy route id: {}",
+                    cfg.id
+                )));
+            }
+
+            if cfg.predicates.is_empty() {
+                return Err(ProxyError::Config(format!(
+                    "Route {} must define at least one predicate",
+                    cfg.id
+                )));
+            }
+
+            let target = Url::parse(&cfg.target)
+                .map_err(|e| ProxyError::Config(format!("Invalid target for {}: {}", cfg.id, e)))?;
+
+            let mut weight_meta = None;
+            let predicates = cfg
+                .predicates
+                .into_iter()
+                .map(|p| Predicate::try_from(p, &mut weight_meta))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if let Some(meta) = weight_meta.clone() {
+                weighted_groups
+                    .entry(meta.group.clone())
+                    .or_default()
+                    .push(WeightedEntry {
+                        route_index: idx,
+                        weight: meta.weight,
+                    });
+            }
+
+            routes.push(CompiledRoute {
+                id: cfg.id,
+                target,
+                priority: cfg.priority.unwrap_or(0),
+                predicates,
+                weight: weight_meta,
+                original_index: idx,
+            });
+        }
+
+        let weighted_groups = weighted_groups
+            .into_iter()
+            .map(|(group, entries)| {
+                let total: u32 = entries.iter().map(|e| e.weight).sum();
+                if total == 0 {
+                    return Err(ProxyError::Config(format!(
+                        "Weighted group {} has zero total weight",
+                        group
+                    )));
+                }
+                Ok((
+                    group,
+                    WeightedGroup {
+                        entries,
+                        counter: AtomicU64::new(0),
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, ProxyError>>()?;
+
+        Ok(Self {
+            routes,
+            weighted_groups,
+        })
+    }
+
+    fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    fn unique_targets(&self) -> Vec<Url> {
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for route in &self.routes {
+            let key = route.target.as_str().to_string();
+            if seen.insert(key.clone()) {
+                targets.push(route.target.clone());
+            }
+        }
+        targets
+    }
+
+    fn select_route<'a>(&'a self, req: &Request<Incoming>, context: &RequestContext) -> Option<&'a CompiledRoute> {
+        let mut matches: Vec<(&CompiledRoute, i32)> = Vec::new();
+        for route in &self.routes {
+            if route.matches(req, context) {
+                matches.push((route, route.priority));
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+
+        let min_priority = matches
+            .iter()
+            .map(|(_, pri)| *pri)
+            .min()
+            .unwrap_or(i32::MAX);
+
+        let mut filtered: Vec<&CompiledRoute> = matches
+            .into_iter()
+            .filter(|(_, pri)| *pri == min_priority)
+            .map(|(r, _)| r)
+            .collect();
+
+        // Preserve declaration order within the same priority
+        filtered.sort_by_key(|r| r.original_index);
+
+        if let Some(first) = filtered.first().copied() {
+            if let Some(weight_meta) = &first.weight {
+                if let Some(group) = self.weighted_groups.get(&weight_meta.group) {
+                    let mut active_entries = Vec::new();
+                    for entry in &group.entries {
+                        if filtered
+                            .iter()
+                            .any(|r| r.original_index == entry.route_index)
+                        {
+                            active_entries.push(entry);
+                        }
+                    }
+
+                    let total_weight: u32 = active_entries.iter().map(|e| e.weight).sum();
+                    if total_weight > 0 {
+                        let seq = group.counter.fetch_add(1, Ordering::Relaxed);
+                        let mut cursor = (seq % total_weight as u64) as u32;
+                        for entry in active_entries {
+                            if cursor < entry.weight {
+                                return self.routes.get(entry.route_index);
+                            }
+                            cursor -= entry.weight;
+                        }
+                    }
+                }
+            }
+
+            return Some(first);
+        }
+
+        // Should not reach here, but return first matched route to be safe
+        if let Some(route) = filtered.first().copied() {
+            return Some(route);
+        }
+
+        None
+    }
+}
+
+#[derive(Clone)]
+enum Predicate {
+    Path(PathMatcher),
+    Host(HostMatcher),
+    Method(Vec<Method>),
+    Header(HeaderMatcher),
+    Query(QueryMatcher),
+    Cookie(CookieMatcher),
+    RemoteAddr(Vec<IpNet>),
+    After(DateTime<FixedOffset>),
+    Before(DateTime<FixedOffset>),
+    Between(DateTime<FixedOffset>, DateTime<FixedOffset>),
+}
+
+impl Predicate {
+    fn try_from(config: RoutePredicateConfig, weight_meta: &mut Option<WeightMeta>) -> Result<Self, ProxyError> {
+        match config {
+            RoutePredicateConfig::Path {
+                patterns,
+                match_trailing_slash,
+            } => {
+                if patterns.is_empty() {
+                    return Err(ProxyError::Config(
+                        "Path predicate requires at least one pattern".to_string(),
+                    ));
+                }
+                let matcher = PathMatcher::from_patterns(patterns, match_trailing_slash)?;
+                Ok(Predicate::Path(matcher))
+            }
+            RoutePredicateConfig::Host { patterns } => {
+                if patterns.is_empty() {
+                    return Err(ProxyError::Config(
+                        "Host predicate requires at least one pattern".to_string(),
+                    ));
+                }
+                let matcher = HostMatcher::from_patterns(patterns)?;
+                Ok(Predicate::Host(matcher))
+            }
+            RoutePredicateConfig::Method { methods } => {
+                if methods.is_empty() {
+                    return Err(ProxyError::Config(
+                        "Method predicate requires at least one method".to_string(),
+                    ));
+                }
+                let parsed = methods
+                    .into_iter()
+                    .map(|m| Method::from_bytes(m.as_bytes()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ProxyError::Config("Invalid HTTP method".to_string()))?;
+                Ok(Predicate::Method(parsed))
+            }
+            RoutePredicateConfig::Header { name, value, regex } => {
+                let matcher = HeaderMatcher::new(&name, value, regex)?;
+                Ok(Predicate::Header(matcher))
+            }
+            RoutePredicateConfig::Query { name, value, regex } => {
+                let matcher = QueryMatcher::new(&name, value, regex)?;
+                Ok(Predicate::Query(matcher))
+            }
+            RoutePredicateConfig::Cookie { name, value, regex } => {
+                let matcher = CookieMatcher::new(&name, value, regex)?;
+                Ok(Predicate::Cookie(matcher))
+            }
+            RoutePredicateConfig::After { instant } => {
+                let parsed = parse_instant(&instant)?;
+                Ok(Predicate::After(parsed))
+            }
+            RoutePredicateConfig::Before { instant } => {
+                let parsed = parse_instant(&instant)?;
+                Ok(Predicate::Before(parsed))
+            }
+            RoutePredicateConfig::Between { start, end } => {
+                let start = parse_instant(&start)?;
+                let end = parse_instant(&end)?;
+                Ok(Predicate::Between(start, end))
+            }
+            RoutePredicateConfig::RemoteAddr { cidrs } => {
+                if cidrs.is_empty() {
+                    return Err(ProxyError::Config(
+                        "RemoteAddr predicate requires at least one CIDR".to_string(),
+                    ));
+                }
+                let nets = cidrs
+                    .into_iter()
+                    .map(|c| c.parse::<IpNet>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ProxyError::Config(format!("Invalid CIDR: {}", e)))?;
+                Ok(Predicate::RemoteAddr(nets))
+            }
+            RoutePredicateConfig::Weight { group, weight } => {
+                if weight == 0 {
+                    return Err(ProxyError::Config(format!(
+                        "Weight for group {} must be greater than zero",
+                        group
+                    )));
+                }
+                *weight_meta = Some(WeightMeta { group, weight });
+                // Weight is not an executable predicate; always true
+                Ok(Predicate::Method(vec![]))
+            }
+        }
+    }
+
+    fn evaluate(&self, req: &Request<Incoming>, context: &RequestContext) -> Result<bool, ProxyError> {
+        match self {
+            Predicate::Path(matcher) => Ok(matcher.matches(req.uri().path())),
+            Predicate::Host(matcher) => {
+                let host = req
+                    .headers()
+                    .get(HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .or_else(|| req.uri().host());
+                Ok(host.map(|h| matcher.matches(h)).unwrap_or(false))
+            }
+            Predicate::Method(methods) => {
+                if methods.is_empty() {
+                    Ok(true)
+                } else {
+                    Ok(methods.iter().any(|m| m == req.method()))
+                }
+            }
+            Predicate::Header(matcher) => Ok(matcher.matches(req.headers())),
+            Predicate::Query(matcher) => Ok(matcher.matches(req.uri())),
+            Predicate::Cookie(matcher) => Ok(matcher.matches(req.headers())),
+            Predicate::RemoteAddr(nets) => {
+                if let Some(ip_str) = context.client_ip.as_deref() {
+                    let ip: IpAddr = ip_str
+                        .parse()
+                        .map_err(|e| ProxyError::Config(format!("Invalid client IP: {}", e)))?;
+                    Ok(nets.iter().any(|n| n.contains(&ip)))
+                } else {
+                    Ok(false)
+                }
+            }
+            Predicate::After(instant) => {
+                let now = Utc::now().with_timezone(instant.offset());
+                Ok(now > *instant)
+            }
+            Predicate::Before(instant) => {
+                let now = Utc::now().with_timezone(instant.offset());
+                Ok(now < *instant)
+            }
+            Predicate::Between(start, end) => {
+                let tz = start.offset();
+                let now = Utc::now().with_timezone(tz);
+                Ok(now >= *start && now < *end)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PathMatcher {
+    regexes: Vec<Regex>,
+}
+
+impl PathMatcher {
+    fn from_patterns(patterns: Vec<String>, match_trailing_slash: bool) -> Result<Self, ProxyError> {
+        let regexes = patterns
+            .iter()
+            .map(|p| {
+                build_ant_regex(p, match_trailing_slash, false)
+                    .map_err(|e| ProxyError::Config(format!("Invalid path pattern {}: {}", p, e)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { regexes })
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.regexes.iter().any(|r| r.is_match(path))
+    }
+}
+
+#[derive(Clone)]
+struct HostMatcher {
+    regexes: Vec<Regex>,
+}
+
+impl HostMatcher {
+    fn from_patterns(patterns: Vec<String>) -> Result<Self, ProxyError> {
+        let regexes = patterns
+            .iter()
+            .map(|p| {
+                build_ant_regex(p, false, true)
+                    .map_err(|e| ProxyError::Config(format!("Invalid host pattern {}: {}", p, e)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { regexes })
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        self.regexes.iter().any(|r| r.is_match(host))
+    }
+}
+
+#[derive(Clone)]
+struct HeaderMatcher {
+    name: HeaderName,
+    value: Option<String>,
+    regex: Option<Regex>,
+}
+
+impl HeaderMatcher {
+    fn new(name: &str, value: Option<String>, regex: Option<String>) -> Result<Self, ProxyError> {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| ProxyError::Config(format!("Invalid header name: {}", e)))?;
+        let regex = if let Some(r) = regex {
+            Some(Regex::new(&r).map_err(|e| ProxyError::Config(format!("Invalid header regex: {}", e)))?)
+        } else {
+            None
+        };
+        Ok(Self { name, value, regex })
+    }
+
+    fn matches(&self, headers: &hyper::HeaderMap) -> bool {
+        let value = headers.get(&self.name).and_then(|v| v.to_str().ok());
+        match (value, &self.value, &self.regex) {
+            (Some(actual), Some(expected), None) => actual == expected,
+            (Some(actual), None, Some(re)) => re.is_match(actual),
+            (Some(actual), Some(expected), Some(re)) => actual == expected && re.is_match(actual),
+            (Some(_), None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct QueryMatcher {
+    name: String,
+    value: Option<String>,
+    regex: Option<Regex>,
+}
+
+impl QueryMatcher {
+    fn new(name: &str, value: Option<String>, regex: Option<String>) -> Result<Self, ProxyError> {
+        if value.is_some() && regex.is_some() {
+            return Err(ProxyError::Config(
+                "Query predicate cannot specify both value and regex".to_string(),
+            ));
+        }
+        let regex = if let Some(r) = regex {
+            Some(Regex::new(&r).map_err(|e| ProxyError::Config(format!("Invalid query regex: {}", e)))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            name: name.to_string(),
+            value,
+            regex,
+        })
+    }
+
+    fn matches(&self, uri: &Uri) -> bool {
+        if let Some(query) = uri.query() {
+            for (k, v) in form_urlencoded::parse(query.as_bytes()) {
+                if k == self.name {
+                    if let Some(expected) = &self.value {
+                        return &v == expected;
+                    }
+                    if let Some(re) = &self.regex {
+                        return re.is_match(&v);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+#[derive(Clone)]
+struct CookieMatcher {
+    name: String,
+    value: Option<String>,
+    regex: Option<Regex>,
+}
+
+impl CookieMatcher {
+    fn new(name: &str, value: Option<String>, regex: Option<String>) -> Result<Self, ProxyError> {
+        if value.is_some() && regex.is_some() {
+            return Err(ProxyError::Config(
+                "Cookie predicate cannot specify both value and regex".to_string(),
+            ));
+        }
+        let regex = if let Some(r) = regex {
+            Some(Regex::new(&r).map_err(|e| ProxyError::Config(format!("Invalid cookie regex: {}", e)))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            name: name.to_string(),
+            value,
+            regex,
+        })
+    }
+
+    fn matches(&self, headers: &hyper::HeaderMap) -> bool {
+        let mut found = false;
+        for val in headers.get_all("cookie").iter() {
+            if let Ok(cookie_str) = val.to_str() {
+                for part in cookie_str.split(';') {
+                    let trimmed = part.trim();
+                    if let Some((name, value)) = trimmed.split_once('=') {
+                        if name == self.name {
+                            found = true;
+                            if let Some(expected) = &self.value {
+                                if value == expected {
+                                    return true;
+                                }
+                            } else if let Some(re) = &self.regex {
+                                if re.is_match(value) {
+                                    return true;
+                                }
+                            } else {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found && self.value.is_none() && self.regex.is_none()
+    }
+}
+
+impl CompiledRoute {
+    fn matches(&self, req: &Request<Incoming>, context: &RequestContext) -> bool {
+        for predicate in &self.predicates {
+            match predicate.evaluate(req, context) {
+                Ok(true) => continue,
+                Ok(false) => return false,
+                Err(e) => {
+                    warn!("Predicate evaluation error on route {}: {}", self.id, e);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn parse_instant(raw: &str) -> Result<DateTime<FixedOffset>, ProxyError> {
+    DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| ProxyError::Config(format!("Invalid timestamp {}: {}", raw, e)))
+}
+
+fn build_ant_regex(
+    pattern: &str,
+    match_trailing_slash: bool,
+    case_insensitive: bool,
+) -> Result<Regex, regex::Error> {
+    let mut regex = String::from("^");
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    regex.push_str(".*");
+                } else {
+                    regex.push_str("[^/]*");
+                }
+            }
+            '{' => {
+                while let Some(next) = chars.next() {
+                    if next == '}' {
+                        break;
+                    }
+                }
+                regex.push_str("([^/]+)");
+            }
+            '?' => regex.push_str("."),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '\\' => {
+                regex.push('\\');
+                regex.push(ch);
+            }
+            _ => regex.push(ch),
+        }
+    }
+    if match_trailing_slash {
+        regex.push_str("/?");
+    }
+    regex.push('$');
+    if case_insensitive {
+        regex.insert_str(0, "(?i)");
+    }
+    Regex::new(&regex)
+}
+
 pub struct ReverseProxy {
-    target_url: Url,
+    routes: Arc<RouteMatcher>,
     preserve_host: bool,
-    // HTTP client with connection pooling
     http_client: Arc<Client<HttpConnector, Incoming>>,
-    // Health check configuration
     health_check_config: Option<HealthCheckConfig>,
     metrics: Arc<PerformanceMetrics>,
     websocket_config: WebSocketConfig,
@@ -45,8 +637,13 @@ pub struct ReverseProxy {
 }
 
 impl ReverseProxy {
-    /// Creates a new reverse proxy with default pooling configuration
-    pub fn new(target_url: String, connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Result<Self, ProxyError> {
+    /// Creates a new reverse proxy with default pooling configuration (single route fallback)
+    pub fn new(
+        target_url: String,
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        max_connection_lifetime_secs: u64,
+    ) -> Result<Self, ProxyError> {
         Self::new_with_config(
             target_url,
             connect_timeout_secs,
@@ -57,39 +654,69 @@ impl ReverseProxy {
         )
     }
 
-    /// Creates a new reverse proxy with custom pooling configuration
+    /// Creates a new reverse proxy with custom pooling configuration (single route fallback)
     pub fn new_with_config(
         target_url: String,
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        max_connection_lifetime_secs: u64,
+        reverse_proxy_config: Option<ReverseProxyConfig>,
+        websocket_config: Option<WebSocketConfig>,
+    ) -> Result<Self, ProxyError> {
+        let route = ReverseProxyRouteConfig {
+            id: "default".to_string(),
+            target: target_url,
+            priority: Some(0),
+            predicates: vec![RoutePredicateConfig::Path {
+                patterns: vec!["/**".to_string()],
+                match_trailing_slash: true,
+            }],
+        };
+        Self::new_with_routes(
+            vec![route],
+            connect_timeout_secs,
+            idle_timeout_secs,
+            max_connection_lifetime_secs,
+            reverse_proxy_config,
+            websocket_config,
+        )
+    }
+
+    /// Creates a new reverse proxy from multi-route configuration
+    pub fn new_with_routes(
+        routes: Vec<ReverseProxyRouteConfig>,
         connect_timeout_secs: u64,
         _idle_timeout_secs: u64,
         _max_connection_lifetime_secs: u64,
         reverse_proxy_config: Option<ReverseProxyConfig>,
         websocket_config: Option<WebSocketConfig>,
     ) -> Result<Self, ProxyError> {
-        let url = Url::parse(&target_url)
-            .map_err(|e| ProxyError::Url(e))?;
-
-        // Get pool configuration
         let pool_config = reverse_proxy_config.unwrap_or_default();
         let health_check_config = pool_config.health_check.clone();
+        let router = Arc::new(RouteMatcher::new(routes)?);
 
-        // Build HTTP client with connection pooling
         let http_client = Self::build_http_client(
             connect_timeout_secs,
             pool_config.pool_max_idle_per_host,
             pool_config.pool_idle_timeout_secs,
         );
 
-        info!("Reverse proxy configuration: pool_max_idle_per_host={}, pool_idle_timeout={}s",
-              pool_config.pool_max_idle_per_host, pool_config.pool_idle_timeout_secs);
+        info!(
+            "Reverse proxy configuration: {} routes, pool_max_idle_per_host={}, pool_idle_timeout={}s",
+            router.route_count(),
+            pool_config.pool_max_idle_per_host,
+            pool_config.pool_idle_timeout_secs
+        );
 
         if let Some(ref health_check) = health_check_config {
-            info!("Health check enabled: interval={}s, timeout={}s, endpoint={:?}",
-                  health_check.interval_secs, health_check.timeout_secs, health_check.endpoint);
+            info!(
+                "Health check enabled: interval={}s, timeout={}s, endpoint={:?}",
+                health_check.interval_secs, health_check.timeout_secs, health_check.endpoint
+            );
         }
 
         Ok(Self {
-            target_url: url,
+            routes: router,
             preserve_host: true,
             http_client: Arc::new(http_client),
             health_check_config,
@@ -100,13 +727,6 @@ impl ReverseProxy {
     }
 
     /// Build HTTP client for reverse proxy with connection pooling
-    ///
-    /// Reverse proxy pooling strategy:
-    /// - Connects to a single fixed backend server
-    /// - Maintains persistent connection pool for better performance
-    /// - pool_max_idle_per_host: 0-50 (user configurable, default: 10)
-    /// - pool_idle_timeout: Long timeout (60-90s) to keep connections warm
-    /// - Health checks ensure pooled connections are healthy
     fn build_http_client(
         connect_timeout_secs: u64,
         pool_max_idle_per_host: usize,
@@ -123,16 +743,16 @@ impl ReverseProxy {
             info!("Reverse proxy: connection pooling DISABLED (pool_max_idle_per_host=0)");
             builder.pool_max_idle_per_host(0);
         } else {
-            info!("Reverse proxy: connection pooling ENABLED (pool_max_idle_per_host={}, idle_timeout={}s)",
-                  pool_max_idle_per_host, pool_idle_timeout_secs);
+            info!(
+                "Reverse proxy: connection pooling ENABLED (pool_max_idle_per_host={}, idle_timeout={}s)",
+                pool_max_idle_per_host, pool_idle_timeout_secs
+            );
             builder.pool_max_idle_per_host(pool_max_idle_per_host);
             builder.pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
             builder.pool_timer(TokioTimer::new());
         }
 
-        builder
-            .http2_only(false)
-            .build(connector)
+        builder.http2_only(false).build(connector)
     }
 
     pub fn with_preserve_host(mut self, preserve_host: bool) -> Self {
@@ -151,49 +771,59 @@ impl ReverseProxy {
     }
 
     /// Public method for handling individual requests (used by CombinedProxyAdapter)
-    pub async fn handle_request_with_context(&self, req: Request<Incoming>, context: RequestContext) -> Result<Response<Full<Bytes>>, Infallible> {
+    pub async fn handle_request_with_context(
+        &self,
+        req: Request<Incoming>,
+        context: RequestContext,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
         Self::handle_request_static(
             req,
             context,
             self.http_client.clone(),
-            self.target_url.clone(),
+            self.routes.clone(),
             self.preserve_host,
             Arc::new(self.websocket_config.clone()),
             self.metrics.clone(),
             self.rate_limiter.clone(),
-        ).await
+        )
+        .await
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
-        let listener = tokio::net::TcpListener::bind(addr).await
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-        info!("Reverse proxy listening on: {} -> {}", addr, self.target_url);
+        info!("Reverse proxy listening on: {}", addr);
 
-        // Start health check task if configured
         if let Some(health_check_config) = self.health_check_config.clone() {
-            let target_url = self.target_url.clone();
             let http_client = self.http_client.clone();
-            tokio::spawn(async move {
-                Self::health_check_loop(http_client, target_url, health_check_config).await;
-            });
+            for target_url in self.routes.unique_targets() {
+                let cfg = health_check_config.clone();
+                let client = http_client.clone();
+                tokio::spawn(async move {
+                    Self::health_check_loop(client, target_url, cfg).await;
+                });
+            }
         }
 
         let http_client = self.http_client.clone();
-        let target_url = self.target_url.clone();
+        let routes = self.routes.clone();
         let preserve_host = self.preserve_host;
         let websocket_config = Arc::new(self.websocket_config.clone());
         let metrics = self.metrics.clone();
         let rate_limiter = self.rate_limiter.clone();
 
         loop {
-            let (stream, remote_addr) = listener.accept().await
+            let (stream, remote_addr) = listener
+                .accept()
+                .await
                 .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
             let http_client = http_client.clone();
-            let target_url = target_url.clone();
+            let routes = routes.clone();
             let metrics = metrics.clone();
-            let websocket_config = websocket_config.clone();
+            let websocket_cfg = websocket_config.clone();
             let rate_limiter = rate_limiter.clone();
 
             tokio::spawn(async move {
@@ -205,10 +835,10 @@ impl ReverseProxy {
                         io,
                         service_fn(move |req| {
                             let http_client = http_client.clone();
-                            let target_url = target_url.clone();
+                            let routes = routes.clone();
                             let client_ip = Some(remote_addr.ip().to_string());
                             let metrics = metrics.clone();
-                            let websocket_cfg = websocket_config.clone();
+                            let websocket_cfg = websocket_cfg.clone();
                             let rate_limiter = rate_limiter.clone();
 
                             let context = RequestContext {
@@ -222,22 +852,25 @@ impl ReverseProxy {
                                     req,
                                     context,
                                     http_client,
-                                    target_url,
+                                    routes,
                                     preserve_host,
                                     websocket_cfg,
                                     metrics.clone(),
                                     rate_limiter.clone(),
-                                ).await;
+                                )
+                                .await;
 
-                                if let Some(len) = result.as_ref()
+                                if let Some(len) = result
+                                    .as_ref()
                                     .ok()
-                                    .and_then(|response| response.body().size_hint().exact()) {
+                                    .and_then(|response| response.body().size_hint().exact())
+                                {
                                     metrics.record_response_bytes(len as u64);
                                 }
                                 timer.finish();
                                 result
                             }
-                        })
+                        }),
                     )
                     .await
                 {
@@ -252,7 +885,7 @@ impl ReverseProxy {
         req: Request<Incoming>,
         context: RequestContext,
         http_client: Arc<Client<HttpConnector, Incoming>>,
-        target_url: Url,
+        routes: Arc<RouteMatcher>,
         preserve_host: bool,
         websocket_config: Arc<WebSocketConfig>,
         metrics: Arc<PerformanceMetrics>,
@@ -275,22 +908,41 @@ impl ReverseProxy {
                         "Reverse proxy rate limit hit for {} via rule {}",
                         client_ip, hit.rule_id
                     );
-                    return Ok(ResponseBuilder::too_many_requests(&hit.rule_id, hit.retry_after_secs));
+                    return Ok(ResponseBuilder::too_many_requests(
+                        &hit.rule_id,
+                        hit.retry_after_secs,
+                    ));
                 }
             }
         }
 
+        let selected_route = match routes.select_route(&req, &context) {
+            Some(route) => route,
+            None => return Ok(ResponseBuilder::error(StatusCode::NOT_FOUND, "No matching route")),
+        };
+
         if is_websocket_upgrade(req.headers()) {
-            return Self::handle_websocket_request(req, context, http_client, target_url, preserve_host, websocket_config).await;
+            return Self::handle_websocket_request(
+                req,
+                context,
+                http_client,
+                selected_route.target.clone(),
+                preserve_host,
+                websocket_config,
+            )
+            .await;
         }
 
-        match Self::process_request_static(req, context, http_client, target_url, preserve_host).await {
+        match Self::process_request_static(req, context, http_client, selected_route.target.clone(), preserve_host)
+        .await
+        {
             Ok(response) => Ok(response),
             Err(e) => {
                 error!("Proxy error: {}", e);
+                let body = Full::new(Bytes::from(format!("Proxy Error: {}", e)));
                 let error_response = Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!("Proxy Error: {}", e))))
+                    .body(body)
                     .unwrap();
                 metrics.increment_connection_errors();
                 Ok(error_response)
@@ -306,9 +958,17 @@ impl ReverseProxy {
         target_url: Url,
         preserve_host: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        let prepared = Self::rewrite_backend_request(req, &context, &target_url, preserve_host, false)?;
+        let prepared = Self::rewrite_backend_request(
+            req,
+            &context,
+            &target_url,
+            preserve_host,
+            false,
+        )?;
 
-        let response = http_client.request(prepared).await
+        let response = http_client
+            .request(prepared)
+            .await
             .map_err(|e| ProxyError::Http(format!("Failed to forward request: {}", e)))?;
 
         Self::finalize_backend_response(response, false).await
@@ -327,19 +987,26 @@ impl ReverseProxy {
         }
 
         let client_upgrade = hyper::upgrade::on(&mut req);
-        let prepared_request = match Self::rewrite_backend_request(req, &context, &target_url, preserve_host, true) {
-            Ok(request) => request,
-            Err(e) => {
-                error!("WebSocket request rewrite failed: {}", e);
-                return Ok(ResponseBuilder::error(StatusCode::BAD_GATEWAY, "Invalid WebSocket request"));
-            }
-        };
+        let prepared_request =
+            match Self::rewrite_backend_request(req, &context, &target_url, preserve_host, true) {
+                Ok(request) => request,
+                Err(e) => {
+                    error!("WebSocket request rewrite failed: {}", e);
+                    return Ok(ResponseBuilder::error(
+                        StatusCode::BAD_GATEWAY,
+                        "Invalid WebSocket request",
+                    ));
+                }
+            };
 
         let mut backend_response = match http_client.request(prepared_request).await {
             Ok(resp) => resp,
             Err(e) => {
                 error!("WebSocket backend request failed: {}", e);
-                return Ok(ResponseBuilder::error(StatusCode::BAD_GATEWAY, "WebSocket backend error"));
+                return Ok(ResponseBuilder::error(
+                    StatusCode::BAD_GATEWAY,
+                    "WebSocket backend error",
+                ));
             }
         };
 
@@ -348,7 +1015,10 @@ impl ReverseProxy {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     error!("Failed to finalize backend response: {}", e);
-                    Ok(ResponseBuilder::error(StatusCode::BAD_GATEWAY, "WebSocket backend error"))
+                    Ok(ResponseBuilder::error(
+                        StatusCode::BAD_GATEWAY,
+                        "WebSocket backend error",
+                    ))
                 }
             };
         }
@@ -380,17 +1050,23 @@ impl ReverseProxy {
         }
 
         if config.allowed_origins.iter().all(|o| o != "*") {
-            let origin = headers.get(ORIGIN)
+            let origin = headers
+                .get(ORIGIN)
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| "Origin header is required for WebSocket requests".to_string())?;
 
-            if !config.allowed_origins.iter().any(|allowed| allowed.eq_ignore_ascii_case(origin)) {
+            if !config
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+            {
                 return Err("Origin not allowed".to_string());
             }
         }
 
         if !config.supported_protocols.is_empty() {
-            let offered = headers.get("Sec-WebSocket-Protocol")
+            let offered = headers
+                .get("Sec-WebSocket-Protocol")
                 .and_then(|v| v.to_str().ok())
                 .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
                 .unwrap_or_else(|| Vec::new());
@@ -399,8 +1075,15 @@ impl ReverseProxy {
                 return Err("WebSocket subprotocol required".to_string());
             }
 
-            let supported = config.supported_protocols.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>();
-            if !offered.iter().any(|offer| supported.iter().any(|allowed| allowed == &offer.to_ascii_lowercase())) {
+            let supported = config
+                .supported_protocols
+                .iter()
+                .map(|p| p.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            if !offered
+                .iter()
+                .any(|offer| supported.iter().any(|allowed| allowed == &offer.to_ascii_lowercase()))
+            {
                 return Err("Unsupported WebSocket subprotocol".to_string());
             }
         }
@@ -415,7 +1098,9 @@ impl ReverseProxy {
         preserve_host: bool,
         keep_upgrade: bool,
     ) -> Result<Request<Incoming>, ProxyError> {
-        let path_and_query = req.uri().path_and_query()
+        let path_and_query = req
+            .uri()
+            .path_and_query()
             .ok_or_else(|| ProxyError::Config("Invalid URI path".to_string()))?;
 
         let target_url_string = format!(
@@ -424,7 +1109,8 @@ impl ReverseProxy {
             path_and_query.as_str()
         );
 
-        let target_uri: Uri = target_url_string.parse()
+        let target_uri: Uri = target_url_string
+            .parse()
             .map_err(|e: hyper::http::uri::InvalidUri| ProxyError::Uri(e.to_string()))?;
 
         let original_host = req.headers().get(HOST).cloned();
@@ -468,11 +1154,15 @@ impl ReverseProxy {
         keep_upgrade: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let (mut parts, body) = response.into_parts();
-        let body_bytes = body.collect().await
+        let body_bytes = body
+            .collect()
+            .await
             .map_err(|e| ProxyError::Http(format!("Failed to collect response body: {}", e)))?;
 
         Self::strip_response_headers(&mut parts.headers, keep_upgrade);
-        parts.headers.insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
+        parts
+            .headers
+            .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
 
         Ok(Response::from_parts(parts, Full::new(body_bytes.to_bytes())))
     }
@@ -528,10 +1218,7 @@ impl ReverseProxy {
         };
         let port = target_url.port().unwrap_or(80);
 
-        match tokio::time::timeout(
-            timeout,
-            tokio::net::TcpStream::connect((host, port))
-        ).await {
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
                 debug!("TCP health check failed: {}", e);
@@ -551,20 +1238,18 @@ impl ReverseProxy {
         endpoint: &str,
         timeout: Duration,
     ) -> bool {
-        let health_url = format!("{}{}",
-            target_url.as_str().trim_end_matches('/'),
-            endpoint
-        );
+        let health_url = format!("{}{}", target_url.as_str().trim_end_matches('/'), endpoint);
 
         // Use a simple HTTP client for health check (not the pooled client)
         let connector = HttpConnector::new();
-        let simple_client: Client<HttpConnector, Empty<Bytes>> = Client::builder(TokioExecutor::new())
-            .build(connector);
+        let simple_client: Client<HttpConnector, Empty<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(connector);
 
         let request = match Request::builder()
             .method(Method::GET)
             .uri(health_url)
-            .body(Empty::<Bytes>::new()) {
+            .body(Empty::<Bytes>::new())
+        {
             Ok(req) => req,
             Err(e) => {
                 debug!("Failed to build health check request: {}", e);
@@ -587,19 +1272,105 @@ impl ReverseProxy {
             }
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::body::Incoming;
 
     #[test]
     fn test_reverse_proxy_creation() {
-        let result = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300);
+        let result = ReverseProxy::new(
+            "http://backend.example.com".to_string(),
+            10,
+            90,
+            300,
+        );
         assert!(result.is_ok());
 
         let invalid_url = ReverseProxy::new("not-a-url".to_string(), 10, 90, 300);
         assert!(invalid_url.is_err());
+    }
+
+    #[test]
+    fn test_route_matching_priority() {
+        let routes = vec![
+            ReverseProxyRouteConfig {
+                id: "high".to_string(),
+                target: "http://h.example.com".to_string(),
+                priority: Some(1),
+                predicates: vec![RoutePredicateConfig::Path {
+                    patterns: vec!["/api/**".to_string()],
+                    match_trailing_slash: true,
+                }],
+            },
+            ReverseProxyRouteConfig {
+                id: "low".to_string(),
+                target: "http://l.example.com".to_string(),
+                priority: Some(5),
+                predicates: vec![RoutePredicateConfig::Path {
+                    patterns: vec!["/**".to_string()],
+                    match_trailing_slash: true,
+                }],
+            },
+        ];
+        let matcher = RouteMatcher::new(routes).unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/users")
+            .body(Incoming::empty())
+            .unwrap();
+        let route = matcher
+            .select_route(&req, &RequestContext { client_ip: None })
+            .unwrap();
+        assert_eq!(route.id, "high");
+    }
+
+    #[test]
+    fn test_weighted_selection_single_group() {
+        let routes = vec![
+            ReverseProxyRouteConfig {
+                id: "a".to_string(),
+                target: "http://a.example.com".to_string(),
+                priority: Some(0),
+                predicates: vec![
+                    RoutePredicateConfig::Path {
+                        patterns: vec!["/**".to_string()],
+                        match_trailing_slash: true,
+                    },
+                    RoutePredicateConfig::Weight {
+                        group: "g".to_string(),
+                        weight: 1,
+                    },
+                ],
+            },
+            ReverseProxyRouteConfig {
+                id: "b".to_string(),
+                target: "http://b.example.com".to_string(),
+                priority: Some(0),
+                predicates: vec![
+                    RoutePredicateConfig::Path {
+                        patterns: vec!["/**".to_string()],
+                        match_trailing_slash: true,
+                    },
+                    RoutePredicateConfig::Weight {
+                        group: "g".to_string(),
+                        weight: 3,
+                    },
+                ],
+            },
+        ];
+        let matcher = RouteMatcher::new(routes).unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/anything")
+            .body(Incoming::empty())
+            .unwrap();
+        let first = matcher
+            .select_route(&req, &RequestContext { client_ip: None })
+            .unwrap();
+        assert!(first.id == "a" || first.id == "b");
     }
 }

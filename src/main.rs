@@ -336,6 +336,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         mode,
         listen_addr,
         reverse_proxy_target: args.target.clone(),
+        reverse_proxy_routes: None,
         max_connections: Some(1000),
         connect_timeout_secs: args.connect_timeout,
         idle_timeout_secs: args.idle_timeout,
@@ -425,8 +426,10 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
 fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     match config.mode {
         ProxyMode::Reverse => {
-            if config.reverse_proxy_target.is_none() && config.static_files.is_none() {
-                return Err("Reverse proxy mode requires either a target URL or static files configuration".into());
+            let has_target = config.reverse_proxy_target.is_some();
+            let has_routes = config.reverse_proxy_routes.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+            if !has_target && !has_routes && config.static_files.is_none() {
+                return Err("Reverse proxy mode requires either a target URL, reverse_proxy_routes, or static files configuration".into());
             }
         }
         ProxyMode::Forward => {

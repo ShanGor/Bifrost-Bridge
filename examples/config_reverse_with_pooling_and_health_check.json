@@ -4,7 +4,12 @@
   "reverse_proxy_target": "http://127.0.0.1:3030",
   "reverse_proxy_config": {
     "pool_max_idle_per_host": 1,
-    "pool_idle_timeout_secs": 90
+    "pool_idle_timeout_secs": 90,
+    "health_check": {
+      "interval_secs": 30,
+      "endpoint": "/health",
+      "timeout_secs": 5
+    }
   },
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,

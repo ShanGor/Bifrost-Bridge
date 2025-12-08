@@ -92,7 +92,8 @@ impl ProxyFactory {
             ProxyMode::Reverse => {
                 info!("Initializing Reverse Proxy mode");
 
-                if config.static_files.is_some() && config.reverse_proxy_target.is_none() {
+                let reverse_routes = config.reverse_proxy_routes.clone().unwrap_or_default();
+                if config.static_files.is_some() && config.reverse_proxy_target.is_none() && reverse_routes.is_empty() {
                     info!("Static files only mode (no reverse proxy target)");
                     let static_config = config.static_files.unwrap();
                     debug!("Static files configuration - mounts: {}", static_config.mounts.len());
@@ -105,7 +106,7 @@ impl ProxyFactory {
                         certificate: config.certificate,
                         rate_limiter: rate_limiter.clone(),
                     })
-                } else if config.static_files.is_some() && config.reverse_proxy_target.is_some() {
+                } else if config.static_files.is_some() && (config.reverse_proxy_target.is_some() || !reverse_routes.is_empty()) {
                     // Combined mode: both reverse proxy and static files
                     info!("Combined reverse proxy + static files mode");
                     let static_config = config.static_files.unwrap();
@@ -113,8 +114,6 @@ impl ProxyFactory {
                     let handler = StaticFileHandler::new(static_config)?
                         .with_metrics(monitoring_handles.static_metrics());
 
-                    let target_url = config.reverse_proxy_target.unwrap();
-                    info!("Reverse proxy target: {}", target_url);
                     // Support backward compatibility with timeout_secs
                     let connect_timeout_secs = config.connect_timeout_secs
                         .or(config.timeout_secs)
@@ -123,14 +122,28 @@ impl ProxyFactory {
                         .unwrap_or(90);
                     let max_connection_lifetime_secs = config.max_connection_lifetime_secs
                         .unwrap_or(300);
-                    let proxy = ReverseProxy::new_with_config(
-                        target_url,
-                        connect_timeout_secs,
-                        idle_timeout_secs,
-                        max_connection_lifetime_secs,
-                        config.reverse_proxy_config.clone(),
-                        config.websocket.clone(),
-                    )?
+                    let proxy = if !reverse_routes.is_empty() {
+                        info!("Reverse proxy routes: {}", reverse_routes.len());
+                        ReverseProxy::new_with_routes(
+                            reverse_routes,
+                            connect_timeout_secs,
+                            idle_timeout_secs,
+                            max_connection_lifetime_secs,
+                            config.reverse_proxy_config.clone(),
+                            config.websocket.clone(),
+                        )?
+                    } else {
+                        let target_url = config.reverse_proxy_target.unwrap();
+                        info!("Reverse proxy target: {}", target_url);
+                        ReverseProxy::new_with_config(
+                            target_url,
+                            connect_timeout_secs,
+                            idle_timeout_secs,
+                            max_connection_lifetime_secs,
+                            config.reverse_proxy_config.clone(),
+                            config.websocket.clone(),
+                        )?
+                    }
                     .with_metrics(monitoring_handles.reverse_metrics())
                     .with_rate_limiter(rate_limiter.clone());
 
@@ -144,9 +157,6 @@ impl ProxyFactory {
                     })
                 } else {
                     // Reverse proxy only mode
-                    let target_url = config.reverse_proxy_target
-                        .ok_or_else(|| ProxyError::Config("Reverse proxy target URL is required for reverse proxy mode".to_string()))?;
-                    info!("Reverse proxy target: {}", target_url);
                     // Support backward compatibility with timeout_secs
                     let connect_timeout_secs = config.connect_timeout_secs
                         .or(config.timeout_secs)
@@ -155,14 +165,30 @@ impl ProxyFactory {
                         .unwrap_or(90);
                     let max_connection_lifetime_secs = config.max_connection_lifetime_secs
                         .unwrap_or(300);
-                    let proxy = ReverseProxy::new_with_config(
-                        target_url,
-                        connect_timeout_secs,
-                        idle_timeout_secs,
-                        max_connection_lifetime_secs,
-                        config.reverse_proxy_config.clone(),
-                        config.websocket.clone(),
-                    )?
+                    let reverse_routes = config.reverse_proxy_routes.clone().unwrap_or_default();
+                    let proxy = if !reverse_routes.is_empty() {
+                        info!("Reverse proxy routes: {}", reverse_routes.len());
+                        ReverseProxy::new_with_routes(
+                            reverse_routes,
+                            connect_timeout_secs,
+                            idle_timeout_secs,
+                            max_connection_lifetime_secs,
+                            config.reverse_proxy_config.clone(),
+                            config.websocket.clone(),
+                        )?
+                    } else {
+                        let target_url = config.reverse_proxy_target
+                            .ok_or_else(|| ProxyError::Config("Reverse proxy target URL is required for reverse proxy mode".to_string()))?;
+                        info!("Reverse proxy target: {}", target_url);
+                        ReverseProxy::new_with_config(
+                            target_url,
+                            connect_timeout_secs,
+                            idle_timeout_secs,
+                            max_connection_lifetime_secs,
+                            config.reverse_proxy_config.clone(),
+                            config.websocket.clone(),
+                        )?
+                    }
                     .with_metrics(monitoring_handles.reverse_metrics())
                     .with_rate_limiter(rate_limiter.clone());
                     Box::new(ReverseProxyAdapter {

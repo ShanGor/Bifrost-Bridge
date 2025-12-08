@@ -273,6 +273,73 @@ impl Default for ReverseProxyConfig {
     }
 }
 
+/// Reverse proxy route configuration supporting multiple targets and predicates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReverseProxyRouteConfig {
+    /// Unique route id
+    pub id: String,
+    /// Upstream target URL
+    pub target: String,
+    /// Optional priority (lower number = higher priority). Defaults to 0.
+    #[serde(default)]
+    pub priority: Option<i32>,
+    /// Predicate list (logical AND). Empty list is invalid.
+    #[serde(default)]
+    pub predicates: Vec<RoutePredicateConfig>,
+}
+
+/// Predicate configuration for reverse proxy routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum RoutePredicateConfig {
+    /// Path matching using Ant-style patterns (supports ** and *)
+    Path {
+        patterns: Vec<String>,
+        #[serde(default)]
+        match_trailing_slash: bool,
+    },
+    /// Host header matching with Ant-style patterns
+    Host {
+        patterns: Vec<String>,
+    },
+    /// Allowed HTTP methods
+    Method {
+        methods: Vec<String>,
+    },
+    /// Header match by exact value or regex
+    Header {
+        name: String,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        regex: Option<String>,
+    },
+    /// Query param match by presence, exact value, or regex
+    Query {
+        name: String,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        regex: Option<String>,
+    },
+    /// Cookie match by name with optional exact value or regex
+    Cookie {
+        name: String,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        regex: Option<String>,
+    },
+    /// Time-based predicates
+    After { instant: String },
+    Before { instant: String },
+    Between { start: String, end: String },
+    /// Remote address in CIDR ranges
+    RemoteAddr { cidrs: Vec<String> },
+    /// Weighted routing participation
+    Weight { group: String, weight: u32 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticMount {
     pub path: String,        // URL path prefix (e.g., "/app", "/api", "/assets")
@@ -431,6 +498,8 @@ pub struct Config {
     pub mode: ProxyMode,
     pub listen_addr: SocketAddr,
     pub reverse_proxy_target: Option<String>,
+    #[serde(default)]
+    pub reverse_proxy_routes: Option<Vec<ReverseProxyRouteConfig>>,
     pub max_connections: Option<usize>,
     // New timeout configurations
     #[serde(default)]
@@ -495,6 +564,7 @@ impl Default for Config {
             mode: ProxyMode::Forward,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             reverse_proxy_target: None,
+            reverse_proxy_routes: None,
             max_connections: Some(1000),
             connect_timeout_secs: Some(10),
             idle_timeout_secs: Some(90),

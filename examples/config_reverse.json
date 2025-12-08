@@ -1,7 +1,17 @@
 {
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:8888",
-  "reverse_proxy_target": "http://localhost:8080/api",
+  "reverse_proxy_routes": [
+    {
+      "id": "api",
+      "target": "http://localhost:8080",
+      "priority": 0,
+      "predicates": [
+        { "type": "Host", "patterns": ["api.local.test"] },
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
+      ]
+    }
+  ],
   "max_connections": 1000,
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,

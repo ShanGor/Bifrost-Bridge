@@ -280,6 +280,9 @@ pub struct ReverseProxyRouteConfig {
     pub id: String,
     /// Upstream target URL
     pub target: String,
+    /// Optional reverse proxy connection config for this route
+    #[serde(default)]
+    pub reverse_proxy_config: Option<ReverseProxyConfig>,
     /// Optional priority (lower number = higher priority). Defaults to 0.
     #[serde(default)]
     pub priority: Option<i32>,

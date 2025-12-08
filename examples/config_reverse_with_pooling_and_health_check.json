@@ -1,16 +1,45 @@
 {
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:8888",
-  "reverse_proxy_target": "http://127.0.0.1:3030",
-  "reverse_proxy_config": {
-    "pool_max_idle_per_host": 1,
-    "pool_idle_timeout_secs": 90,
-    "health_check": {
-      "interval_secs": 30,
-      "endpoint": "/health",
-      "timeout_secs": 5
+  "reverse_proxy_routes": [
+    {
+      "id": "api-primary",
+      "target": "http://127.0.0.1:3030",
+      "priority": 0,
+      "reverse_proxy_config": {
+        "pool_max_idle_per_host": 2,
+        "pool_idle_timeout_secs": 90,
+        "health_check": {
+          "interval_secs": 30,
+          "endpoint": "/health",
+          "timeout_secs": 5
+        }
+      },
+      "predicates": [
+        { "type": "Host", "patterns": ["api.service.test"] },
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
+      ]
+    },
+    {
+      "id": "api-canary",
+      "target": "http://127.0.0.1:3131",
+      "priority": 0,
+      "reverse_proxy_config": {
+        "pool_max_idle_per_host": 1,
+        "pool_idle_timeout_secs": 60,
+        "health_check": {
+          "interval_secs": 60,
+          "endpoint": "/ready",
+          "timeout_secs": 5
+        }
+      },
+      "predicates": [
+        { "type": "Host", "patterns": ["api.service.test"] },
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true },
+        { "type": "Weight", "group": "api", "weight": 20 }
+      ]
     }
-  },
+  ],
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,
   "monitoring": {

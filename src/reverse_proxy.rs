@@ -50,6 +50,8 @@ struct WeightMeta {
 struct CompiledRoute {
     id: String,
     target: Url,
+    http_client: Arc<Client<HttpConnector, Incoming>>,
+    health_check_config: Option<HealthCheckConfig>,
     priority: i32,
     predicates: Vec<Predicate>,
     weight: Option<WeightMeta>,
@@ -73,7 +75,11 @@ struct RouteMatcher {
 }
 
 impl RouteMatcher {
-    fn new(route_configs: Vec<ReverseProxyRouteConfig>) -> Result<Self, ProxyError> {
+    fn new(
+        route_configs: Vec<ReverseProxyRouteConfig>,
+        connect_timeout_secs: u64,
+        default_pool_config: Option<ReverseProxyConfig>,
+    ) -> Result<Self, ProxyError> {
         if route_configs.is_empty() {
             return Err(ProxyError::Config(
                 "At least one reverse proxy route must be defined".to_string(),
@@ -102,6 +108,18 @@ impl RouteMatcher {
             let target = Url::parse(&cfg.target)
                 .map_err(|e| ProxyError::Config(format!("Invalid target for {}: {}", cfg.id, e)))?;
 
+            let pool_cfg = cfg
+                .reverse_proxy_config
+                .clone()
+                .or_else(|| default_pool_config.clone())
+                .unwrap_or_default();
+            let http_client = Arc::new(ReverseProxy::build_http_client(
+                connect_timeout_secs,
+                pool_cfg.pool_max_idle_per_host,
+                pool_cfg.pool_idle_timeout_secs,
+            ));
+            let health_check_config = pool_cfg.health_check.clone();
+
             let mut weight_meta = None;
             let predicates = cfg
                 .predicates
@@ -122,6 +140,8 @@ impl RouteMatcher {
             routes.push(CompiledRoute {
                 id: cfg.id,
                 target,
+                http_client,
+                health_check_config,
                 priority: cfg.priority.unwrap_or(0),
                 predicates,
                 weight: weight_meta,
@@ -159,19 +179,19 @@ impl RouteMatcher {
         self.routes.len()
     }
 
-    fn unique_targets(&self) -> Vec<Url> {
-        let mut seen = HashSet::new();
-        let mut targets = Vec::new();
+    fn routes_with_health_checks(
+        &self,
+    ) -> Vec<(Url, Arc<Client<HttpConnector, Incoming>>, HealthCheckConfig)> {
+        let mut entries = Vec::new();
         for route in &self.routes {
-            let key = route.target.as_str().to_string();
-            if seen.insert(key.clone()) {
-                targets.push(route.target.clone());
+            if let Some(cfg) = route.health_check_config.clone() {
+                entries.push((route.target.clone(), route.http_client.clone(), cfg));
             }
         }
-        targets
+        entries
     }
 
-    fn select_route<'a>(&'a self, req: &Request<Incoming>, context: &RequestContext) -> Option<&'a CompiledRoute> {
+    fn select_route<'a, B>(&'a self, req: &Request<B>, context: &RequestContext) -> Option<&'a CompiledRoute> {
         let mut matches: Vec<(&CompiledRoute, i32)> = Vec::new();
         for route in &self.routes {
             if route.matches(req, context) {
@@ -340,7 +360,7 @@ impl Predicate {
         }
     }
 
-    fn evaluate(&self, req: &Request<Incoming>, context: &RequestContext) -> Result<bool, ProxyError> {
+    fn evaluate<B>(&self, req: &Request<B>, context: &RequestContext) -> Result<bool, ProxyError> {
         match self {
             Predicate::Path(matcher) => Ok(matcher.matches(req.uri().path())),
             Predicate::Host(matcher) => {
@@ -563,7 +583,7 @@ impl CookieMatcher {
 }
 
 impl CompiledRoute {
-    fn matches(&self, req: &Request<Incoming>, context: &RequestContext) -> bool {
+    fn matches<B>(&self, req: &Request<B>, context: &RequestContext) -> bool {
         for predicate in &self.predicates {
             match predicate.evaluate(req, context) {
                 Ok(true) => continue,
@@ -629,8 +649,6 @@ fn build_ant_regex(
 pub struct ReverseProxy {
     routes: Arc<RouteMatcher>,
     preserve_host: bool,
-    http_client: Arc<Client<HttpConnector, Incoming>>,
-    health_check_config: Option<HealthCheckConfig>,
     metrics: Arc<PerformanceMetrics>,
     websocket_config: WebSocketConfig,
     rate_limiter: Arc<RateLimiter>,
@@ -666,6 +684,7 @@ impl ReverseProxy {
         let route = ReverseProxyRouteConfig {
             id: "default".to_string(),
             target: target_url,
+            reverse_proxy_config: reverse_proxy_config.clone(),
             priority: Some(0),
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/**".to_string()],
@@ -691,35 +710,17 @@ impl ReverseProxy {
         reverse_proxy_config: Option<ReverseProxyConfig>,
         websocket_config: Option<WebSocketConfig>,
     ) -> Result<Self, ProxyError> {
-        let pool_config = reverse_proxy_config.unwrap_or_default();
-        let health_check_config = pool_config.health_check.clone();
-        let router = Arc::new(RouteMatcher::new(routes)?);
-
-        let http_client = Self::build_http_client(
+        let router = Arc::new(RouteMatcher::new(
+            routes,
             connect_timeout_secs,
-            pool_config.pool_max_idle_per_host,
-            pool_config.pool_idle_timeout_secs,
-        );
+            reverse_proxy_config,
+        )?);
 
-        info!(
-            "Reverse proxy configuration: {} routes, pool_max_idle_per_host={}, pool_idle_timeout={}s",
-            router.route_count(),
-            pool_config.pool_max_idle_per_host,
-            pool_config.pool_idle_timeout_secs
-        );
-
-        if let Some(ref health_check) = health_check_config {
-            info!(
-                "Health check enabled: interval={}s, timeout={}s, endpoint={:?}",
-                health_check.interval_secs, health_check.timeout_secs, health_check.endpoint
-            );
-        }
+        info!("Reverse proxy configuration: {} routes", router.route_count());
 
         Ok(Self {
             routes: router,
             preserve_host: true,
-            http_client: Arc::new(http_client),
-            health_check_config,
             metrics: Arc::new(PerformanceMetrics::new()),
             websocket_config: websocket_config.unwrap_or_default(),
             rate_limiter: Arc::new(RateLimiter::new(None)),
@@ -779,7 +780,6 @@ impl ReverseProxy {
         Self::handle_request_static(
             req,
             context,
-            self.http_client.clone(),
             self.routes.clone(),
             self.preserve_host,
             Arc::new(self.websocket_config.clone()),
@@ -796,18 +796,12 @@ impl ReverseProxy {
 
         info!("Reverse proxy listening on: {}", addr);
 
-        if let Some(health_check_config) = self.health_check_config.clone() {
-            let http_client = self.http_client.clone();
-            for target_url in self.routes.unique_targets() {
-                let cfg = health_check_config.clone();
-                let client = http_client.clone();
-                tokio::spawn(async move {
-                    Self::health_check_loop(client, target_url, cfg).await;
-                });
-            }
+        for (target_url, client, cfg) in self.routes.routes_with_health_checks() {
+            tokio::spawn(async move {
+                Self::health_check_loop(client, target_url, cfg).await;
+            });
         }
 
-        let http_client = self.http_client.clone();
         let routes = self.routes.clone();
         let preserve_host = self.preserve_host;
         let websocket_config = Arc::new(self.websocket_config.clone());
@@ -820,7 +814,6 @@ impl ReverseProxy {
                 .await
                 .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-            let http_client = http_client.clone();
             let routes = routes.clone();
             let metrics = metrics.clone();
             let websocket_cfg = websocket_config.clone();
@@ -834,7 +827,6 @@ impl ReverseProxy {
                     .serve_connection(
                         io,
                         service_fn(move |req| {
-                            let http_client = http_client.clone();
                             let routes = routes.clone();
                             let client_ip = Some(remote_addr.ip().to_string());
                             let metrics = metrics.clone();
@@ -851,7 +843,6 @@ impl ReverseProxy {
                                 let result = Self::handle_request_static(
                                     req,
                                     context,
-                                    http_client,
                                     routes,
                                     preserve_host,
                                     websocket_cfg,
@@ -884,7 +875,6 @@ impl ReverseProxy {
     async fn handle_request_static(
         req: Request<Incoming>,
         context: RequestContext,
-        http_client: Arc<Client<HttpConnector, Incoming>>,
         routes: Arc<RouteMatcher>,
         preserve_host: bool,
         websocket_config: Arc<WebSocketConfig>,
@@ -925,15 +915,14 @@ impl ReverseProxy {
             return Self::handle_websocket_request(
                 req,
                 context,
-                http_client,
-                selected_route.target.clone(),
+                selected_route,
                 preserve_host,
                 websocket_config,
             )
             .await;
         }
 
-        match Self::process_request_static(req, context, http_client, selected_route.target.clone(), preserve_host)
+        match Self::process_request_static(req, context, selected_route, preserve_host)
         .await
         {
             Ok(response) => Ok(response),
@@ -954,19 +943,19 @@ impl ReverseProxy {
     async fn process_request_static(
         req: Request<Incoming>,
         context: RequestContext,
-        http_client: Arc<Client<HttpConnector, Incoming>>,
-        target_url: Url,
+        selected_route: &CompiledRoute,
         preserve_host: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let prepared = Self::rewrite_backend_request(
             req,
             &context,
-            &target_url,
+            &selected_route.target,
             preserve_host,
             false,
         )?;
 
-        let response = http_client
+        let response = selected_route
+            .http_client
             .request(prepared)
             .await
             .map_err(|e| ProxyError::Http(format!("Failed to forward request: {}", e)))?;
@@ -977,14 +966,16 @@ impl ReverseProxy {
     async fn handle_websocket_request(
         mut req: Request<Incoming>,
         context: RequestContext,
-        http_client: Arc<Client<HttpConnector, Incoming>>,
-        target_url: Url,
+        selected_route: &CompiledRoute,
         preserve_host: bool,
         websocket_config: Arc<WebSocketConfig>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         if let Err(reason) = Self::validate_websocket_headers(req.headers(), &websocket_config) {
             return Ok(ResponseBuilder::error(StatusCode::FORBIDDEN, &reason));
         }
+
+        let target_url = selected_route.target.clone();
+        let http_client = selected_route.http_client.clone();
 
         let client_upgrade = hyper::upgrade::on(&mut req);
         let prepared_request =
@@ -1277,7 +1268,8 @@ impl ReverseProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::body::Incoming;
+    use bytes::Bytes;
+    use http_body_util::Empty;
 
     #[test]
     fn test_reverse_proxy_creation() {
@@ -1299,6 +1291,7 @@ mod tests {
             ReverseProxyRouteConfig {
                 id: "high".to_string(),
                 target: "http://h.example.com".to_string(),
+                reverse_proxy_config: None,
                 priority: Some(1),
                 predicates: vec![RoutePredicateConfig::Path {
                     patterns: vec!["/api/**".to_string()],
@@ -1308,6 +1301,7 @@ mod tests {
             ReverseProxyRouteConfig {
                 id: "low".to_string(),
                 target: "http://l.example.com".to_string(),
+                reverse_proxy_config: None,
                 priority: Some(5),
                 predicates: vec![RoutePredicateConfig::Path {
                     patterns: vec!["/**".to_string()],
@@ -1315,12 +1309,12 @@ mod tests {
                 }],
             },
         ];
-        let matcher = RouteMatcher::new(routes).unwrap();
+        let matcher = RouteMatcher::new(routes, 10, None).unwrap();
 
         let req = Request::builder()
             .method(Method::GET)
             .uri("/api/users")
-            .body(Incoming::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap();
         let route = matcher
             .select_route(&req, &RequestContext { client_ip: None })
@@ -1334,6 +1328,7 @@ mod tests {
             ReverseProxyRouteConfig {
                 id: "a".to_string(),
                 target: "http://a.example.com".to_string(),
+                reverse_proxy_config: None,
                 priority: Some(0),
                 predicates: vec![
                     RoutePredicateConfig::Path {
@@ -1349,6 +1344,7 @@ mod tests {
             ReverseProxyRouteConfig {
                 id: "b".to_string(),
                 target: "http://b.example.com".to_string(),
+                reverse_proxy_config: None,
                 priority: Some(0),
                 predicates: vec![
                     RoutePredicateConfig::Path {
@@ -1362,11 +1358,11 @@ mod tests {
                 ],
             },
         ];
-        let matcher = RouteMatcher::new(routes).unwrap();
+        let matcher = RouteMatcher::new(routes, 10, None).unwrap();
         let req = Request::builder()
             .method(Method::GET)
             .uri("/anything")
-            .body(Incoming::empty())
+            .body(Empty::<Bytes>::new())
             .unwrap();
         let first = matcher
             .select_route(&req, &RequestContext { client_ip: None })

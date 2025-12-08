@@ -1,11 +1,34 @@
 {
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:8888",
-  "reverse_proxy_target": "http://127.0.0.1:3030",
-  "reverse_proxy_config": {
-    "pool_max_idle_per_host": 1,
-    "pool_idle_timeout_secs": 90
-  },
+  "reverse_proxy_routes": [
+    {
+      "id": "primary-api",
+      "target": "http://127.0.0.1:3030",
+      "priority": 0,
+      "reverse_proxy_config": {
+        "pool_max_idle_per_host": 4,
+        "pool_idle_timeout_secs": 120
+      },
+      "predicates": [
+        { "type": "Host", "patterns": ["api.internal"] },
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true },
+        { "type": "Method", "methods": ["GET", "POST", "PUT", "DELETE"] }
+      ]
+    },
+    {
+      "id": "static-fallback",
+      "target": "http://127.0.0.1:4040",
+      "priority": 5,
+      "reverse_proxy_config": {
+        "pool_max_idle_per_host": 1,
+        "pool_idle_timeout_secs": 60
+      },
+      "predicates": [
+        { "type": "Path", "patterns": ["/static/**"], "match_trailing_slash": true }
+      ]
+    }
+  ],
   "connect_timeout_secs": 10,
   "idle_timeout_secs": 90,
   "monitoring": {

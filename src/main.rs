@@ -1,7 +1,7 @@
 use clap::Parser;
-use log::{info, error, debug};
+use log::{info, error};
 use bifrost_bridge::{
-    config::{Config, ProxyMode, ReverseProxyRouteConfig, RoutePredicateConfig},
+    config::{Config, ProxyMode},
     logging,
     proxy::ProxyFactory,
     secrets::{config_has_encrypted_values, SecretManager},

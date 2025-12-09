@@ -7,9 +7,19 @@
       "target": "http://localhost:8080",
       "priority": 0,
       "predicates": [
-        { "type": "Host", "patterns": ["api.local.test"] },
-        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
-      ]
+        {
+          "type": "Path",
+          "patterns": [
+            "/test/**"
+          ],
+          "match_trailing_slash": true
+        }
+      ],
+      "reverse_proxy_config": {
+        "pool_max_idle_per_host": 0,
+        "pool_idle_timeout_secs": 2
+      },
+      "strip_path_prefix": "/test"
     }
   ],
   "max_connections": 1000,

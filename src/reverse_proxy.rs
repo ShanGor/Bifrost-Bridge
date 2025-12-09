@@ -52,6 +52,7 @@ struct CompiledRoute {
     target: Url,
     http_client: Arc<Client<HttpConnector, Incoming>>,
     health_check_config: Option<HealthCheckConfig>,
+    strip_path_prefix: Option<String>,
     priority: i32,
     predicates: Vec<Predicate>,
     weight: Option<WeightMeta>,
@@ -142,6 +143,7 @@ impl RouteMatcher {
                 target,
                 http_client,
                 health_check_config,
+                strip_path_prefix: cfg.strip_path_prefix,
                 priority: cfg.priority.unwrap_or(0),
                 predicates,
                 weight: weight_meta,
@@ -685,6 +687,7 @@ impl ReverseProxy {
             id: "default".to_string(),
             target: target_url,
             reverse_proxy_config: reverse_proxy_config.clone(),
+            strip_path_prefix: None,
             priority: Some(0),
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/**".to_string()],
@@ -952,6 +955,7 @@ impl ReverseProxy {
             &selected_route.target,
             preserve_host,
             false,
+            selected_route.strip_path_prefix.as_deref(),
         )?;
 
         let response = selected_route
@@ -979,7 +983,14 @@ impl ReverseProxy {
 
         let client_upgrade = hyper::upgrade::on(&mut req);
         let prepared_request =
-            match Self::rewrite_backend_request(req, &context, &target_url, preserve_host, true) {
+            match Self::rewrite_backend_request(
+                req,
+                &context,
+                &target_url,
+                preserve_host,
+                true,
+                selected_route.strip_path_prefix.as_deref(),
+            ) {
                 Ok(request) => request,
                 Err(e) => {
                     error!("WebSocket request rewrite failed: {}", e);
@@ -1088,16 +1099,41 @@ impl ReverseProxy {
         target_url: &Url,
         preserve_host: bool,
         keep_upgrade: bool,
+        strip_path_prefix: Option<&str>,
     ) -> Result<Request<Incoming>, ProxyError> {
         let path_and_query = req
             .uri()
             .path_and_query()
             .ok_or_else(|| ProxyError::Config("Invalid URI path".to_string()))?;
 
+        let raw = path_and_query.as_str();
+        let (raw_path, raw_query) = raw
+            .split_once('?')
+            .map(|(p, q)| (p, Some(q)))
+            .unwrap_or((raw, None));
+
+        let mut path = raw_path.to_string();
+        if let Some(prefix) = strip_path_prefix {
+            if path.starts_with(prefix) {
+                path = path[prefix.len()..].to_string();
+                if path.is_empty() {
+                    path = "/".to_string();
+                } else if !path.starts_with('/') {
+                    path = format!("/{}", path);
+                }
+            }
+        }
+
+        let new_path_and_query = if let Some(query) = raw_query {
+            format!("{}?{}", path, query)
+        } else {
+            path
+        };
+
         let target_url_string = format!(
             "{}{}",
             target_url.as_str().trim_end_matches('/'),
-            path_and_query.as_str()
+            new_path_and_query
         );
 
         let target_uri: Uri = target_url_string

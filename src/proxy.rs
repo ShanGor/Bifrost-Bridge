@@ -92,7 +92,7 @@ impl ProxyFactory {
             ProxyMode::Reverse => {
                 info!("Initializing Reverse Proxy mode");
 
-                let reverse_routes = config.reverse_proxy_routes.clone().unwrap_or_default();
+                let reverse_routes = config.reverse_proxy_routes.clone();
                 if config.static_files.is_some() && config.reverse_proxy_target.is_none() && reverse_routes.is_empty() {
                     info!("Static files only mode (no reverse proxy target)");
                     let static_config = config.static_files.unwrap();
@@ -165,7 +165,7 @@ impl ProxyFactory {
                         .unwrap_or(90);
                     let max_connection_lifetime_secs = config.max_connection_lifetime_secs
                         .unwrap_or(300);
-                    let reverse_routes = config.reverse_proxy_routes.clone().unwrap_or_default();
+                    let reverse_routes = config.reverse_proxy_routes.clone();
                     let proxy = if !reverse_routes.is_empty() {
                         info!("Reverse proxy routes: {}", reverse_routes.len());
                         ReverseProxy::new_with_routes(

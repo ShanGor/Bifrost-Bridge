@@ -283,6 +283,9 @@ pub struct ReverseProxyRouteConfig {
     /// Optional reverse proxy connection config for this route
     #[serde(default)]
     pub reverse_proxy_config: Option<ReverseProxyConfig>,
+    /// Optional path prefix to strip before forwarding (e.g., "/test" -> "/api")
+    #[serde(default)]
+    pub strip_path_prefix: Option<String>,
     /// Optional priority (lower number = higher priority). Defaults to 0.
     #[serde(default)]
     pub priority: Option<i32>,
@@ -293,7 +296,7 @@ pub struct ReverseProxyRouteConfig {
 
 /// Predicate configuration for reverse proxy routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type")]
 pub enum RoutePredicateConfig {
     /// Path matching using Ant-style patterns (supports ** and *)
     Path {
@@ -502,7 +505,7 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub reverse_proxy_target: Option<String>,
     #[serde(default)]
-    pub reverse_proxy_routes: Option<Vec<ReverseProxyRouteConfig>>,
+    pub reverse_proxy_routes: Vec<ReverseProxyRouteConfig>,
     pub max_connections: Option<usize>,
     // New timeout configurations
     #[serde(default)]
@@ -567,7 +570,7 @@ impl Default for Config {
             mode: ProxyMode::Forward,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             reverse_proxy_target: None,
-            reverse_proxy_routes: None,
+            reverse_proxy_routes: Vec::new(),
             max_connections: Some(1000),
             connect_timeout_secs: Some(10),
             idle_timeout_secs: Some(90),

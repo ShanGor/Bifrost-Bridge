@@ -1,7 +1,7 @@
 use clap::Parser;
-use log::{info, error};
+use log::{info, error, debug};
 use bifrost_bridge::{
-    config::{Config, ProxyMode},
+    config::{Config, ProxyMode, ReverseProxyRouteConfig, RoutePredicateConfig},
     logging,
     proxy::ProxyFactory,
     secrets::{config_has_encrypted_values, SecretManager},
@@ -336,7 +336,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         mode,
         listen_addr,
         reverse_proxy_target: args.target.clone(),
-        reverse_proxy_routes: None,
+        reverse_proxy_routes: Vec::new(),
         max_connections: Some(1000),
         connect_timeout_secs: args.connect_timeout,
         idle_timeout_secs: args.idle_timeout,
@@ -427,7 +427,13 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     match config.mode {
         ProxyMode::Reverse => {
             let has_target = config.reverse_proxy_target.is_some();
-            let has_routes = config.reverse_proxy_routes.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+            let has_routes = !config.reverse_proxy_routes.is_empty();
+            info!(
+                "Reverse proxy validation: target_present={}, routes_count={}, static_files={}",
+                has_target,
+                config.reverse_proxy_routes.len(),
+                config.static_files.is_some()
+            );
             if !has_target && !has_routes && config.static_files.is_none() {
                 return Err("Reverse proxy mode requires either a target URL, reverse_proxy_routes, or static files configuration".into());
             }
@@ -466,4 +472,34 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    use super::*;
+
+    #[test]
+    fn reverse_mode_accepts_routes_without_target() {
+        let route = ReverseProxyRouteConfig {
+            id: "test".to_string(),
+            target: "http://localhost:3000".to_string(),
+            reverse_proxy_config: None,
+            priority: Some(0),
+            predicates: vec![RoutePredicateConfig::Path {
+                patterns: vec!["/**".to_string()],
+                match_trailing_slash: true,
+            }],
+        };
+
+        let config = Config {
+            mode: ProxyMode::Reverse,
+            listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            reverse_proxy_target: None,
+            reverse_proxy_routes: vec![route],
+            static_files: None,
+            ..Default::default()
+        };
+
+        assert!(validate_config(&config).is_ok());
+    }
 }

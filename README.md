@@ -186,7 +186,7 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 \
     "worker_threads": 8
   }
 }
-
+```
 ### Configuration File
 
 Create a JSON configuration file:
@@ -273,28 +273,44 @@ cargo run -- --mode forward --listen 127.0.0.1:8080
 
 ## Reverse Proxy (反向代理)
 
-The reverse proxy mode routes incoming requests to backend servers. This is similar to Nginx reverse proxy functionality.
+The reverse proxy mode routes incoming requests to backend servers. Use predicate-based routes (similar to Spring Cloud Gateway) to target different upstreams.
 
-### Usage Example
+### Usage Example (predicate routes)
 
-1. Start the reverse proxy:
-```bash
-cargo run -- --mode reverse --listen 127.0.0.1:8080 --target http://localhost:3000
+```json
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "reverse_proxy_routes": [
+    {
+      "id": "api",
+      "target": "http://localhost:3000",
+      "strip_path_prefix": "/api",
+      "predicates": [
+        { "type": "Path", "patterns": ["/api/{segment}", "/api/**"], "match_trailing_slash": true }
+      ]
+    },
+    {
+      "id": "docs",
+      "target": "http://localhost:4000",
+      "predicates": [
+        { "type": "Host", "patterns": ["docs.local"] },
+        { "type": "Path", "patterns": ["/docs/**"], "match_trailing_slash": true }
+      ]
+    }
+  ]
+}
 ```
 
-2. Access services through the proxy at `http://127.0.0.1:8080`
-
-3. Requests will be forwarded to the backend server
+Run with `cargo run -- --mode reverse --listen 127.0.0.1:8080 -c your-config.json`.
 
 ### Features
 
-- HTTP reverse proxying
-- URL rewriting
-- X-Forwarded-* headers
-- Host header preservation
-- Connection pooling
-- Static file serving
-- SPA (Single Page Application) support
+- Predicate-based routing (Path/Host/Method/Header/etc.) with priorities and weights
+- Optional path-prefix stripping per route
+- X-Forwarded-* headers and host preservation
+- Connection pooling (per route) and health checks
+- Static file serving + SPA support
 
 ### Headers Added
 

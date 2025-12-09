@@ -116,7 +116,8 @@ cargo run -- --help
 | `listen_addr` | String | Server listen address | `"127.0.0.1:8080"` |
 | `max_connections` | Number | Maximum concurrent connections | `1000` |
 | `timeout_secs` | Number | Connection timeout in seconds | `30` |
-| `reverse_proxy_target` | String | Target URL for reverse proxy | `null` |
+| `reverse_proxy_target` | String | Legacy single target for reverse proxy (use `reverse_proxy_routes` instead) | `null` |
+| `reverse_proxy_routes` | Array | Route list for reverse proxy (id, target, predicates, optional strip/pooling) | `[]` |
 | `static_files` | Object | Static file serving configuration | `null` |
 | `private_key` | String | Path to PKCS#8 PEM format private key file for HTTPS | `null` |
 | `certificate` | String | Path to PEM format certificate file for HTTPS | `null` |
@@ -141,6 +142,50 @@ cargo run -- --help
   }
 }
 ```
+
+## 🔀 Reverse Proxy Routes (Predicate-Based)
+
+Use `reverse_proxy_routes` to configure multiple upstream targets with predicate-driven matching (similar to Spring Cloud Gateway). Each route requires an `id`, `target`, and at least one predicate.
+
+### Route Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | String | ✅ Yes | Unique route id |
+| `target` | String | ✅ Yes | Upstream URL |
+| `predicates` | Array | ✅ Yes | One or more predicates (all must pass) |
+| `priority` | Number | ❌ No | Lower wins; ties use declaration order |
+| `reverse_proxy_config` | Object | ❌ No | Per-route pooling/health checks |
+| `strip_path_prefix` | String | ❌ No | Remove prefix before forwarding (e.g., `"/test"` → `/api`) |
+
+### Supported Predicates
+- `Path` with `patterns` (Ant-style, supports `**`, `{segment}`) and `match_trailing_slash`
+- `Host` with patterns (Ant-style)
+- `Method` list (e.g., `["GET","POST"]`)
+- `Header`, `Query`, `Cookie` (exact or regex)
+- `RemoteAddr` (CIDRs)
+- `After`, `Before`, `Between` (ISO-8601 timestamps)
+- `Weight` (group + weight for weighted selection)
+
+### Route Example (two patterns, prefix strip)
+```json
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "reverse_proxy_routes": [
+    {
+      "id": "api",
+      "target": "http://backend:8080",
+      "strip_path_prefix": "/api",
+      "predicates": [
+        { "type": "Path", "patterns": ["/api/{segment}", "/api/**"], "match_trailing_slash": true }
+      ]
+    }
+  ]
+}
+```
+
+`reverse_proxy_target` remains supported for single-target setups, but `reverse_proxy_routes` is preferred for predicate-based routing.
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|

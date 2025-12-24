@@ -89,6 +89,19 @@ fn should_use_no_cache_for_spa(file_path: &Path, spa_mode: bool, is_spa_fallback
     is_no_cache_file(file_path, no_cache_files)
 }
 
+fn normalize_mount_path(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[derive(Clone)]
 pub struct StaticFileHandler {
     // Pre-computed mount information for faster lookup
@@ -110,14 +123,16 @@ impl StaticFileHandler {
         let mut mounts = Vec::new();
 
         for mount in &config.mounts {
-            let resolved_mount = mount.resolve_inheritance(&config);
+            let mut resolved_mount = mount.resolve_inheritance(&config);
+            resolved_mount.path = normalize_mount_path(&resolved_mount.path);
             let root_path = Path::new(&resolved_mount.root_dir).canonicalize()
                 .map_err(|e| ProxyError::Config(format!("Invalid root directory '{}': {}", resolved_mount.root_dir, e)))?;
+            let path_len = resolved_mount.path.len();
 
             mounts.push(MountInfo {
                 resolved_mount,
                 root_path,
-                path_len: mount.path.len(),
+                path_len,
             });
         }
 
@@ -176,14 +191,21 @@ impl StaticFileHandler {
 
     pub fn find_mount_for_path(&self, path: &str) -> Option<(&MountInfo, String)> {
         for mount_info in &self.mounts {
-            if path.starts_with(&mount_info.resolved_mount.path) {
-                let relative_path = if mount_info.resolved_mount.path == "/" {
-                    path.to_string()
-                } else {
-                    path[mount_info.resolved_mount.path.len()..].to_string()
-                };
-                return Some((mount_info, relative_path));
+            let mount_path = mount_info.resolved_mount.path.as_str();
+            if mount_path == "/" {
+                return Some((mount_info, path.to_string()));
             }
+
+            if !path.starts_with(mount_path) {
+                continue;
+            }
+
+            let remainder = &path[mount_path.len()..];
+            if !remainder.is_empty() && !remainder.starts_with('/') {
+                continue;
+            }
+
+            return Some((mount_info, remainder.to_string()));
         }
         None
     }
@@ -448,7 +470,7 @@ impl StaticFileHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StaticFileConfig;
+    use crate::config::{StaticFileConfig, StaticMount};
 
     #[test]
     fn test_mime_type_detection() {
@@ -483,5 +505,25 @@ mod tests {
         let (mount_info, relative_path) = handler_multi.find_mount_for_path("/some/file.txt").unwrap();
         assert_eq!(mount_info.resolved_mount.path, "/");
         assert_eq!(relative_path, "/some/file.txt");
+    }
+
+    #[test]
+    fn test_mount_prefix_boundary() {
+        let mut config = StaticFileConfig::single("test-temp".to_string(), false);
+        config.mounts = vec![StaticMount {
+            path: "/static/".to_string(),
+            root_dir: "test-temp".to_string(),
+            enable_directory_listing: None,
+            index_files: None,
+            spa_mode: None,
+            spa_fallback_file: None,
+            no_cache_files: None,
+            cache_millisecs: None,
+        }];
+
+        let handler = StaticFileHandler::new(config).expect("Failed to create handler");
+        assert!(handler.find_mount_for_path("/static").is_some());
+        assert!(handler.find_mount_for_path("/static/file.txt").is_some());
+        assert!(handler.find_mount_for_path("/static-api/file.txt").is_none());
     }
 }

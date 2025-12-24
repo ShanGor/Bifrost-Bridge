@@ -28,6 +28,7 @@ This directory contains bug reports and their fixing status for the Bifrost Brid
 | Bug ID | Title | Severity | Status | Date Reported | Date Fixed |
 |--------|-------|----------|---------|--------------|------------|
 | [B001](./2025-01-17-spa-cache-bug.md) | SPA cache control for index files and fallbacks | Medium | 🟢 Fixed | 2025-01-17 | 2025-01-17 |
+| [B002](./2025-12-24-static-mount-prefix-routing.md) | Static mount prefix collision bypasses reverse proxy routes | High | Fixed | 2025-12-24 | 2025-12-24 |
 | [NB001](./2025-01-18-chrome-extension-cache-control.md) | Chrome extension cache control behavior | Information | 🟢 Not a Bug | 2025-01-18 | 2025-01-17 |
 | [NB002](./2025-11-21-tls-warning-log-level.md) | TLS warning log level for certificate alerts | Information | 🟢 Not a Bug | 2025-11-21 | 2025-11-21 |
 |  |  |  | *(✅ Resolved)* |  | |

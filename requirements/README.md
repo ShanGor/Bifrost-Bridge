@@ -28,8 +28,10 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R018](R018-rate-limiting.md) | Rate Limiting | Configurable per-IP throttling with tiered rules | 2025-11-19 |
 | [R021](R021-tokio-worker-threads.md) | Tokio Worker Threads for Static Files | Implement Tokio-based threading for CPU-intensive static file operations | 2025-11-16 |
 | [R022](R022-advanced-cache-control.md) | Advanced Cache Control Configuration | Add flexible cache control with no_cache_files patterns and configurable cache duration | 2025-01-17 |
+| [R023](R023-connection-pooling-optimization.md) | Connection Pooling Optimization | Optimize forward/reverse pooling and health checks | 2025-01-18 |
 | [R024](R024-secret-encryption.md) | Encrypted Secret Management | Add key generation + encrypted secrets workflow for configurations | 2025-02-14 |
 | [R025](R025-reverse-proxy-requirements.md) | Reverse Proxy Request Routing | Multi-route reverse proxy with predicate-based matching | 2025-02-21 |
+| [R026](R026-multi-target-reverse-proxy.md) | Multi-target reverse proxy routing | Load balancing and sticky routing across multiple upstreams | 2025-02-25 |
 
 ### 📝 **Pending Requirements**
 
@@ -70,7 +72,9 @@ requirements/
 ├── R021-tokio-worker-threads.md       # Detailed requirement
 ├── R022-advanced-cache-control.md      # Detailed requirement
 ├── R023-connection-pooling-optimization.md # Detailed requirement
-└── R024-secret-encryption.md           # Detailed requirement
+│   ├── R024-secret-encryption.md           # Detailed requirement
+│   ├── R025-reverse-proxy-requirements.md  # Detailed requirement
+│   └── R026-multi-target-reverse-proxy.md  # Detailed requirement
 ```
 
 ## 📚 How to Use This Documentation
@@ -89,6 +93,6 @@ requirements/
 
 ---
 
-**Last Updated:** 2025-02-21
+**Last Updated:** 2025-02-25
 **Maintainer:** Development Team
-**Total Requirements:** 24 (22 Completed, 2 Pending)
+**Total Requirements:** 26 (24 Completed, 2 Pending)

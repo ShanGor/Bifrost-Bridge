@@ -273,13 +273,107 @@ impl Default for ReverseProxyConfig {
     }
 }
 
+fn default_target_weight() -> u32 {
+    1
+}
+
+fn default_target_enabled() -> bool {
+    true
+}
+
+/// Reverse proxy target configuration for multi-target routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReverseProxyTargetConfig {
+    /// Unique target id (within the route)
+    pub id: String,
+    /// Upstream target URL
+    pub url: String,
+    /// Optional weight for weighted routing (>= 1)
+    #[serde(default = "default_target_weight")]
+    pub weight: u32,
+    /// Optional flag to disable the target
+    #[serde(default = "default_target_enabled")]
+    pub enabled: bool,
+}
+
+/// Load balancing configuration for multi-target routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadBalancingConfig {
+    #[serde(default)]
+    pub policy: LoadBalancingPolicy,
+}
+
+impl Default for LoadBalancingConfig {
+    fn default() -> Self {
+        Self {
+            policy: LoadBalancingPolicy::RoundRobin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingPolicy {
+    RoundRobin,
+    WeightedRoundRobin,
+    LeastConnections,
+    Random,
+}
+
+impl Default for LoadBalancingPolicy {
+    fn default() -> Self {
+        LoadBalancingPolicy::RoundRobin
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StickyMode {
+    Cookie,
+    Header,
+    SourceIp,
+}
+
+/// Sticky session configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StickyConfig {
+    pub mode: StickyMode,
+    #[serde(default)]
+    pub cookie_name: Option<String>,
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+/// Header override routing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderOverrideConfig {
+    pub header_name: String,
+    #[serde(default)]
+    pub allowed_values: std::collections::HashMap<String, String>,
+}
+
 /// Reverse proxy route configuration supporting multiple targets and predicates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseProxyRouteConfig {
     /// Unique route id
     pub id: String,
     /// Upstream target URL
-    pub target: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Multi-target configuration (preferred when set)
+    #[serde(default)]
+    pub targets: Vec<ReverseProxyTargetConfig>,
+    /// Optional load balancing policy for multi-target routing
+    #[serde(default)]
+    pub load_balancing: Option<LoadBalancingConfig>,
+    /// Optional sticky session configuration
+    #[serde(default)]
+    pub sticky: Option<StickyConfig>,
+    /// Optional header override routing
+    #[serde(default)]
+    pub header_override: Option<HeaderOverrideConfig>,
     /// Optional reverse proxy connection config for this route
     #[serde(default)]
     pub reverse_proxy_config: Option<ReverseProxyConfig>,

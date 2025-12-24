@@ -9,6 +9,7 @@ This guide covers all configuration options for the proxy server, including comm
 - [Static File Configuration](#static-file-configuration)
 - [Multiple Mount Points](#multiple-mount-points)
 - [Configuration Inheritance](#configuration-inheritance)
+- [Multi-Target Reverse Proxy Routing](#multi-target-reverse-proxy-routing)
 - [Reverse Proxy Headers](#reverse-proxy-headers)
 - [Examples](#examples)
 
@@ -145,7 +146,7 @@ cargo run -- --help
 
 ## 🔀 Reverse Proxy Routes (Predicate-Based)
 
-Use `reverse_proxy_routes` to configure multiple upstream targets with predicate-driven matching (similar to Spring Cloud Gateway). Each route requires an `id`, `target`, and at least one predicate.
+Use `reverse_proxy_routes` to configure multiple upstream targets with predicate-driven matching (similar to Spring Cloud Gateway). Each route requires an `id`, at least one predicate, and either `target` (single target) or `targets` (multi-target).
 
 ### Route Fields
 
@@ -184,6 +185,93 @@ Use `reverse_proxy_routes` to configure multiple upstream targets with predicate
   ]
 }
 ```
+
+## Multi-Target Reverse Proxy Routing
+
+Multi-target routing selects a target within a matched route using this order:
+1) Header override (if configured and allowed)
+2) Sticky selection (if configured and key present)
+3) Load balancing policy
+
+### Target Fields
+
+```json
+{
+  "id": "api-a",
+  "url": "http://10.0.0.10:8080",
+  "weight": 3,
+  "enabled": true
+}
+```
+
+| Field | Type | Required | Description | When to use |
+|-------|------|----------|-------------|-------------|
+| `id` | String | Yes | Unique target id within the route | Required for sticky/header override lookups |
+| `url` | String | Yes | Absolute upstream URL | Required for every target |
+| `weight` | Number | No | Weight for `weighted_round_robin` (>= 1, default 1) | Use to bias traffic to larger instances |
+| `enabled` | Boolean | No | Enable/disable the target (default true) | Use to drain an instance without deleting config |
+
+### Load Balancing Policies
+
+```json
+{ "load_balancing": { "policy": "round_robin" } }
+```
+
+| Policy | Behavior | When to use |
+|--------|----------|-------------|
+| `round_robin` | Cycles across healthy targets | Default choice for similar backends |
+| `weighted_round_robin` | Uses target weights for selection | Gradual rollout or uneven capacity |
+| `least_connections` | Picks target with fewest in-flight requests | Spiky or uneven request cost |
+| `random` | Random healthy target | Simple fallback or large pools |
+
+### Sticky Sessions
+
+```json
+{
+  "sticky": {
+    "mode": "cookie",
+    "cookie_name": "BIFROST_STICKY",
+    "ttl_seconds": 3600
+  }
+}
+```
+
+| Field | Type | Required | Description | When to use |
+|-------|------|----------|-------------|-------------|
+| `mode` | String | Yes | `cookie`, `header`, or `source_ip` | Choose a stable client key |
+| `cookie_name` | String | Conditional | Cookie name for `cookie` mode | Browser sessions that must stay on one node |
+| `header_name` | String | Conditional | Header name for `header` mode | API clients that provide a stable header |
+| `ttl_seconds` | Number | No | Cookie max-age (seconds) | Limit stickiness duration |
+
+Sticky cookie mode stores the selected target id in a cookie. If the cookie is missing or invalid,
+the proxy selects a target using the load-balancing policy and sets a new cookie.
+
+### Header Override Routing
+
+```json
+{
+  "header_override": {
+    "header_name": "X-Bifrost-Target",
+    "allowed_values": {
+      "canary": "api-b"
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description | When to use |
+|-------|------|----------|-------------|-------------|
+| `header_name` | String | Yes | Header used for override matching | Canary, region, or debug routing |
+| `allowed_values` | Object | Yes | Map of header value -> target id | Restrict overrides to trusted values |
+
+Header override is evaluated before sticky or load balancing. If the header is present but unmapped
+or points to an unhealthy target, normal selection applies.
+
+Example configs in `examples/`:
+- `examples/config_reverse_multi_targets_round_robin.json` for a basic round-robin pool
+- `examples/config_reverse_multi_targets_weighted.json` for uneven capacity rollout
+- `examples/config_reverse_multi_targets_least_connections.json` for uneven request cost
+- `examples/config_reverse_multi_targets_sticky_header_override.json` for sticky + header override
 
 `reverse_proxy_target` remains supported for single-target setups, but `reverse_proxy_routes` is preferred for predicate-based routing.
 

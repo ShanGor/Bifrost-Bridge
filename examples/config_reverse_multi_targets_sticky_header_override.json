@@ -1,0 +1,29 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "reverse_proxy_routes": [
+    {
+      "id": "api",
+      "predicates": [
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
+      ],
+      "targets": [
+        { "id": "api-a", "url": "http://127.0.0.1:9001" },
+        { "id": "api-b", "url": "http://127.0.0.1:9002" },
+        { "id": "api-canary", "url": "http://127.0.0.1:9003" }
+      ],
+      "load_balancing": { "policy": "round_robin" },
+      "sticky": {
+        "mode": "cookie",
+        "cookie_name": "BIFROST_STICKY",
+        "ttl_seconds": 3600
+      },
+      "header_override": {
+        "header_name": "X-Bifrost-Target",
+        "allowed_values": {
+          "canary": "api-canary"
+        }
+      }
+    }
+  ]
+}

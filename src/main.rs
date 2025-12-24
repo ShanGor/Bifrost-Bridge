@@ -477,13 +477,19 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod config_validation_tests {
     use super::*;
+    use bifrost_bridge::config::{ReverseProxyRouteConfig, RoutePredicateConfig};
 
     #[test]
     fn reverse_mode_accepts_routes_without_target() {
         let route = ReverseProxyRouteConfig {
             id: "test".to_string(),
-            target: "http://localhost:3000".to_string(),
+            target: Some("http://localhost:3000".to_string()),
+            targets: Vec::new(),
+            load_balancing: None,
+            sticky: None,
+            header_override: None,
             reverse_proxy_config: None,
+            strip_path_prefix: None,
             priority: Some(0),
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/**".to_string()],

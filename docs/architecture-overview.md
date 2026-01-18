@@ -4,6 +4,8 @@ This document explains how Bifrost Bridge is structured today. The binary launch
 runtime, loads configuration from the CLI/JSON file, and creates the single proxy adapter that matches
 the requested mode.
 
+If a term like adapter, route, or rate limiting is unfamiliar, see the [glossary](./glossary.md).
+
 ```mermaid
 flowchart TD
     subgraph Runtime["Tokio Runtime (multi-threaded)"]

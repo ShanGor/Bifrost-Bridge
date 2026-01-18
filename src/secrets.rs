@@ -414,11 +414,22 @@ pub fn config_has_encrypted_values(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
+
+    fn secure_temp_root() -> TempDir {
+        let dir = tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(dir.path(), perms).unwrap();
+        }
+        dir
+    }
 
     #[test]
     fn init_and_round_trip_encryption() {
-        let dir = tempdir().unwrap();
+        let dir = secure_temp_root();
         let manager = SecretManager::with_root(dir.path().to_path_buf()).unwrap();
         manager.init_encryption_key(false).unwrap();
 
@@ -431,7 +442,7 @@ mod tests {
 
     #[test]
     fn decrypt_option_field_updates_value() {
-        let dir = tempdir().unwrap();
+        let dir = secure_temp_root();
         let manager = SecretManager::with_root(dir.path().to_path_buf()).unwrap();
         manager.init_encryption_key(false).unwrap();
 

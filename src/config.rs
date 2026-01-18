@@ -352,6 +352,41 @@ pub struct HeaderOverrideConfig {
     pub header_name: String,
     #[serde(default)]
     pub allowed_values: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub allowed_groups: std::collections::HashMap<String, Vec<String>>,
+}
+
+fn default_retry_max_attempts() -> u32 {
+    1
+}
+
+fn default_retry_on_connect_error() -> bool {
+    true
+}
+
+fn default_retry_methods() -> Vec<String> {
+    vec![
+        "GET".to_string(),
+        "HEAD".to_string(),
+        "OPTIONS".to_string(),
+    ]
+}
+
+/// Retry policy for reverse proxy routes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicyConfig {
+    /// Total attempts including the initial request
+    #[serde(default = "default_retry_max_attempts")]
+    pub max_attempts: u32,
+    /// Retry when connection errors occur before a response is received
+    #[serde(default = "default_retry_on_connect_error")]
+    pub retry_on_connect_error: bool,
+    /// Retry when the upstream responds with one of these status codes
+    #[serde(default)]
+    pub retry_on_statuses: Vec<u16>,
+    /// Allowed HTTP methods for retries (defaults to safe methods)
+    #[serde(default = "default_retry_methods")]
+    pub methods: Vec<String>,
 }
 
 /// Reverse proxy route configuration supporting multiple targets and predicates
@@ -374,6 +409,9 @@ pub struct ReverseProxyRouteConfig {
     /// Optional header override routing
     #[serde(default)]
     pub header_override: Option<HeaderOverrideConfig>,
+    /// Optional retry policy for upstream failures
+    #[serde(default)]
+    pub retry_policy: Option<RetryPolicyConfig>,
     /// Optional reverse proxy connection config for this route
     #[serde(default)]
     pub reverse_proxy_config: Option<ReverseProxyConfig>,

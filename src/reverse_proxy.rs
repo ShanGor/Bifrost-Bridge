@@ -10,6 +10,7 @@ use crate::error::ProxyError;
 use crate::rate_limit::RateLimiter;
 use chrono::{DateTime, FixedOffset, Utc};
 use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::combinators::BoxBody;
 use hyper::body::{Body as _, Bytes, Incoming};
 use hyper::header::{HeaderName, HOST, ORIGIN};
 use hyper::server::conn::http1::Builder as ServerBuilder;
@@ -24,6 +25,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
+use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +39,9 @@ use url::Url;
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 static X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+
+type BoxError = Box<dyn Error + Send + Sync>;
+type BoxedBody = BoxBody<Bytes, BoxError>;
 
 /// Wrapper to store request data including client IP
 #[derive(Clone, Debug)]
@@ -63,7 +68,7 @@ struct CompiledTarget {
 struct CompiledRoute {
     id: String,
     targets: Vec<CompiledTarget>,
-    http_client: Arc<Client<HttpConnector, Incoming>>,
+    http_client: Arc<Client<HttpConnector, BoxedBody>>,
     health_check_config: Option<HealthCheckConfig>,
     strip_path_prefix: Option<String>,
     priority: i32,
@@ -73,12 +78,43 @@ struct CompiledRoute {
     load_balancing: LoadBalancingPolicy,
     sticky: Option<StickyConfig>,
     header_override: Option<HeaderOverrideConfig>,
+    retry_policy: Option<CompiledRetryPolicy>,
     rr_counter: AtomicU64,
+}
+
+#[derive(Clone)]
+struct CompiledRetryPolicy {
+    max_attempts: u32,
+    retry_on_connect_error: bool,
+    retry_on_statuses: HashSet<StatusCode>,
+    methods: HashSet<Method>,
+}
+
+impl CompiledRetryPolicy {
+    fn allows_method(&self, method: &Method) -> bool {
+        self.methods.contains(method)
+    }
+
+    fn should_retry_status(&self, status: StatusCode) -> bool {
+        self.retry_on_statuses.contains(&status)
+    }
+
+    fn should_retry_error(&self, error: &ProxyError) -> bool {
+        if !self.retry_on_connect_error {
+            return false;
+        }
+        matches!(error, ProxyError::Connection(_) | ProxyError::Hyper(_))
+    }
 }
 
 struct TargetSelection<'a> {
     target: &'a CompiledTarget,
     set_cookie: Option<String>,
+}
+
+enum RequestFailure {
+    Selection(ProxyError),
+    Forward(ProxyError),
 }
 
 struct InflightGuard {
@@ -256,6 +292,22 @@ impl RouteMatcher {
                         )));
                     }
                 }
+                for (group, group_targets) in &header_override.allowed_groups {
+                    if group_targets.is_empty() {
+                        return Err(ProxyError::Config(format!(
+                            "Header override group {} for {} must include at least one target",
+                            group, cfg.id
+                        )));
+                    }
+                    for target_id in group_targets {
+                        if !target_ids.contains(target_id) {
+                            return Err(ProxyError::Config(format!(
+                                "Header override group {} for {} references unknown target {}",
+                                group, cfg.id, target_id
+                            )));
+                        }
+                    }
+                }
             }
 
             if let Some(sticky) = cfg.sticky.as_ref() {
@@ -286,6 +338,46 @@ impl RouteMatcher {
                 }
             }
 
+            let retry_policy = if let Some(retry_policy) = cfg.retry_policy.as_ref() {
+                if retry_policy.max_attempts == 0 {
+                    return Err(ProxyError::Config(format!(
+                        "Route {} retry policy max_attempts must be >= 1",
+                        cfg.id
+                    )));
+                }
+
+                let mut methods = HashSet::new();
+                for method in &retry_policy.methods {
+                    let parsed = Method::from_bytes(method.as_bytes()).map_err(|_| {
+                        ProxyError::Config(format!(
+                            "Route {} retry policy method is invalid: {}",
+                            cfg.id, method
+                        ))
+                    })?;
+                    methods.insert(parsed);
+                }
+
+                let mut retry_on_statuses = HashSet::new();
+                for code in &retry_policy.retry_on_statuses {
+                    let status = StatusCode::from_u16(*code).map_err(|_| {
+                        ProxyError::Config(format!(
+                            "Route {} retry policy status is invalid: {}",
+                            cfg.id, code
+                        ))
+                    })?;
+                    retry_on_statuses.insert(status);
+                }
+
+                Some(CompiledRetryPolicy {
+                    max_attempts: retry_policy.max_attempts,
+                    retry_on_connect_error: retry_policy.retry_on_connect_error,
+                    retry_on_statuses,
+                    methods,
+                })
+            } else {
+                None
+            };
+
             let load_balancing = cfg
                 .load_balancing
                 .clone()
@@ -305,6 +397,7 @@ impl RouteMatcher {
                 load_balancing,
                 sticky: cfg.sticky,
                 header_override: cfg.header_override,
+                retry_policy,
                 rr_counter: AtomicU64::new(0),
             });
         }
@@ -341,7 +434,7 @@ impl RouteMatcher {
 
     fn routes_with_health_checks(
         &self,
-    ) -> Vec<(Url, Arc<Client<HttpConnector, Incoming>>, HealthCheckConfig, Arc<AtomicBool>)> {
+    ) -> Vec<(Url, Arc<Client<HttpConnector, BoxedBody>>, HealthCheckConfig, Arc<AtomicBool>)> {
         let mut entries = Vec::new();
         for route in &self.routes {
             if let Some(cfg) = route.health_check_config.clone() {
@@ -427,18 +520,30 @@ impl RouteMatcher {
 }
 
 impl CompiledRoute {
-    fn select_target<'a>(
+    fn select_target<'a, B>(
         &'a self,
-        req: &Request<Incoming>,
+        req: &Request<B>,
         context: &RequestContext,
     ) -> Result<TargetSelection<'a>, ProxyError> {
-        let healthy_targets: Vec<&CompiledTarget> = self
+        let excluded = HashSet::new();
+        self.select_target_with_exclusions(req, context, &excluded)
+    }
+
+    fn select_target_with_exclusions<'a, B>(
+        &'a self,
+        req: &Request<B>,
+        context: &RequestContext,
+        excluded: &HashSet<String>,
+    ) -> Result<TargetSelection<'a>, ProxyError> {
+        let eligible_targets: Vec<&CompiledTarget> = self
             .targets
             .iter()
-            .filter(|t| t.enabled && t.healthy.load(Ordering::Relaxed))
+            .filter(|t| {
+                t.enabled && t.healthy.load(Ordering::Relaxed) && !excluded.contains(&t.id)
+            })
             .collect();
 
-        if healthy_targets.is_empty() {
+        if eligible_targets.is_empty() {
             return Err(ProxyError::Connection(format!(
                 "No healthy targets available for route {}",
                 self.id
@@ -452,11 +557,25 @@ impl CompiledRoute {
                 .and_then(|v| v.to_str().ok())
             {
                 if let Some(target_id) = header_override.allowed_values.get(value) {
-                    if let Some(target) = healthy_targets
+                    if let Some(target) = eligible_targets
                         .iter()
                         .find(|t| t.id == target_id.as_str())
                         .copied()
                     {
+                        return Ok(TargetSelection {
+                            target,
+                            set_cookie: None,
+                        });
+                    }
+                }
+
+                if let Some(group_targets) = header_override.allowed_groups.get(value) {
+                    let group_targets: Vec<&CompiledTarget> = eligible_targets
+                        .iter()
+                        .filter(|t| group_targets.iter().any(|id| id == &t.id))
+                        .copied()
+                        .collect();
+                    if let Some(target) = self.select_by_policy(&group_targets) {
                         return Ok(TargetSelection {
                             target,
                             set_cookie: None,
@@ -472,7 +591,7 @@ impl CompiledRoute {
                 StickyMode::Cookie => {
                     let cookie_name = sticky.cookie_name.as_ref().unwrap();
                     if let Some(value) = extract_cookie_value(req.headers(), cookie_name) {
-                        if let Some(target) = healthy_targets
+                        if let Some(target) = eligible_targets
                             .iter()
                             .find(|t| t.id == value)
                             .copied()
@@ -494,7 +613,7 @@ impl CompiledRoute {
                         .get(header_name.as_str())
                         .and_then(|v| v.to_str().ok())
                     {
-                        if let Some(target) = self.select_by_hash(value, &healthy_targets) {
+                        if let Some(target) = self.select_by_hash(value, &eligible_targets) {
                             return Ok(TargetSelection {
                                 target,
                                 set_cookie: None,
@@ -504,7 +623,7 @@ impl CompiledRoute {
                 }
                 StickyMode::SourceIp => {
                     if let Some(ip) = context.client_ip.as_deref() {
-                        if let Some(target) = self.select_by_hash(ip, &healthy_targets) {
+                        if let Some(target) = self.select_by_hash(ip, &eligible_targets) {
                             return Ok(TargetSelection {
                                 target,
                                 set_cookie: None,
@@ -515,7 +634,7 @@ impl CompiledRoute {
             }
         }
 
-        let target = self.select_by_policy(&healthy_targets).ok_or_else(|| {
+        let target = self.select_by_policy(&eligible_targets).ok_or_else(|| {
             ProxyError::Connection(format!(
                 "No available targets for route {}",
                 self.id
@@ -1049,6 +1168,7 @@ impl ReverseProxy {
             load_balancing: None,
             sticky: None,
             header_override: None,
+            retry_policy: None,
             reverse_proxy_config: reverse_proxy_config.clone(),
             strip_path_prefix: None,
             priority: Some(0),
@@ -1098,7 +1218,7 @@ impl ReverseProxy {
         connect_timeout_secs: u64,
         pool_max_idle_per_host: usize,
         pool_idle_timeout_secs: u64,
-    ) -> Client<HttpConnector, Incoming> {
+    ) -> Client<HttpConnector, BoxedBody> {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(connect_timeout_secs)));
         connector.set_keepalive(Some(Duration::from_secs(pool_idle_timeout_secs)));
@@ -1277,15 +1397,21 @@ impl ReverseProxy {
             None => return Ok(ResponseBuilder::error(StatusCode::NOT_FOUND, "No matching route")),
         };
 
-        let TargetSelection { target, set_cookie } = match selected_route.select_target(&req, &context) {
-            Ok(selection) => selection,
-            Err(e) => {
-                warn!("Target selection failed for route {}: {}", selected_route.id, e);
-                return Ok(ResponseBuilder::error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()));
-            }
-        };
-
         if is_websocket_upgrade(req.headers()) {
+            let TargetSelection { target, set_cookie } =
+                match selected_route.select_target(&req, &context) {
+                    Ok(selection) => selection,
+                    Err(e) => {
+                        warn!(
+                            "Target selection failed for route {}: {}",
+                            selected_route.id, e
+                        );
+                        return Ok(ResponseBuilder::error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &e.to_string(),
+                        ));
+                    }
+                };
             let mut response = match Self::handle_websocket_request(
                 req,
                 context,
@@ -1306,10 +1432,8 @@ impl ReverseProxy {
             return Ok(response);
         }
 
-        match Self::process_request_static(req, context, selected_route, target, preserve_host)
-            .await
-        {
-            Ok(mut response) => {
+        match Self::process_request_with_retries(req, context, selected_route, preserve_host).await {
+            Ok((mut response, set_cookie)) => {
                 if let Some(cookie) = set_cookie {
                     if let Ok(value) = cookie.parse() {
                         response.headers_mut().append("Set-Cookie", value);
@@ -1317,7 +1441,14 @@ impl ReverseProxy {
                 }
                 Ok(response)
             }
-            Err(e) => {
+            Err(RequestFailure::Selection(e)) => {
+                warn!("Target selection failed for route {}: {}", selected_route.id, e);
+                Ok(ResponseBuilder::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &e.to_string(),
+                ))
+            }
+            Err(RequestFailure::Forward(e)) => {
                 error!("Proxy error: {}", e);
                 let body = Full::new(Bytes::from(format!("Proxy Error: {}", e)));
                 let error_response = Response::builder()
@@ -1348,13 +1479,141 @@ impl ReverseProxy {
             selected_route.strip_path_prefix.as_deref(),
         )?;
 
+        let prepared = Self::box_incoming_request(prepared);
         let response = selected_route
             .http_client
             .request(prepared)
             .await
-            .map_err(|e| ProxyError::Http(format!("Failed to forward request: {}", e)))?;
+            .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
 
         Self::finalize_backend_response(response, false).await
+    }
+
+    async fn process_buffered_request(
+        req: Request<Full<Bytes>>,
+        context: RequestContext,
+        selected_route: &CompiledRoute,
+        selected_target: &CompiledTarget,
+        preserve_host: bool,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+        let _inflight = InflightGuard::new(selected_target.inflight.clone());
+        let prepared = Self::rewrite_backend_request(
+            req,
+            &context,
+            &selected_target.url,
+            preserve_host,
+            false,
+            selected_route.strip_path_prefix.as_deref(),
+        )?;
+
+        let prepared = Self::box_infallible_request(prepared);
+        let response = selected_route
+            .http_client
+            .request(prepared)
+            .await
+            .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
+
+        Self::finalize_backend_response(response, false).await
+    }
+
+    async fn process_request_with_retries(
+        req: Request<Incoming>,
+        context: RequestContext,
+        selected_route: &CompiledRoute,
+        preserve_host: bool,
+    ) -> Result<(Response<Full<Bytes>>, Option<String>), RequestFailure> {
+        let retry_policy = selected_route.retry_policy.as_ref();
+
+        if retry_policy
+            .map(|policy| policy.max_attempts <= 1 || !policy.allows_method(req.method()))
+            .unwrap_or(true)
+        {
+            let TargetSelection { target, set_cookie } =
+                selected_route.select_target(&req, &context).map_err(RequestFailure::Selection)?;
+            let response =
+                Self::process_request_static(req, context, selected_route, target, preserve_host)
+                    .await
+                    .map_err(RequestFailure::Forward)?;
+            return Ok((response, set_cookie));
+        }
+
+        let retry_policy = retry_policy.unwrap();
+        let (parts, body) = req.into_parts();
+        let body_bytes = body.collect().await.map_err(|e| {
+            RequestFailure::Forward(ProxyError::Http(format!(
+                "Failed to collect request body: {}",
+                e
+            )))
+        })?;
+        let body_bytes = body_bytes.to_bytes();
+
+        let mut excluded = HashSet::new();
+        let mut last_error: Option<ProxyError> = None;
+        let mut last_response: Option<(Response<Full<Bytes>>, Option<String>)> = None;
+
+        for attempt in 0..retry_policy.max_attempts {
+            let attempt_request =
+                Request::from_parts(parts.clone(), Full::new(body_bytes.clone()));
+            let selection = match selected_route.select_target_with_exclusions(
+                &attempt_request,
+                &context,
+                &excluded,
+            ) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    if let Some(response) = last_response {
+                        return Ok(response);
+                    }
+                    if let Some(error) = last_error {
+                        return Err(RequestFailure::Forward(error));
+                    }
+                    return Err(RequestFailure::Selection(err));
+                }
+            };
+            let TargetSelection { target, set_cookie } = selection;
+
+            excluded.insert(target.id.clone());
+            let set_cookie_clone = set_cookie.clone();
+
+            match Self::process_buffered_request(
+                attempt_request,
+                context.clone(),
+                selected_route,
+                target,
+                preserve_host,
+            )
+            .await
+            {
+                Ok(response) => {
+                    if retry_policy.should_retry_status(response.status())
+                        && attempt + 1 < retry_policy.max_attempts
+                    {
+                        last_response = Some((response, set_cookie_clone));
+                        continue;
+                    }
+                    return Ok((response, set_cookie));
+                }
+                Err(err) => {
+                    if retry_policy.should_retry_error(&err)
+                        && attempt + 1 < retry_policy.max_attempts
+                    {
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(RequestFailure::Forward(err));
+                }
+            }
+        }
+
+        if let Some(response) = last_response {
+            return Ok(response);
+        }
+
+        Err(RequestFailure::Forward(
+            last_error.unwrap_or_else(|| {
+                ProxyError::Connection("Retry attempts exhausted".to_string())
+            }),
+        ))
     }
 
     async fn handle_websocket_request(
@@ -1391,6 +1650,7 @@ impl ReverseProxy {
                     ));
                 }
             };
+        let prepared_request = Self::box_incoming_request(prepared_request);
 
         let mut backend_response = match http_client.request(prepared_request).await {
             Ok(resp) => resp,
@@ -1486,14 +1746,14 @@ impl ReverseProxy {
         Ok(())
     }
 
-    fn rewrite_backend_request(
-        mut req: Request<Incoming>,
+    fn rewrite_backend_request<B>(
+        mut req: Request<B>,
         context: &RequestContext,
         target_url: &Url,
         preserve_host: bool,
         keep_upgrade: bool,
         strip_path_prefix: Option<&str>,
-    ) -> Result<Request<Incoming>, ProxyError> {
+    ) -> Result<Request<B>, ProxyError> {
         let path_and_query = req
             .uri()
             .path_and_query()
@@ -1569,6 +1829,21 @@ impl ReverseProxy {
         headers.remove("Transfer-Encoding");
     }
 
+    fn box_incoming_request(req: Request<Incoming>) -> Request<BoxedBody> {
+        let (parts, body) = req.into_parts();
+        let body = body.map_err(|err| Box::new(err) as BoxError).boxed();
+        Request::from_parts(parts, body)
+    }
+
+    fn box_infallible_request<B>(req: Request<B>) -> Request<BoxedBody>
+    where
+        B: hyper::body::Body<Data = Bytes, Error = Infallible> + Send + Sync + 'static,
+    {
+        let (parts, body) = req.into_parts();
+        let body = body.map_err(|err| match err {}).boxed();
+        Request::from_parts(parts, body)
+    }
+
     async fn finalize_backend_response(
         response: Response<Incoming>,
         keep_upgrade: bool,
@@ -1602,7 +1877,7 @@ impl ReverseProxy {
 
     /// Health check loop (runs in background)
     async fn health_check_loop(
-        http_client: Arc<Client<HttpConnector, Incoming>>,
+        http_client: Arc<Client<HttpConnector, BoxedBody>>,
         target_url: Url,
         config: HealthCheckConfig,
         healthy: Arc<AtomicBool>,
@@ -1656,7 +1931,7 @@ impl ReverseProxy {
 
     /// HTTP endpoint health check
     async fn http_health_check(
-        _http_client: &Client<HttpConnector, Incoming>,
+        _http_client: &Client<HttpConnector, BoxedBody>,
         target_url: &Url,
         endpoint: &str,
         timeout: Duration,
@@ -1702,6 +1977,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Empty;
+    use std::collections::{HashMap, HashSet};
+    use crate::config::RetryPolicyConfig;
 
     #[test]
     fn test_reverse_proxy_creation() {
@@ -1727,6 +2004,7 @@ mod tests {
                 load_balancing: None,
                 sticky: None,
                 header_override: None,
+                retry_policy: None,
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(1),
@@ -1742,6 +2020,7 @@ mod tests {
                 load_balancing: None,
                 sticky: None,
                 header_override: None,
+                retry_policy: None,
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(5),
@@ -1774,6 +2053,7 @@ mod tests {
                 load_balancing: None,
                 sticky: None,
                 header_override: None,
+                retry_policy: None,
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(0),
@@ -1795,6 +2075,7 @@ mod tests {
                 load_balancing: None,
                 sticky: None,
                 header_override: None,
+                retry_policy: None,
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(0),
@@ -1820,5 +2101,222 @@ mod tests {
             .select_route(&req, &RequestContext { client_ip: None })
             .unwrap();
         assert!(first.id == "a" || first.id == "b");
+    }
+
+    #[test]
+    fn test_header_override_group_selection_stays_in_group() {
+        let mut allowed_groups = HashMap::new();
+        allowed_groups.insert(
+            "blue".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+
+        let routes = vec![ReverseProxyRouteConfig {
+            id: "api".to_string(),
+            target: None,
+            targets: vec![
+                ReverseProxyTargetConfig {
+                    id: "a".to_string(),
+                    url: "http://a.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+                ReverseProxyTargetConfig {
+                    id: "b".to_string(),
+                    url: "http://b.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+                ReverseProxyTargetConfig {
+                    id: "c".to_string(),
+                    url: "http://c.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+            ],
+            load_balancing: None,
+            sticky: None,
+            header_override: Some(HeaderOverrideConfig {
+                header_name: "X-Bifrost-Target".to_string(),
+                allowed_values: HashMap::new(),
+                allowed_groups,
+            }),
+            reverse_proxy_config: None,
+            strip_path_prefix: None,
+            priority: Some(0),
+            predicates: vec![RoutePredicateConfig::Path {
+                patterns: vec!["/api/**".to_string()],
+                match_trailing_slash: true,
+            }],
+            retry_policy: None,
+        }];
+
+        let matcher = RouteMatcher::new(routes, 10, None).unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/users")
+            .header("X-Bifrost-Target", "blue")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let route = matcher
+            .select_route(&req, &RequestContext { client_ip: None })
+            .unwrap();
+        let selection = route
+            .select_target(&req, &RequestContext { client_ip: None })
+            .unwrap();
+
+        assert!(selection.target.id == "a" || selection.target.id == "b");
+        assert_ne!(selection.target.id, "c");
+    }
+
+    #[test]
+    fn test_header_override_group_unhealthy_falls_back() {
+        let mut allowed_groups = HashMap::new();
+        allowed_groups.insert("blue".to_string(), vec!["a".to_string()]);
+
+        let routes = vec![ReverseProxyRouteConfig {
+            id: "api".to_string(),
+            target: None,
+            targets: vec![
+                ReverseProxyTargetConfig {
+                    id: "a".to_string(),
+                    url: "http://a.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+                ReverseProxyTargetConfig {
+                    id: "b".to_string(),
+                    url: "http://b.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+            ],
+            load_balancing: None,
+            sticky: None,
+            header_override: Some(HeaderOverrideConfig {
+                header_name: "X-Bifrost-Target".to_string(),
+                allowed_values: HashMap::new(),
+                allowed_groups,
+            }),
+            reverse_proxy_config: None,
+            strip_path_prefix: None,
+            priority: Some(0),
+            predicates: vec![RoutePredicateConfig::Path {
+                patterns: vec!["/api/**".to_string()],
+                match_trailing_slash: true,
+            }],
+            retry_policy: None,
+        }];
+
+        let matcher = RouteMatcher::new(routes, 10, None).unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/users")
+            .header("X-Bifrost-Target", "blue")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let route = matcher
+            .select_route(&req, &RequestContext { client_ip: None })
+            .unwrap();
+
+        if let Some(target) = route.targets.iter().find(|t| t.id == "a") {
+            target.healthy.store(false, Ordering::Relaxed);
+        }
+
+        let selection = route
+            .select_target(&req, &RequestContext { client_ip: None })
+            .unwrap();
+
+        assert_eq!(selection.target.id, "b");
+    }
+
+    #[test]
+    fn test_select_target_excludes_attempted() {
+        let routes = vec![ReverseProxyRouteConfig {
+            id: "api".to_string(),
+            target: None,
+            targets: vec![
+                ReverseProxyTargetConfig {
+                    id: "a".to_string(),
+                    url: "http://a.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+                ReverseProxyTargetConfig {
+                    id: "b".to_string(),
+                    url: "http://b.example.com".to_string(),
+                    weight: 1,
+                    enabled: true,
+                },
+            ],
+            load_balancing: None,
+            sticky: None,
+            header_override: None,
+            reverse_proxy_config: None,
+            strip_path_prefix: None,
+            priority: Some(0),
+            predicates: vec![RoutePredicateConfig::Path {
+                patterns: vec!["/api/**".to_string()],
+                match_trailing_slash: true,
+            }],
+            retry_policy: None,
+        }];
+
+        let matcher = RouteMatcher::new(routes, 10, None).unwrap();
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/users")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let route = matcher
+            .select_route(&req, &RequestContext { client_ip: None })
+            .unwrap();
+
+        let mut excluded = HashSet::new();
+        excluded.insert("a".to_string());
+
+        let selection = route
+            .select_target_with_exclusions(&req, &RequestContext { client_ip: None }, &excluded)
+            .unwrap();
+
+        assert_eq!(selection.target.id, "b");
+    }
+
+    #[test]
+    fn test_retry_policy_rejects_invalid_method() {
+        let routes = vec![ReverseProxyRouteConfig {
+            id: "api".to_string(),
+            target: Some("http://a.example.com".to_string()),
+            targets: Vec::new(),
+            load_balancing: None,
+            sticky: None,
+            header_override: None,
+            reverse_proxy_config: None,
+            strip_path_prefix: None,
+            priority: Some(0),
+            predicates: vec![RoutePredicateConfig::Path {
+                patterns: vec!["/api/**".to_string()],
+                match_trailing_slash: true,
+            }],
+            retry_policy: Some(RetryPolicyConfig {
+                max_attempts: 2,
+                retry_on_connect_error: true,
+                retry_on_statuses: Vec::new(),
+                methods: vec!["BAD METHOD".to_string()],
+            }),
+        }];
+
+        let err = match RouteMatcher::new(routes, 10, None) {
+            Ok(_) => panic!("expected config error"),
+            Err(err) => err,
+        };
+        match err {
+            ProxyError::Config(message) => {
+                assert!(message.contains("retry policy method"));
+            }
+            _ => panic!("expected config error"),
+        }
     }
 }

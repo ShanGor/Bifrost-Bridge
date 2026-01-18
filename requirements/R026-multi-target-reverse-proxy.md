@@ -1,8 +1,8 @@
 # R026: Multi-Target Reverse Proxy Routing
 
-**Status**: Implemented
+**Status**: Partially implemented
 **Created**: 2025-12-24
-**Updated**: 2025-02-25
+**Updated**: 2026-01-18
 **Priority**: High
 
 ## Overview
@@ -25,6 +25,12 @@ matching: routes are selected first, then a target is chosen within the matched 
 - Cross-route failover or global traffic shaping.
 - Full gateway filter chain semantics (out of scope per R025).
 
+## Resolved Decisions
+
+- Header override supports target IDs and group-level selection.
+- Sticky selection is best-effort: fall back to normal selection if the mapped target is unhealthy.
+- Per-route retry policies are required when a target is ejected during request processing.
+
 ## Functional Requirements
 
 ### Configuration
@@ -36,7 +42,7 @@ matching: routes are selected first, then a target is chosen within the matched 
   - `enabled` (optional, default true)
 - Backward compatibility:
   - If `targets` is absent, `target` remains valid and is treated as a single-entry list.
-  - If both are provided, configuration validation fails unless explicitly allowed by a flag.
+  - If both are provided, configuration validation fails.
 
 ### Target Selection Order
 
@@ -63,24 +69,82 @@ matching: routes are selected first, then a target is chosen within the matched 
 ### Header Override Routing (Special Header)
 
 - Optional routing override using a configured header (e.g., `X-Bifrost-Target`).
-- Header values map to target IDs or target groups (allowlist only).
+- Allowlist values map to target IDs and target groups.
+- Group-level overrides select a target within the group using the route's policy.
 - Disabled by default. Recommended to enable only for trusted clients or internal networks.
 - If the header is present but unmapped or unhealthy, fall back to standard selection.
+
+### Retry Policy
+
+- Optional per-route retry policy (`retry_policy`).
+- Retries apply on connection errors and configured upstream status codes.
+- Retries are limited to an allowlist of HTTP methods (safe methods by default).
+- Retries are best-effort and should avoid reusing the same target within a request.
 
 ### Health and Resilience
 
 - Per-target health checks reuse existing reverse proxy health check config, scoped to each target.
+- Per-route retry policy applies when a target is ejected during request processing.
 - Passive failure tracking (timeouts, 5xx threshold) is deferred.
 - Optional slow-start for recovered targets is deferred.
 
 ### Observability
 
-- Log fields: route_id, target_id (implemented via existing logs).
-- Metrics: per-target request counts, errors, latency, and in-flight gauges are deferred.
+- Log fields: route_id, target_id for selection decisions.
+- Metrics: per-target request counts, errors, latency, and in-flight gauges.
 
-## Design (Proposed)
+### Testing Requirements (TDD-first)
 
-### Configuration Model (JSON)
+- For any remaining work, tests must be written before implementation changes.
+- Minimum coverage (non-exhaustive):
+  - Header override group mapping and selection within a group.
+  - Sticky best-effort fallback when a mapped target is unhealthy.
+  - Retry behavior when a target is ejected mid-request.
+  - Selection policy behavior (round-robin, weighted, least connections, random).
+  - Config validation (duplicate target IDs, weight >= 1, invalid header names).
+
+## Validation Rules
+
+- At least one target is required after compatibility expansion.
+- Target IDs must be unique per route.
+- Weights must be >= 1 when using weighted policies.
+- Header override allowlist values must reference known target IDs.
+- When group overrides are added, groups must reference known target IDs.
+- Sticky cookie/header modes must provide a key source (cookie_name/header_name).
+- Header names must be valid HTTP header names.
+- Retry policy max_attempts must be >= 1.
+- Retry policy methods must be valid HTTP methods.
+- Retry policy status codes must be valid HTTP status codes.
+
+## Current Implementation Status (code audit 2026-01-18)
+
+### Implemented
+
+- Multi-target routes with `targets`, id/weight/enabled, and `target` fallback.
+- Validation for duplicate target IDs, weight >= 1, and target vs targets conflicts.
+- Load balancing policies: round-robin, weighted round-robin, least connections, random.
+- Sticky selection: cookie (target id), header (hash), source IP (hash), best-effort fallback.
+- Header override via `header_override.allowed_values` (value -> target id) and `allowed_groups`.
+- Retry policy with max attempts, method allowlist, status-based retry, connect-error retry, and
+  per-attempt target exclusion for non-WebSocket requests.
+- Active per-target health checks and exclusion of unhealthy targets.
+- 503 error when no healthy targets remain.
+- Tests for header override group selection, selection exclusions, and retry policy validation.
+
+### Missing or Divergent from Requirements
+
+- Per-target metrics and explicit target_id logging for selection decisions.
+- Passive ejection/outlier detection and slow-start.
+- Tests for selection policies, sticky fallback behavior, and retry behavior (status/connect retries).
+
+### Testing Progress
+
+- Completed: header override group selection, selection exclusions for retries, retry policy validation.
+- Pending: selection policy coverage, sticky fallback behavior, retry behavior on status/connect errors.
+
+## Configuration Examples
+
+### Current Schema (implemented)
 
 ```json
 {
@@ -92,26 +156,34 @@ matching: routes are selected first, then a target is chosen within the matched 
         { "id": "api-a", "url": "http://10.0.0.10:8080", "weight": 3 },
         { "id": "api-b", "url": "http://10.0.0.11:8080", "weight": 1 }
       ],
-      "load_balancing": {
-        "policy": "weighted_round_robin"
-      },
-      "sticky": {
-        "mode": "cookie",
-        "cookie_name": "BIFROST_STICKY",
-        "ttl_seconds": 3600
-      },
+      "load_balancing": { "policy": "weighted_round_robin" },
+      "sticky": { "mode": "cookie", "cookie_name": "BIFROST_STICKY", "ttl_seconds": 3600 },
       "header_override": {
         "header_name": "X-Bifrost-Target",
-        "allowed_values": {
-          "canary": "api-b"
-        }
+        "allowed_values": { "canary": "api-b" },
+        "allowed_groups": { "eu": ["api-a", "api-b"] }
+      },
+      "retry_policy": {
+        "max_attempts": 2,
+        "retry_on_connect_error": true,
+        "retry_on_statuses": [502, 503],
+        "methods": ["GET", "HEAD"]
       }
     }
   ]
 }
 ```
 
-### Routing Strategy Best Practices
+## Selection Algorithm (current)
+
+1. Build the list of enabled and healthy targets for the matched route.
+2. If a header override is configured and the header value maps to a healthy target id
+   or group, select within that target or group.
+3. If sticky is enabled and a key is present, select by cookie (target id) or hash (header/source IP).
+4. Otherwise, select by the configured policy.
+5. If no healthy targets remain, return 503.
+
+## Operational Guidance (non-normative)
 
 - **Consistent hashing** for sticky keys to minimize churn when targets change.
 - **Smooth weighted round-robin** to avoid clumping on heavier targets.
@@ -120,83 +192,5 @@ matching: routes are selected first, then a target is chosen within the matched 
 - **Outlier detection** (passive) to eject flaky targets quickly.
 - **Fail-open selection**: if sticky or override fails, use standard policy to avoid outages.
 - **Header override safety**: restrict to trusted networks and allowlisted values.
-
-### Internal Structures (Draft)
-
-```rust
-struct TargetConfig {
-    id: String,
-    url: Url,
-    weight: u32,
-    enabled: bool,
-}
-
-struct LoadBalancingConfig {
-    policy: LoadBalancingPolicy,
-}
-
-enum LoadBalancingPolicy {
-    RoundRobin,
-    WeightedRoundRobin,
-    LeastConnections,
-    EwmaLatency,
-    Random,
-}
-
-struct StickyConfig {
-    mode: StickyMode,
-    cookie_name: Option<String>,
-    header_name: Option<String>,
-    ttl_seconds: Option<u64>,
-}
-
-struct HeaderOverrideConfig {
-    header_name: String,
-    allowed_values: HashMap<String, String>, // value -> target_id
-}
-```
-
-### Selection Algorithm (Draft)
-
-1. Build list of healthy targets for the matched route.
-2. If header override is enabled and header value maps to a healthy target, select it.
-3. If sticky is enabled and a key is present, hash to a target (consistent hash ring).
-4. Otherwise, select by policy (round-robin / weighted / least connections / EWMA / random).
-5. If no healthy targets, return 503 with a structured error message.
-
-## Validation Rules
-
-- At least one target is required after compatibility expansion.
-- Target IDs must be unique per route.
-- Weights must be >= 1 when using weighted policies.
-- Header override mappings must reference known target IDs.
-- Sticky cookie/header modes must provide a key source.
-
-## Open Questions
-
-- Should header override allow group-level selection (e.g., region) or only target IDs?
-- Should sticky selection be "strict" (fail if mapped target unhealthy) or "best effort"?
-- Do we need per-route retry policies when a target is ejected during request processing?
-
-## Implementation Tasks (Design-Only)
-
-### Completed
-
-- [x] Extend config structs to accept `targets`, `load_balancing`, `sticky`, `header_override`.
-- [x] Implement per-target health checks (active) and selection algorithms.
-- [x] Update docs and examples for multi-target routes.
-
-### Deferred
-
-- [ ] Passive ejection/outlier detection and slow-start.
-- [ ] Per-target metrics and additional structured logs.
-- [ ] Tests for selection fairness, sticky behavior, and header overrides.
-
-## Implementation Notes
-
-- Sticky cookie mode stores the selected target id; invalid or missing cookies trigger
-  standard selection and a new cookie.
-- Header override uses exact match against an allowlist of header values.
-- Weighted round-robin uses a simple weighted modulo selection; smooth WRR is deferred.
 
 **Back to:** [Requirements Index](../requirements/README.md)

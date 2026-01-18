@@ -7,6 +7,11 @@ Get up and running with the proxy server in minutes!
 - **Rust** (1.70 or later)
 - **Cargo** (comes with Rust)
 
+## Terminology
+
+If terms like *reverse proxy*, *route*, or *sticky session* are unfamiliar, see the
+[glossary](./glossary.md) before diving into configuration.
+
 ### Install Rust
 ```bash
 # On Unix/macOS
@@ -65,7 +70,10 @@ curl http://127.0.0.1:8080/app/dashboard  # if using /app mount
 
 ## 📁 Example Configurations
 
-### SPA Configuration (`spa.json`)
+Use the full examples in `examples/` for production-like configs. The snippets below show the
+minimum shape only.
+
+### SPA Configuration (`examples/config_spa.json`)
 ```json
 {
   "mode": "Reverse",
@@ -82,7 +90,7 @@ curl http://127.0.0.1:8080/app/dashboard  # if using /app mount
 }
 ```
 
-### Multi-Mount Configuration (`multi-mount.json`)
+### Multi-Mount Configuration (`examples/config_multi_mount.json`)
 ```json
 {
   "mode": "Reverse",
@@ -107,6 +115,14 @@ curl http://127.0.0.1:8080/app/dashboard  # if using /app mount
   }
 }
 ```
+
+### More Examples
+
+| File | What it demonstrates | Run command |
+|------|----------------------|-------------|
+| `examples/config_reverse_multi_targets_round_robin.json` | Reverse proxy with multiple targets | `cargo run -- --config examples/config_reverse_multi_targets_round_robin.json` |
+| `examples/config_forward_with_auth.json` | Forward proxy with basic auth | `cargo run -- --config examples/config_forward_with_auth.json` |
+| `examples/config_reverse_with_pooling_and_health_check.json` | Reverse proxy pooling + health checks | `cargo run -- --config examples/config_reverse_with_pooling_and_health_check.json` |
 
 ## 🎯 Common Use Cases
 

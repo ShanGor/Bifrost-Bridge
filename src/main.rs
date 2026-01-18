@@ -488,6 +488,7 @@ mod config_validation_tests {
             load_balancing: None,
             sticky: None,
             header_override: None,
+            retry_policy: None,
             reverse_proxy_config: None,
             strip_path_prefix: None,
             priority: Some(0),

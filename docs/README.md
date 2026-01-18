@@ -9,6 +9,7 @@ This folder contains documentation for the Bifrost Bridge proxy server.
 - [`quick-start.md`](./quick-start.md) - Get started quickly with basic usage
 - [`configuration.md`](./configuration.md) - Detailed configuration options (CLI and JSON)
 - [`https-setup.md`](./https-setup.md) - HTTPS/SSL configuration guide
+- [`glossary.md`](./glossary.md) - Shared definitions for proxy terms and jargon
 
 ### **Technical Documentation**
 - [`architecture-overview.md`](./architecture-overview.md) - Current runtime/adapters architecture with diagrams
@@ -40,5 +41,5 @@ cargo run -- --mount /app:./frontend/dist --mount /api:./api-docs
 
 ---
 
-**Last Updated:** 2025-11-21
+**Last Updated:** 2026-01-18
 **Version:** 1.0.0

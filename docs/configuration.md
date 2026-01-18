@@ -6,6 +6,7 @@ This guide covers all configuration options for the proxy server, including comm
 
 - [Command Line Interface](#command-line-interface)
 - [JSON Configuration](#json-configuration)
+- [Terminology](#terminology)
 - [Static File Configuration](#static-file-configuration)
 - [Multiple Mount Points](#multiple-mount-points)
 - [Configuration Inheritance](#configuration-inheritance)
@@ -127,6 +128,12 @@ cargo run -- --help
 | `logging` | Object | Logging configuration (see below) | Default console logging |
 | `monitoring` | Object | Monitoring endpoints configuration (see below) | Enabled with default endpoints |
 
+## Terminology
+
+If a term is unfamiliar (route, predicate, target, sticky session, header override, load balancing),
+see the [glossary](./glossary.md). The sections below refer back to those definitions to avoid
+duplicating explanations across docs.
+
 ## 📝 Logging Configuration
 
 ```json
@@ -146,25 +153,40 @@ cargo run -- --help
 
 ## 🔀 Reverse Proxy Routes (Predicate-Based)
 
-Use `reverse_proxy_routes` to configure multiple upstream targets with predicate-driven matching (similar to Spring Cloud Gateway). Each route requires an `id`, at least one predicate, and either `target` (single target) or `targets` (multi-target).
+Use `reverse_proxy_routes` to configure multiple upstream targets with predicate-driven matching.
+Each route requires an `id`, at least one predicate, and either `target` (single target) or
+`targets` (multi-target). See the [glossary](./glossary.md) for the meaning of routes, predicates,
+and targets.
 
 ### Route Fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | String | ✅ Yes | Unique route id |
-| `target` | String | ✅ Yes | Upstream URL |
+| `target` | String | ✅ Yes* | Upstream URL (single target) |
+| `targets` | Array | ✅ Yes* | Multi-target list (see below) |
 | `predicates` | Array | ✅ Yes | One or more predicates (all must pass) |
 | `priority` | Number | ❌ No | Lower wins; ties use declaration order |
 | `reverse_proxy_config` | Object | ❌ No | Per-route pooling/health checks |
 | `strip_path_prefix` | String | ❌ No | Remove prefix before forwarding (e.g., `"/test"` → `/api`) |
+| `retry_policy` | Object | ❌ No | Retry policy for upstream failures (see below) |
+
+*Either `target` or `targets` is required. Defining both is invalid.
+
+### Routing Guidelines
+
+- Keep predicates specific and use `priority` to resolve overlaps deterministically.
+- Use `strip_path_prefix` when upstreams do not expect the public-facing prefix.
+- Prefer `targets` with weights for uneven capacity; disable a target to drain traffic.
+- Use header overrides only for trusted clients and keep the allowlist narrow.
+- Enable sticky sessions only when application state is not shared across targets.
 
 ### Supported Predicates
-- `Path` with `patterns` (Ant-style, supports `**`, `{segment}`) and `match_trailing_slash`
+- `Path` with `patterns` (Ant-style) and `match_trailing_slash`
 - `Host` with patterns (Ant-style)
 - `Method` list (e.g., `["GET","POST"]`)
 - `Header`, `Query`, `Cookie` (exact or regex)
-- `RemoteAddr` (CIDRs)
+- `RemoteAddr` (CIDR blocks)
 - `After`, `Before`, `Between` (ISO-8601 timestamps)
 - `Weight` (group + weight for weighted selection)
 
@@ -252,9 +274,8 @@ the proxy selects a target using the load-balancing policy and sets a new cookie
 {
   "header_override": {
     "header_name": "X-Bifrost-Target",
-    "allowed_values": {
-      "canary": "api-b"
-    }
+    "allowed_values": { "canary": "api-b" },
+    "allowed_groups": { "eu": ["api-a", "api-b"] }
   }
 }
 ```
@@ -263,15 +284,44 @@ the proxy selects a target using the load-balancing policy and sets a new cookie
 |-------|------|----------|-------------|-------------|
 | `header_name` | String | Yes | Header used for override matching | Canary, region, or debug routing |
 | `allowed_values` | Object | Yes | Map of header value -> target id | Restrict overrides to trusted values |
+| `allowed_groups` | Object | No | Map of header value -> target id list | Allow region or cohort routing |
 
 Header override is evaluated before sticky or load balancing. If the header is present but unmapped
 or points to an unhealthy target, normal selection applies.
+
+### Retry Policy
+
+```json
+{
+  "retry_policy": {
+    "max_attempts": 2,
+    "retry_on_connect_error": true,
+    "retry_on_statuses": [502, 503],
+    "methods": ["GET", "HEAD"]
+  }
+}
+```
+
+| Field | Type | Required | Description | When to use |
+|-------|------|----------|-------------|-------------|
+| `max_attempts` | Number | Yes | Total attempts including the first try | Keep small (2-3) |
+| `retry_on_connect_error` | Boolean | No | Retry when the connection fails before response | Flaky networks or cold backends |
+| `retry_on_statuses` | Array | No | Retry on specific upstream status codes | Gateway errors (502/503/504) |
+| `methods` | Array | No | Allowed HTTP methods for retries | Limit to safe/idempotent methods |
+
+Retries are only attempted when a retry policy is configured. Requests are buffered in memory for
+replay; avoid large payloads or high max attempts unless you can tolerate the memory use.
 
 Example configs in `examples/`:
 - `examples/config_reverse_multi_targets_round_robin.json` for a basic round-robin pool
 - `examples/config_reverse_multi_targets_weighted.json` for uneven capacity rollout
 - `examples/config_reverse_multi_targets_least_connections.json` for uneven request cost
+- `examples/config_reverse_multi_targets_random.json` for random selection across healthy targets
 - `examples/config_reverse_multi_targets_sticky_header_override.json` for sticky + header override
+- `examples/config_reverse_multi_targets_sticky_header.json` for sticky routing via request header
+- `examples/config_reverse_multi_targets_sticky_source_ip.json` for sticky routing via source IP
+- `examples/config_reverse_multi_targets_header_override_groups.json` for header override groups
+- `examples/config_reverse_multi_targets_retry_policy.json` for retry policy across multiple targets
 
 `reverse_proxy_target` remains supported for single-target setups, but `reverse_proxy_routes` is preferred for predicate-based routing.
 

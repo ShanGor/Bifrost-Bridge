@@ -13,6 +13,7 @@ This guide ensures documentation stays synchronized with code changes.
 - ✅ Breaking changes
 - ✅ Security fixes
 - ✅ Performance improvements
+- ✅ New terms or jargon introduced (update `docs/glossary.md`)
 
 **Recommended Updates (SHOULD DO):**
 - 🔄 Bug fixes that affect user behavior
@@ -131,6 +132,7 @@ if echo "$CHANGED_FILES" | grep -q "src/"; then
     echo "  - [ ] Add new examples to examples/ directory if needed"
     echo "  - [ ] CHANGELOG.md for version tracking"
     echo "  - [ ] requirements/README.md for requirements log"
+    echo "  - [ ] docs/glossary.md if new terms were added"
 
     read -p "Continue with commit? (y/N): " -n 1 -r
     echo

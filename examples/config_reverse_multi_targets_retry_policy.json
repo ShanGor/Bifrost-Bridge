@@ -1,0 +1,24 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8080",
+  "reverse_proxy_routes": [
+    {
+      "id": "api",
+      "predicates": [
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
+      ],
+      "targets": [
+        { "id": "api-a", "url": "http://127.0.0.1:9001" },
+        { "id": "api-b", "url": "http://127.0.0.1:9002" },
+        { "id": "api-c", "url": "http://127.0.0.1:9003" }
+      ],
+      "load_balancing": { "policy": "round_robin" },
+      "retry_policy": {
+        "max_attempts": 2,
+        "retry_on_connect_error": true,
+        "retry_on_statuses": [502, 503, 504],
+        "methods": ["GET", "HEAD"]
+      }
+    }
+  ]
+}

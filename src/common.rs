@@ -243,7 +243,7 @@ impl FileStreaming {
             let should_stream = Self::should_stream_file(file_size, 1024 * 1024); // 1MB threshold
 
             if should_stream {
-                log::info!("File size {} bytes exceeds 1MB threshold, using zero-copy streaming", file_size);
+                log::debug!("File size {} bytes exceeds 1MB threshold, using zero-copy streaming", file_size);
                 let streaming_body = Self::create_streaming_body(file_path).await?;
                 FileBody::Streaming(streaming_body)
             } else {

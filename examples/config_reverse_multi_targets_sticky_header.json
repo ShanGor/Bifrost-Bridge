@@ -8,9 +8,16 @@
         { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
       ],
       "targets": [
-        { "id": "api-a", "url": "http://127.0.0.1:9001" },
-        { "id": "api-b", "url": "http://127.0.0.1:9002" }
+        {"id": "api-a", "url": "http://127.0.0.1:9001"},
+        {"id": "api-b", "url": "http://127.0.0.1:9002"}
       ],
+      "reverse_proxy_config": {
+        "health_check": {
+          "interval_secs": 5,
+          "endpoint": "/ready",
+          "timeout_secs": 5
+        }
+      },
       "load_balancing": { "policy": "round_robin" },
       "sticky": {
         "mode": "header",

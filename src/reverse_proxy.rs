@@ -434,13 +434,14 @@ impl RouteMatcher {
 
     fn routes_with_health_checks(
         &self,
-    ) -> Vec<(Url, Arc<Client<HttpConnector, BoxedBody>>, HealthCheckConfig, Arc<AtomicBool>)> {
+    ) -> Vec<(String, Url, Arc<Client<HttpConnector, BoxedBody>>, HealthCheckConfig, Arc<AtomicBool>)> {
         let mut entries = Vec::new();
         for route in &self.routes {
             if let Some(cfg) = route.health_check_config.clone() {
                 for target in &route.targets {
                     if target.enabled {
                         entries.push((
+                            target.id.clone(),
                             target.url.clone(),
                             route.http_client.clone(),
                             cfg.clone(),
@@ -1282,9 +1283,9 @@ impl ReverseProxy {
 
         info!("Reverse proxy listening on: {}", addr);
 
-        for (target_url, client, cfg, healthy) in self.routes.routes_with_health_checks() {
+        for (target_id, target_url, client, cfg, healthy) in self.routes.routes_with_health_checks() {
             tokio::spawn(async move {
-                Self::health_check_loop(client, target_url, cfg, healthy).await;
+                Self::health_check_loop(target_id, client, target_url, cfg, healthy).await;
             });
         }
 
@@ -1877,6 +1878,7 @@ impl ReverseProxy {
 
     /// Health check loop (runs in background)
     async fn health_check_loop(
+        target_id: String,
         http_client: Arc<Client<HttpConnector, BoxedBody>>,
         target_url: Url,
         config: HealthCheckConfig,
@@ -1884,9 +1886,20 @@ impl ReverseProxy {
     ) {
         let interval = Duration::from_secs(config.interval_secs);
         let timeout = Duration::from_secs(config.timeout_secs);
-        let endpoint = config.endpoint;
+        let endpoint = config.endpoint.clone();
 
-        info!("Starting health check loop for {}", target_url);
+        let port = target_url.port().unwrap_or(80);
+        info!(
+            "Starting health check for target '{}' on {} (interval={}s, timeout={}s, endpoint={})",
+            target_id,
+            target_url,
+            config.interval_secs,
+            config.timeout_secs,
+            endpoint.as_deref().unwrap_or("TCP")
+        );
+
+        // Track previous health state to detect transitions
+        let mut was_healthy = true;
 
         let mut interval_timer = tokio::time::interval(interval);
         loop {
@@ -1900,10 +1913,28 @@ impl ReverseProxy {
 
             if is_healthy {
                 healthy.store(true, Ordering::Relaxed);
-                debug!("Health check passed for {}", target_url);
+                // Log recovery if previously unhealthy
+                if !was_healthy {
+                    info!(
+                        "Target '{}' on port {} is now HEALTHY (recovered)",
+                        target_id, port
+                    );
+                    was_healthy = true;
+                } else {
+                    debug!("Health check passed for target '{}'", target_id);
+                }
             } else {
                 healthy.store(false, Ordering::Relaxed);
-                warn!("Health check failed for {}", target_url);
+                // Log with ERROR level when transitioning from healthy to unhealthy
+                if was_healthy {
+                    error!(
+                        "Target '{}' on port {} is now OFFLINE (health check failed)",
+                        target_id, port
+                    );
+                    was_healthy = false;
+                } else {
+                    debug!("Health check still failing for target '{}'", target_id);
+                }
             }
         }
     }

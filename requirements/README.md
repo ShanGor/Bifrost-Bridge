@@ -32,6 +32,7 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R024](R024-secret-encryption.md) | Encrypted Secret Management | Add key generation + encrypted secrets workflow for configurations | 2025-02-14 |
 | [R025](R025-reverse-proxy-requirements.md) | Reverse Proxy Request Routing | Multi-route reverse proxy with predicate-based matching | 2025-02-21 |
 | [R026](R026-multi-target-reverse-proxy.md) | Multi-target reverse proxy routing | Load balancing and sticky routing across multiple upstreams | 2025-02-25 |
+| [R027](R027-env-variable-interpolation.md) | Environment Variable Interpolation | Resolve `$VAR` and `${VAR}` placeholders in config string values | 2026-03-01 |
 
 ### 📝 **Pending Requirements**
 
@@ -72,9 +73,10 @@ requirements/
 ├── R021-tokio-worker-threads.md       # Detailed requirement
 ├── R022-advanced-cache-control.md      # Detailed requirement
 ├── R023-connection-pooling-optimization.md # Detailed requirement
-│   ├── R024-secret-encryption.md           # Detailed requirement
-│   ├── R025-reverse-proxy-requirements.md  # Detailed requirement
-│   └── R026-multi-target-reverse-proxy.md  # Detailed requirement
+├── R024-secret-encryption.md           # Detailed requirement
+├── R025-reverse-proxy-requirements.md  # Detailed requirement
+├── R026-multi-target-reverse-proxy.md  # Detailed requirement
+└── R027-env-variable-interpolation.md  # Detailed requirement
 ```
 
 ## 📚 How to Use This Documentation
@@ -93,6 +95,6 @@ requirements/
 
 ---
 
-**Last Updated:** 2025-02-25
+**Last Updated:** 2026-03-01
 **Maintainer:** Development Team
-**Total Requirements:** 26 (24 Completed, 2 Pending)
+**Total Requirements:** 27 (25 Completed, 2 Pending)

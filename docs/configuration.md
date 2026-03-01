@@ -6,6 +6,7 @@ This guide covers all configuration options for the proxy server, including comm
 
 - [Command Line Interface](#command-line-interface)
 - [JSON Configuration](#json-configuration)
+- [Environment Variable Interpolation](#environment-variable-interpolation)
 - [Terminology](#terminology)
 - [Static File Configuration](#static-file-configuration)
 - [Multiple Mount Points](#multiple-mount-points)
@@ -127,6 +128,45 @@ cargo run -- --help
 | `pool_max_idle_per_host` | Number | Maximum idle connections per host for connection pooling | `10` |
 | `logging` | Object | Logging configuration (see below) | Default console logging |
 | `monitoring` | Object | Monitoring endpoints configuration (see below) | Enabled with default endpoints |
+
+## Environment Variable Interpolation
+
+All JSON string values support environment variable interpolation during config loading.
+
+### Supported syntax
+
+- `$VAR` where `VAR` matches `[A-Za-z_][A-Za-z0-9_]*`
+- `${VAR}` with the same variable naming rules
+- `$$` to emit a literal `$`
+
+### Example
+
+```json
+{
+  "mode": "Forward",
+  "listen_addr": "127.0.0.1:8080",
+  "relay_proxies": [
+    {
+      "relay_proxy_url": "http://$USERNAME:${PASSWORD}@localhost:3128"
+    }
+  ]
+}
+```
+
+If `USERNAME=alice` and `PASSWORD=s3cr3t`, the resolved value becomes:
+`http://alice:s3cr3t@localhost:3128`
+
+### Error behavior
+
+- Missing environment variable references fail startup with a config load error.
+- Invalid interpolation syntax (for example unterminated `${...}`) fails startup.
+- Errors include the JSON field path to the failing value.
+
+### Notes
+
+- Interpolation is applied before JSON is deserialized into typed config structs.
+- Existing plain text values continue to work unchanged.
+- `{encrypted}...` values remain supported for secret fields.
 
 ## Terminology
 
@@ -736,5 +776,5 @@ This example shows a development setup with custom logging configuration:
 
 ---
 
-**Last Updated:** 2025-11-21
+**Last Updated:** 2026-03-01
 **See Also:** [Examples](../examples/), [CLI Reference](../README.md)

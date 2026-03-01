@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use thiserror::Error;
 
 fn default_cache_millisecs() -> u64 {
     3600
@@ -696,6 +697,173 @@ fn default_max_header_size() -> Option<usize> {
     Some(16 * 1024) // 16KB default header size limit
 }
 
+#[derive(Debug, Error)]
+enum ConfigLoadError {
+    #[error("failed to read config file: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("failed to parse config JSON: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("environment variable `{var}` referenced at `{path}` is not set")]
+    MissingEnvVar { var: String, path: String },
+
+    #[error("invalid environment interpolation at `{path}`: {reason}")]
+    InvalidInterpolation { path: String, reason: String },
+}
+
+fn is_var_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_var_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn validate_var_name(name: &str, path: &str) -> Result<(), ConfigLoadError> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return Err(ConfigLoadError::InvalidInterpolation {
+            path: path.to_string(),
+            reason: "empty variable name in `${...}`".to_string(),
+        });
+    }
+    if !is_var_start(bytes[0]) || !bytes.iter().skip(1).all(|byte| is_var_continue(*byte)) {
+        return Err(ConfigLoadError::InvalidInterpolation {
+            path: path.to_string(),
+            reason: format!("invalid variable name `{}`", name),
+        });
+    }
+    Ok(())
+}
+
+fn interpolate_env_string_with<F>(
+    input: &str,
+    path: &str,
+    resolver: &mut F,
+) -> Result<String, ConfigLoadError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut output = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < input.len() {
+        let ch = input[i..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 iteration");
+        if ch != '$' {
+            output.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if i + 1 >= input.len() {
+            output.push('$');
+            i += 1;
+            continue;
+        }
+
+        let next = input[i + 1..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 iteration");
+
+        if next == '$' {
+            output.push('$');
+            i += 2;
+            continue;
+        }
+
+        if next == '{' {
+            let mut j = i + 2;
+            let mut end = None;
+            while j < input.len() {
+                let current = input[j..]
+                    .chars()
+                    .next()
+                    .expect("valid UTF-8 iteration");
+                if current == '}' {
+                    end = Some(j);
+                    break;
+                }
+                j += current.len_utf8();
+            }
+
+            let end = end.ok_or_else(|| ConfigLoadError::InvalidInterpolation {
+                path: path.to_string(),
+                reason: "unterminated `${...}` expression".to_string(),
+            })?;
+
+            let var_name = &input[i + 2..end];
+            validate_var_name(var_name, path)?;
+            let value = resolver(var_name).ok_or_else(|| ConfigLoadError::MissingEnvVar {
+                var: var_name.to_string(),
+                path: path.to_string(),
+            })?;
+            output.push_str(&value);
+            i = end + 1;
+            continue;
+        }
+
+        let first = input.as_bytes()[i + 1];
+        if !is_var_start(first) {
+            output.push('$');
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 2;
+        while j < input.len() && is_var_continue(input.as_bytes()[j]) {
+            j += 1;
+        }
+        let var_name = &input[i + 1..j];
+        let value = resolver(var_name).ok_or_else(|| ConfigLoadError::MissingEnvVar {
+            var: var_name.to_string(),
+            path: path.to_string(),
+        })?;
+        output.push_str(&value);
+        i = j;
+    }
+
+    Ok(output)
+}
+
+fn interpolate_env_in_json_with<F>(
+    value: &mut serde_json::Value,
+    path: &str,
+    resolver: &mut F,
+) -> Result<(), ConfigLoadError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    match value {
+        serde_json::Value::String(s) => {
+            *s = interpolate_env_string_with(s, path, resolver)?;
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter_mut().enumerate() {
+                let child_path = format!("{}[{}]", path, idx);
+                interpolate_env_in_json_with(item, &child_path, resolver)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let child_path = format!("{}.{}", path, key);
+                interpolate_env_in_json_with(item, &child_path, resolver)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn interpolate_env_in_json(value: &mut serde_json::Value) -> Result<(), ConfigLoadError> {
+    let mut resolver = |name: &str| std::env::var(name).ok();
+    interpolate_env_in_json_with(value, "$", &mut resolver)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -733,7 +901,9 @@ impl Default for Config {
 impl Config {
     pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let mut raw: serde_json::Value = serde_json::from_str(&content)?;
+        interpolate_env_in_json(&mut raw)?;
+        let config: Config = serde_json::from_value(raw)?;
         Ok(config)
     }
 
@@ -741,5 +911,89 @@ impl Config {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn interpolate_env_string_supports_multiple_forms_and_escape() {
+        let mut resolver = |name: &str| match name {
+            "USERNAME" => Some("alice".to_string()),
+            "PASSWORD" => Some("s3cr3t".to_string()),
+            _ => None,
+        };
+
+        let interpolated = interpolate_env_string_with(
+            "http://$USERNAME:${PASSWORD}@localhost:3128?cost=$$20",
+            "$.relay_proxy_url",
+            &mut resolver,
+        )
+        .unwrap();
+
+        assert_eq!(
+            interpolated,
+            "http://alice:s3cr3t@localhost:3128?cost=$20"
+        );
+    }
+
+    #[test]
+    fn interpolate_env_string_errors_when_var_missing() {
+        let mut resolver = |_name: &str| None;
+        let err = interpolate_env_string_with("$MISSING", "$.proxy_password", &mut resolver)
+            .unwrap_err();
+
+        match err {
+            ConfigLoadError::MissingEnvVar { var, path } => {
+                assert_eq!(var, "MISSING");
+                assert_eq!(path, "$.proxy_password");
+            }
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn interpolate_env_string_rejects_invalid_braced_var_name() {
+        let mut resolver = |_name: &str| None;
+        let err =
+            interpolate_env_string_with("${9BAD}", "$.relay_proxy_url", &mut resolver).unwrap_err();
+
+        match err {
+            ConfigLoadError::InvalidInterpolation { path, .. } => {
+                assert_eq!(path, "$.relay_proxy_url");
+            }
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn config_from_file_interpolates_nested_values() {
+        let path_value = std::env::var("PATH").expect("PATH env var must be set in test runtime");
+        let home_value = std::env::var("HOME").expect("HOME env var must be set in test runtime");
+        let config_json = json!({
+            "mode": "Forward",
+            "listen_addr": "127.0.0.1:8080",
+            "proxy_password": "$PATH",
+            "relay_proxies": [
+                {
+                    "relay_proxy_url": "http://${HOME}@localhost:3128"
+                }
+            ]
+        });
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", config_json).unwrap();
+
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.proxy_password, Some(path_value));
+        assert_eq!(
+            config.relay_proxies.unwrap()[0].relay_proxy_url,
+            format!("http://{}@localhost:3128", home_value)
+        );
     }
 }

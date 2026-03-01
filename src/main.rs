@@ -15,7 +15,7 @@ const ENCRYPT_STDIN_PLACEHOLDER: &str = "__BIFROST_STDIN__";
 
 #[derive(Parser)]
 #[clap(
-    version = "1.0.0",
+    version = env!("CARGO_PKG_VERSION"),
     author = "Rust Proxy Server",
     about = "A Rust proxy server that can function as both forward and reverse proxy"
 )]

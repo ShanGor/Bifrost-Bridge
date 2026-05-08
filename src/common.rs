@@ -3,6 +3,7 @@ use crate::secrets::register_secret_metrics;
 use hyper::{Response, StatusCode, body::{Body, Frame}};
 use hyper::body::Bytes;
 use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -186,6 +187,7 @@ impl Body for StreamingFileBody {
 pub enum FileBody {
     InMemory(Full<Bytes>),
     Streaming(StreamingFileBody),
+    Boxed(BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>),
 }
 
 impl Body for FileBody {
@@ -203,6 +205,9 @@ impl Body for FileBody {
             FileBody::Streaming(stream) => {
                 Pin::new(stream).poll_frame(cx).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             }
+            FileBody::Boxed(boxed) => {
+                Pin::new(boxed).poll_frame(cx)
+            }
         }
     }
 
@@ -210,6 +215,7 @@ impl Body for FileBody {
         match self {
             FileBody::InMemory(full) => full.size_hint(),
             FileBody::Streaming(stream) => stream.size_hint(),
+            FileBody::Boxed(boxed) => boxed.size_hint(),
         }
     }
 }

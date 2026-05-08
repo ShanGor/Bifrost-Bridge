@@ -581,9 +581,11 @@ impl CombinedProxyAdapter {
                     // Try reverse proxy - this consumes req, so we must return here
                     match reverse_proxy.handle_request_with_context(req, context).await {
                         Ok(response) => {
-                            // Convert Full<Bytes> to FileBody
+                            // Convert BoxedBody to FileBody::Streaming
                             let (parts, body) = response.into_parts();
-                            let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
+                            // BoxedBody is already a streaming body, wrap it in FileBody
+                            let file_body = FileBody::Boxed(body);
+                            let response_with_file_body = Response::from_parts(parts, file_body);
                             return Ok::<_, Infallible>(response_with_file_body);
                         }
                         Err(_) => {

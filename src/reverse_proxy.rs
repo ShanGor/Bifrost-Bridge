@@ -1264,7 +1264,7 @@ impl ReverseProxy {
         &self,
         req: Request<Incoming>,
         context: RequestContext,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<BoxedBody>, Infallible> {
         Self::handle_request_static(
             req,
             context,
@@ -1368,7 +1368,7 @@ impl ReverseProxy {
         websocket_config: Arc<WebSocketConfig>,
         metrics: Arc<PerformanceMetrics>,
         rate_limiter: Arc<RateLimiter>,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<BoxedBody>, Infallible> {
         if rate_limiter.is_enabled() {
             if let Some(client_ip) = context.client_ip.as_deref() {
                 if let Err(hit) = rate_limiter
@@ -1386,17 +1386,17 @@ impl ReverseProxy {
                         "Reverse proxy rate limit hit for {} via rule {}",
                         client_ip, hit.rule_id
                     );
-                    return Ok(ResponseBuilder::too_many_requests(
+                    return Ok(Self::boxed_response(ResponseBuilder::too_many_requests(
                         &hit.rule_id,
                         hit.retry_after_secs,
-                    ));
+                    )));
                 }
             }
         }
 
         let selected_route = match routes.select_route(&req, &context) {
             Some(route) => route,
-            None => return Ok(ResponseBuilder::error(StatusCode::NOT_FOUND, "No matching route")),
+            None => return Ok(Self::boxed_response(ResponseBuilder::error(StatusCode::NOT_FOUND, "No matching route"))),
         };
 
         if is_websocket_upgrade(req.headers()) {
@@ -1408,10 +1408,10 @@ impl ReverseProxy {
                             "Target selection failed for route {}: {}",
                             selected_route.id, e
                         );
-                        return Ok(ResponseBuilder::error(
+                        return Ok(Self::boxed_response(ResponseBuilder::error(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &e.to_string(),
-                        ));
+                        )));
                     }
                 };
             let mut response = match Self::handle_websocket_request(
@@ -1431,11 +1431,12 @@ impl ReverseProxy {
                     response.headers_mut().append("Set-Cookie", value);
                 }
             }
-            return Ok(response);
+            return Ok(Self::boxed_response(response));
         }
 
         match Self::process_request_with_retries(req, context, selected_route, preserve_host).await {
-            Ok((mut response, set_cookie)) => {
+            Ok((response, set_cookie)) => {
+                let mut response = response;
                 if let Some(cookie) = set_cookie {
                     if let Ok(value) = cookie.parse() {
                         response.headers_mut().append("Set-Cookie", value);
@@ -1445,10 +1446,10 @@ impl ReverseProxy {
             }
             Err(RequestFailure::Selection(e)) => {
                 warn!("Target selection failed for route {}: {}", selected_route.id, e);
-                Ok(ResponseBuilder::error(
+                Ok(Self::boxed_response(ResponseBuilder::error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &e.to_string(),
-                ))
+                )))
             }
             Err(RequestFailure::Forward(e)) => {
                 error!("Proxy error: {}", e);
@@ -1458,9 +1459,16 @@ impl ReverseProxy {
                     .body(body)
                     .unwrap();
                 metrics.increment_connection_errors();
-                Ok(error_response)
+                Ok(Self::boxed_response(error_response))
             }
         }
+    }
+    
+    /// Helper to convert Full<Bytes> response to BoxedBody response
+    fn boxed_response(response: Response<Full<Bytes>>) -> Response<BoxedBody> {
+        let (parts, body) = response.into_parts();
+        let boxed_body = body.map_err(|err| match err {}).boxed();
+        Response::from_parts(parts, boxed_body)
     }
 
     /// Process request using HTTP client with connection pooling
@@ -1470,7 +1478,7 @@ impl ReverseProxy {
         selected_route: &CompiledRoute,
         selected_target: &CompiledTarget,
         preserve_host: bool,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+    ) -> Result<Response<BoxedBody>, ProxyError> {
         let _inflight = InflightGuard::new(selected_target.inflight.clone());
         let prepared = Self::rewrite_backend_request(
             req,
@@ -1488,7 +1496,18 @@ impl ReverseProxy {
             .await
             .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
 
-        Self::finalize_backend_response(response, false).await
+        // Check if this is an SSE response
+        let is_sse = Self::is_sse_response(response.headers());
+        
+        if is_sse {
+            // Use streaming handler for SSE
+            Self::finalize_backend_response_streaming(response, false)
+        } else {
+            // Use buffered handler for regular responses
+            Self::finalize_backend_response(response, false)
+                .await
+                .map(Self::boxed_response)
+        }
     }
 
     async fn process_buffered_request(
@@ -1497,7 +1516,7 @@ impl ReverseProxy {
         selected_route: &CompiledRoute,
         selected_target: &CompiledTarget,
         preserve_host: bool,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+    ) -> Result<Response<BoxedBody>, ProxyError> {
         let _inflight = InflightGuard::new(selected_target.inflight.clone());
         let prepared = Self::rewrite_backend_request(
             req,
@@ -1515,7 +1534,18 @@ impl ReverseProxy {
             .await
             .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
 
-        Self::finalize_backend_response(response, false).await
+        // Check if this is an SSE response
+        let is_sse = Self::is_sse_response(response.headers());
+        
+        if is_sse {
+            // Use streaming handler for SSE
+            Self::finalize_backend_response_streaming(response, false)
+        } else {
+            // Use buffered handler for regular responses
+            Self::finalize_backend_response(response, false)
+                .await
+                .map(Self::boxed_response)
+        }
     }
 
     async fn process_request_with_retries(
@@ -1523,7 +1553,7 @@ impl ReverseProxy {
         context: RequestContext,
         selected_route: &CompiledRoute,
         preserve_host: bool,
-    ) -> Result<(Response<Full<Bytes>>, Option<String>), RequestFailure> {
+    ) -> Result<(Response<BoxedBody>, Option<String>), RequestFailure> {
         let retry_policy = selected_route.retry_policy.as_ref();
 
         if retry_policy
@@ -1551,7 +1581,7 @@ impl ReverseProxy {
 
         let mut excluded = HashSet::new();
         let mut last_error: Option<ProxyError> = None;
-        let mut last_response: Option<(Response<Full<Bytes>>, Option<String>)> = None;
+        let mut last_response: Option<(Response<BoxedBody>, Option<String>)> = None;
 
         for attempt in 0..retry_policy.max_attempts {
             let attempt_request =
@@ -1846,25 +1876,72 @@ impl ReverseProxy {
         Request::from_parts(parts, body)
     }
 
+    /// Check if response is SSE based on Content-Type header
+    fn is_sse_response(headers: &hyper::HeaderMap) -> bool {
+        headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false)
+    }
+
     async fn finalize_backend_response(
         response: Response<Incoming>,
         keep_upgrade: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let (mut parts, body) = response.into_parts();
+        
+        // Check if this is an SSE response before collecting the body
+        let is_sse = Self::is_sse_response(&parts.headers);
+        
+        if is_sse {
+            // For SSE, we cannot buffer the response - return an error
+            // The caller should use finalize_backend_response_streaming instead
+            return Err(ProxyError::Http(
+                "SSE responses must use streaming handler".to_string()
+            ));
+        }
+        
         let body_bytes = body
             .collect()
             .await
             .map_err(|e| ProxyError::Http(format!("Failed to collect response body: {}", e)))?;
 
-        Self::strip_response_headers(&mut parts.headers, keep_upgrade);
+        Self::strip_response_headers(&mut parts.headers, keep_upgrade, is_sse);
         parts
             .headers
             .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
 
         Ok(Response::from_parts(parts, Full::new(body_bytes.to_bytes())))
     }
+    
+    /// Finalize backend response for streaming (SSE, chunked responses)
+    fn finalize_backend_response_streaming(
+        response: Response<Incoming>,
+        keep_upgrade: bool,
+    ) -> Result<Response<BoxedBody>, ProxyError> {
+        let (mut parts, body) = response.into_parts();
+        let is_sse = Self::is_sse_response(&parts.headers);
+        
+        Self::strip_response_headers(&mut parts.headers, keep_upgrade, is_sse);
+        parts
+            .headers
+            .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
+        
+        // Convert Incoming body to BoxedBody for streaming
+        let boxed_body = body.map_err(|err| Box::new(err) as BoxError).boxed();
+        Ok(Response::from_parts(parts, boxed_body))
+    }
 
-    fn strip_response_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool) {
+    fn strip_response_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool, is_sse: bool) {
+        // For SSE responses, preserve critical headers
+        if is_sse {
+            // Only remove proxy-specific headers, keep Connection, Transfer-Encoding, etc.
+            headers.remove("Proxy-Authenticate");
+            headers.remove("Proxy-Authorization");
+            return;
+        }
+        
         if !keep_upgrade {
             headers.remove("Connection");
             headers.remove("Upgrade");
@@ -2358,5 +2435,52 @@ mod tests {
             }
             _ => panic!("expected config error"),
         }
+    }
+
+    #[test]
+    fn test_sse_detection() {
+        let mut headers = hyper::HeaderMap::new();
+        
+        // Test without SSE header
+        assert!(!ReverseProxy::is_sse_response(&headers));
+        
+        // Test with SSE content-type
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        assert!(ReverseProxy::is_sse_response(&headers));
+        
+        // Test with SSE content-type and charset
+        headers.insert("content-type", "text/event-stream; charset=utf-8".parse().unwrap());
+        assert!(ReverseProxy::is_sse_response(&headers));
+        
+        // Test with non-SSE content-type
+        headers.insert("content-type", "application/json".parse().unwrap());
+        assert!(!ReverseProxy::is_sse_response(&headers));
+    }
+
+    #[test]
+    fn test_sse_header_preservation() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("connection", "keep-alive".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        headers.insert("cache-control", "no-cache".parse().unwrap());
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        
+        // For SSE responses, critical headers should be preserved
+        ReverseProxy::strip_response_headers(&mut headers, false, true);
+        
+        assert!(headers.contains_key("connection"), "Connection header should be preserved for SSE");
+        assert!(headers.contains_key("transfer-encoding"), "Transfer-Encoding should be preserved for SSE");
+        assert!(headers.contains_key("cache-control"), "Cache-Control should be preserved for SSE");
+        assert!(headers.contains_key("content-type"), "Content-Type should be preserved for SSE");
+        
+        // For non-SSE responses, headers should be stripped
+        let mut headers2 = hyper::HeaderMap::new();
+        headers2.insert("connection", "keep-alive".parse().unwrap());
+        headers2.insert("transfer-encoding", "chunked".parse().unwrap());
+        
+        ReverseProxy::strip_response_headers(&mut headers2, false, false);
+        
+        assert!(!headers2.contains_key("connection"), "Connection header should be stripped for non-SSE");
+        assert!(!headers2.contains_key("transfer-encoding"), "Transfer-Encoding should be stripped for non-SSE");
     }
 }

@@ -519,6 +519,7 @@ mod tests {
             spa_fallback_file: None,
             no_cache_files: None,
             cache_millisecs: None,
+            order: None,
         }];
 
         let handler = StaticFileHandler::new(config).expect("Failed to create handler");

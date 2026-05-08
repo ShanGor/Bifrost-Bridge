@@ -422,6 +422,10 @@ pub struct ReverseProxyRouteConfig {
     /// Optional priority (lower number = higher priority). Defaults to 0.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Optional routing order (lower number = higher priority, evaluated first)
+    /// Default: 50 for reverse proxy routes
+    #[serde(default)]
+    pub order: Option<u32>,
     /// Predicate list (logical AND). Empty list is invalid.
     #[serde(default)]
     pub predicates: Vec<RoutePredicateConfig>,
@@ -495,6 +499,10 @@ pub struct StaticMount {
     pub no_cache_files: Option<Vec<String>>,
     #[serde(default)]
     pub cache_millisecs: Option<u64>,
+    /// Optional routing order (lower number = higher priority, evaluated first)
+    /// Default: 100 for static mounts
+    #[serde(default)]
+    pub order: Option<u32>,
 }
 
 impl StaticMount {
@@ -517,6 +525,7 @@ impl StaticMount {
                 .unwrap_or_else(|| parent_config.no_cache_files.clone()),
             cache_millisecs: self.cache_millisecs
                 .unwrap_or(parent_config.cache_millisecs),
+            order: self.order.unwrap_or(100), // Default order for static mounts
         }
     }
 }
@@ -531,6 +540,7 @@ pub struct ResolvedStaticMount {
     pub spa_fallback_file: String,
     pub no_cache_files: Vec<String>,
     pub cache_millisecs: u64,
+    pub order: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +572,7 @@ impl Default for StaticFileConfig {
                 spa_fallback_file: None, // Will inherit from parent
                 no_cache_files: None, // Will inherit from parent
                 cache_millisecs: None, // Will inherit from parent
+                order: None, // Will use default (100)
             }],
             enable_directory_listing: false,
             index_files: vec!["index.html".to_string(), "index.htm".to_string()],
@@ -587,6 +598,7 @@ impl StaticFileConfig {
                 spa_fallback_file: None, // Will inherit from parent
                 no_cache_files: None, // Will inherit from parent
                 cache_millisecs: None, // Will inherit from parent
+                order: None, // Will use default (100)
             }],
             enable_directory_listing: false,
             index_files: vec!["index.html".to_string(), "index.htm".to_string()],
@@ -609,6 +621,7 @@ impl StaticFileConfig {
             spa_fallback_file: None, // Will inherit from parent
             no_cache_files: None, // Will inherit from parent
             cache_millisecs: None, // Will inherit from parent
+            order: None, // Will use default (100)
         });
     }
 

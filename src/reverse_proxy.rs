@@ -1173,6 +1173,7 @@ impl ReverseProxy {
             reverse_proxy_config: reverse_proxy_config.clone(),
             strip_path_prefix: None,
             priority: Some(0),
+            order: None, // Use default order (50)
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/**".to_string()],
                 match_trailing_slash: true,
@@ -2039,6 +2040,7 @@ mod tests {
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(1),
+                order: None,
                 predicates: vec![RoutePredicateConfig::Path {
                     patterns: vec!["/api/**".to_string()],
                     match_trailing_slash: true,
@@ -2055,6 +2057,7 @@ mod tests {
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(5),
+                order: None,
                 predicates: vec![RoutePredicateConfig::Path {
                     patterns: vec!["/**".to_string()],
                     match_trailing_slash: true,
@@ -2088,6 +2091,7 @@ mod tests {
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(0),
+            order: None,
                 predicates: vec![
                     RoutePredicateConfig::Path {
                         patterns: vec!["/**".to_string()],
@@ -2110,6 +2114,7 @@ mod tests {
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(0),
+            order: None,
                 predicates: vec![
                     RoutePredicateConfig::Path {
                         patterns: vec!["/**".to_string()],
@@ -2175,6 +2180,7 @@ mod tests {
             reverse_proxy_config: None,
             strip_path_prefix: None,
             priority: Some(0),
+            order: None,
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/api/**".to_string()],
                 match_trailing_slash: true,
@@ -2233,6 +2239,7 @@ mod tests {
             reverse_proxy_config: None,
             strip_path_prefix: None,
             priority: Some(0),
+            order: None,
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/api/**".to_string()],
                 match_trailing_slash: true,
@@ -2288,6 +2295,7 @@ mod tests {
             reverse_proxy_config: None,
             strip_path_prefix: None,
             priority: Some(0),
+            order: None,
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/api/**".to_string()],
                 match_trailing_slash: true,
@@ -2327,6 +2335,7 @@ mod tests {
             reverse_proxy_config: None,
             strip_path_prefix: None,
             priority: Some(0),
+            order: None,
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/api/**".to_string()],
                 match_trailing_slash: true,

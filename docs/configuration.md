@@ -11,6 +11,7 @@ This guide covers all configuration options for the proxy server, including comm
 - [Static File Configuration](#static-file-configuration)
 - [Multiple Mount Points](#multiple-mount-points)
 - [Configuration Inheritance](#configuration-inheritance)
+- [Routing Order and Priority](#routing-order-and-priority)
 - [Multi-Target Reverse Proxy Routing](#multi-target-reverse-proxy-routing)
 - [Reverse Proxy Headers](#reverse-proxy-headers)
 - [Examples](#examples)
@@ -207,6 +208,7 @@ and targets.
 | `targets` | Array | ✅ Yes* | Multi-target list (see below) |
 | `predicates` | Array | ✅ Yes | One or more predicates (all must pass) |
 | `priority` | Number | ❌ No | Lower wins; ties use declaration order |
+| `order` | Number | ❌ No | Routing order (lower = evaluated first, default: 50) |
 | `reverse_proxy_config` | Object | ❌ No | Per-route pooling/health checks |
 | `strip_path_prefix` | String | ❌ No | Remove prefix before forwarding (e.g., `"/test"` → `/api`) |
 | `retry_policy` | Object | ❌ No | Retry policy for upstream failures (see below) |
@@ -216,6 +218,7 @@ and targets.
 ### Routing Guidelines
 
 - Keep predicates specific and use `priority` to resolve overlaps deterministically.
+- Use `order` to control evaluation sequence when combining static files and reverse proxy routes (see [Routing Order and Priority](#routing-order-and-priority)).
 - Use `strip_path_prefix` when upstreams do not expect the public-facing prefix.
 - Prefer `targets` with weights for uneven capacity; disable a target to drain traffic.
 - Use header overrides only for trusted clients and keep the allowlist narrow.
@@ -502,6 +505,7 @@ Each mount in the `mounts` array supports the following fields:
 | `index_files` | Array | ❌ No | Index files for this mount |
 | `spa_mode` | Boolean | ❌ No | Enable SPA mode for this mount |
 | `spa_fallback_file` | String | ❌ No | SPA fallback file for this mount |
+| `order` | Number | ❌ No | Routing order (lower = evaluated first, default: 100) |
 
 **Note:** MIME type mappings are configured at the top-level `static_files` level and are inherited by all mounts automatically.
 
@@ -580,6 +584,93 @@ Mount configurations inherit values from the parent `static_files` configuration
   }
 }
 ```
+
+## 🔀 Routing Order and Priority
+
+When combining static file serving and reverse proxy routes, you can control the evaluation order using the `order` field. This is particularly useful when you have overlapping paths, such as serving a SPA from "/" while also handling API routes like "/api/**".
+
+### How Routing Order Works
+
+1. **Lower `order` values are evaluated first** (e.g., order=10 before order=50)
+2. **Default values:**
+   - Reverse proxy routes: `order = 50`
+   - Static file mounts: `order = 100`
+3. **Route matching:**
+   - Routes are evaluated in order from lowest to highest `order` value
+   - For static mounts, if a file is not found (404), the next route is tried
+   - For reverse proxy routes, the request is forwarded immediately if predicates match
+4. **Backward compatibility:** If `order` is not specified, default values are used
+
+### Common Use Cases
+
+#### Use Case 1: API Routes with SPA Fallback
+
+Serve API routes before falling back to SPA for all other paths:
+
+```json
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8088",
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/",
+        "root_dir": "./dist",
+        "order": 100,
+        "spa_mode": true
+      }
+    ]
+  },
+  "reverse_proxy_routes": [
+    {
+      "id": "api",
+      "target": "http://127.0.0.1:8080",
+      "order": 10,
+      "predicates": [
+        { "type": "Path", "patterns": ["/api/**"] }
+      ]
+    }
+  ]
+}
+```
+
+In this example:
+- API requests to `/api/**` are evaluated first (order=10) and forwarded to the backend
+- All other requests fall through to the static file handler (order=100)
+- If a static file is not found, the SPA fallback serves `index.html`
+
+#### Use Case 2: Multiple Static Mounts with Different Priorities
+
+```json
+{
+  "static_files": {
+    "mounts": [
+      {
+        "path": "/admin",
+        "root_dir": "./admin-dist",
+        "order": 50
+      },
+      {
+        "path": "/",
+        "root_dir": "./public",
+        "order": 100
+      }
+    ]
+  }
+}
+```
+
+In this example:
+- Requests to `/admin/**` are checked first (order=50)
+- If no file is found in `./admin-dist`, requests fall through to the `/` mount (order=100)
+
+### Best Practices
+
+1. **Use explicit `order` values** when combining static files and reverse proxy routes with overlapping paths
+2. **Reserve low order values (0-49)** for critical routes like APIs and authentication
+3. **Use default values (50-99)** for standard reverse proxy routes
+4. **Use high order values (100+)** for static file serving and catch-all routes
+5. **Leave gaps between order values** (e.g., 10, 20, 30) to allow for future insertions
 
 ## 🔧 Reverse Proxy Headers
 

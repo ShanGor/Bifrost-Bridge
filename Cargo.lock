@@ -177,7 +177,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bifrost-bridge"
-version = "1.1.1"
+version = "1.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -197,12 +197,14 @@ dependencies = [
  "hyper",
  "hyper-tls",
  "hyper-util",
+ "ipnet",
  "log",
  "mime_guess",
  "num_cpus",
  "percent-encoding",
  "prometheus",
  "rand",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "serde",

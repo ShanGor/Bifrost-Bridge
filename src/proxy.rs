@@ -9,7 +9,7 @@ use crate::monitoring::MonitoringServer;
 use crate::rate_limit::{RateLimiter, RateLimitHit};
 use log::{info, debug, warn, error};
 use hyper::{Response, StatusCode};
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper_util::rt::TokioIo;
@@ -111,7 +111,7 @@ impl ProxyFactory {
                     info!("Combined reverse proxy + static files mode");
                     let static_config = config.static_files.unwrap();
                     debug!("Static files configuration - mounts: {}", static_config.mounts.len());
-                    let handler = StaticFileHandler::new(static_config)?
+                    let handler = StaticFileHandler::new(static_config.clone())?
                         .with_metrics(monitoring_handles.static_metrics());
 
                     // Support backward compatibility with timeout_secs
@@ -125,7 +125,7 @@ impl ProxyFactory {
                     let proxy = if !reverse_routes.is_empty() {
                         info!("Reverse proxy routes: {}", reverse_routes.len());
                         ReverseProxy::new_with_routes(
-                            reverse_routes,
+                            reverse_routes.clone(),
                             connect_timeout_secs,
                             idle_timeout_secs,
                             max_connection_lifetime_secs,
@@ -147,6 +147,43 @@ impl ProxyFactory {
                     .with_metrics(monitoring_handles.reverse_metrics())
                     .with_rate_limiter(rate_limiter.clone());
 
+                    // Build unified route table
+                    let mut route_table = Vec::new();
+                    
+                    // Add static mounts to route table
+                    for (idx, mount) in static_config.mounts.iter().enumerate() {
+                        let resolved = mount.resolve_inheritance(&static_config);
+                        route_table.push(RouteEntry::StaticMount {
+                            order: resolved.order,
+                            mount_index: idx,
+                            path: resolved.path.clone(),
+                        });
+                    }
+                    
+                    // Add reverse proxy routes to route table
+                    for route in &reverse_routes {
+                        let order = route.order.unwrap_or(50); // Default order for reverse proxy
+                        route_table.push(RouteEntry::ReverseProxy {
+                            order,
+                            route_id: route.id.clone(),
+                        });
+                    }
+                    
+                    // Sort route table by order (ascending - lower order = higher priority)
+                    route_table.sort_by_key(|entry| entry.order());
+                    
+                    info!("Built unified route table with {} entries", route_table.len());
+                    for entry in &route_table {
+                        match entry {
+                            RouteEntry::StaticMount { order, path, .. } => {
+                                info!("  Route order {}: Static mount '{}'", order, path);
+                            }
+                            RouteEntry::ReverseProxy { order, route_id } => {
+                                info!("  Route order {}: Reverse proxy route '{}'", order, route_id);
+                            }
+                        }
+                    }
+
                     Box::new(CombinedProxyAdapter {
                         reverse_proxy: proxy,
                         static_handler: handler,
@@ -154,6 +191,7 @@ impl ProxyFactory {
                         private_key: config.private_key,
                         certificate: config.certificate,
                         rate_limiter: rate_limiter.clone(),
+                        route_table,
                     })
                 } else {
                     // Reverse proxy only mode
@@ -462,6 +500,29 @@ impl Proxy for StaticFileProxyAdapter {
     }
 }
 
+/// Unified route entry for combined mode routing
+#[derive(Clone, Debug)]
+enum RouteEntry {
+    StaticMount {
+        order: u32,
+        mount_index: usize,
+        path: String,
+    },
+    ReverseProxy {
+        order: u32,
+        route_id: String,
+    },
+}
+
+impl RouteEntry {
+    fn order(&self) -> u32 {
+        match self {
+            RouteEntry::StaticMount { order, .. } => *order,
+            RouteEntry::ReverseProxy { order, .. } => *order,
+        }
+    }
+}
+
 struct CombinedProxyAdapter {
     reverse_proxy: ReverseProxy,
     static_handler: StaticFileHandler,
@@ -471,6 +532,79 @@ struct CombinedProxyAdapter {
     #[allow(dead_code)]
     certificate: Option<String>,
     rate_limiter: Arc<RateLimiter>,
+    route_table: Vec<RouteEntry>,
+}
+
+impl CombinedProxyAdapter {
+    /// Route request using the unified route table
+    async fn route_request(
+        static_handler: &StaticFileHandler,
+        reverse_proxy: &ReverseProxy,
+        route_table: &[RouteEntry],
+        req: hyper::Request<Incoming>,
+        remote_addr: SocketAddr,
+    ) -> Result<Response<FileBody>, Infallible> {
+        let request_path = req.uri().path().to_string();
+        let context = crate::reverse_proxy::RequestContext {
+            client_ip: Some(remote_addr.ip().to_string()),
+        };
+
+        // Iterate through route table in order
+        for entry in route_table {
+            match entry {
+                RouteEntry::StaticMount { path, .. } => {
+                    // Check if request path matches this static mount
+                    if path == "/" || request_path.starts_with(path) {
+                        if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(&request_path) {
+                            match static_handler.handle_request(&req).await {
+                                Ok(response) => {
+                                    // Static file found and served successfully
+                                    return Ok::<_, Infallible>(response);
+                                }
+                                Err(ProxyError::NotFound(_)) => {
+                                    // Static file not found, continue to next route
+                                    debug!("Static file not found for path {}, continuing to next route", request_path);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    // Other error, return 500
+                                    return Ok::<_, Infallible>(Response::builder()
+                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
+                                        .unwrap());
+                                }
+                            }
+                        }
+                    }
+                }
+                RouteEntry::ReverseProxy { .. } => {
+                    // Try reverse proxy - this consumes req, so we must return here
+                    match reverse_proxy.handle_request_with_context(req, context).await {
+                        Ok(response) => {
+                            // Convert Full<Bytes> to FileBody
+                            let (parts, body) = response.into_parts();
+                            let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
+                            return Ok::<_, Infallible>(response_with_file_body);
+                        }
+                        Err(_) => {
+                            // Reverse proxy failed, but we can't continue because req was consumed
+                            // Return error response
+                            return Ok::<_, Infallible>(Response::builder()
+                                .status(StatusCode::BAD_GATEWAY)
+                                .body(FileBody::InMemory(Full::new(Bytes::from("Bad Gateway"))))
+                                .unwrap());
+                        }
+                    }
+                }
+            }
+        }
+
+        // No route matched or all routes failed
+        Ok::<_, Infallible>(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(FileBody::InMemory(Full::new(Bytes::from("Not Found"))))
+            .unwrap())
+    }
 }
 
 impl Proxy for CombinedProxyAdapter {
@@ -482,6 +616,7 @@ impl Proxy for CombinedProxyAdapter {
             let reverse_proxy = Arc::new(self.reverse_proxy);
             let static_handler = Arc::new(self.static_handler);
             let rate_limiter = self.rate_limiter.clone();
+            let route_table = Arc::new(self.route_table);
 
             match (private_key, certificate) {
                 (Some(private_key_path), Some(cert_path)) => {
@@ -509,6 +644,7 @@ impl Proxy for CombinedProxyAdapter {
                         let reverse_proxy_ref = reverse_proxy.clone();
                         let static_handler_ref = static_handler.clone();
                         let rate_limiter = rate_limiter.clone();
+                        let route_table_ref = route_table.clone();
                         let client_ip = remote_addr.ip().to_string();
 
                         tokio::spawn(async move {
@@ -518,82 +654,36 @@ impl Proxy for CombinedProxyAdapter {
                                         let reverse_proxy = reverse_proxy_ref.clone();
                                         let static_handler = static_handler_ref.clone();
                                         let rate_limiter = rate_limiter.clone();
+                                        let route_table = route_table_ref.clone();
                                         let client_ip = client_ip.clone();
                                         async move {
-                                            // Route request to appropriate handler
-                                            let request_path = req.uri().path();
-
-                                            // Check if request matches any static file mount
-                                            if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(request_path) {
-                                                if let Err(hit) = rate_limiter
-                                                    .check_request(
-                                                        &client_ip,
-                                                        req.method(),
-                                                        req.uri()
-                                                            .path_and_query()
-                                                            .map(|pq| pq.as_str())
-                                                            .unwrap_or("/"),
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!(
-                                                        "Combined HTTPS rate limit hit for {} via rule {}",
-                                                        client_ip, hit.rule_id
-                                                    );
-                                                    return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
-                                                }
-
-                                                // Serve static file
-                                                match static_handler.handle_request(&req).await {
-                                                    Ok(response) => Ok::<_, Infallible>(response),
-                                                    Err(ProxyError::NotFound(_)) => {
-                                                        // Fall back to reverse proxy if static file not found
-                                                        let context = crate::reverse_proxy::RequestContext {
-                                                            client_ip: Some(remote_addr.ip().to_string()),
-                                                        };
-                                                        match reverse_proxy.handle_request_with_context(req, context).await {
-                                                            Ok(response) => {
-                                                                // Convert Full<Bytes> to FileBody
-                                                                let (parts, body) = response.into_parts();
-                                                                let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
-                                                                Ok::<_, Infallible>(response_with_file_body)
-                                                            }
-                                                            Err(_) => {
-                                                                Ok::<_, Infallible>(Response::builder()
-                                                                    .status(StatusCode::BAD_GATEWAY)
-                                                                    .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
-                                                                    .unwrap())
-                                                            }
-                                                        }
-                                                    },
-                                                    Err(_) => {
-                                                        Ok::<_, Infallible>(Response::builder()
-                                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
-                                                            .unwrap())
-                                                    }
-                                                }
-                                            } else {
-                                                // Forward to reverse proxy
-                                                let context = crate::reverse_proxy::RequestContext {
-                                                    client_ip: Some(remote_addr.ip().to_string()),
-                                                };
-                                                match reverse_proxy.handle_request_with_context(req, context).await {
-                                                    Ok(response) => {
-                                                        // Convert Full<Bytes> to FileBody
-                                                        let (parts, body) = response.into_parts();
-                                                        let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
-                                                        Ok::<_, Infallible>(response_with_file_body)
-                                                    }
-                                                    Err(_) => {
-                                                        Ok::<_, Infallible>(Response::builder()
-                                                            .status(StatusCode::BAD_GATEWAY)
-                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
-                                                            .unwrap())
-                                                    }
-                                                }
+                                            // Rate limiting check
+                                            if let Err(hit) = rate_limiter
+                                                .check_request(
+                                                    &client_ip,
+                                                    req.method(),
+                                                    req.uri()
+                                                        .path_and_query()
+                                                        .map(|pq| pq.as_str())
+                                                        .unwrap_or("/"),
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Combined HTTPS rate limit hit for {} via rule {}",
+                                                    client_ip, hit.rule_id
+                                                );
+                                                return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
                                             }
 
+                                            // Route request using unified route table
+                                            CombinedProxyAdapter::route_request(
+                                                &static_handler,
+                                                &reverse_proxy,
+                                                &route_table,
+                                                req,
+                                                remote_addr,
+                                            ).await
                                         }
                                     });
 
@@ -628,6 +718,7 @@ impl Proxy for CombinedProxyAdapter {
                         let reverse_proxy = reverse_proxy.clone();
                         let static_handler = static_handler.clone();
                         let rate_limiter = rate_limiter.clone();
+                        let route_table = route_table.clone();
                         let client_ip = remote_addr.ip().to_string();
                         tokio::spawn(async move {
                             let io = TokioIo::new(stream);
@@ -639,82 +730,36 @@ impl Proxy for CombinedProxyAdapter {
                                         let reverse_proxy = reverse_proxy.clone();
                                         let static_handler = static_handler.clone();
                                         let rate_limiter = rate_limiter.clone();
+                                        let route_table = route_table.clone();
                                         let client_ip = client_ip.clone();
                                         async move {
-                                            // Route request to appropriate handler
-                                            let request_path = req.uri().path();
-
-                                            // Check if request matches any static file mount
-                                            if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(request_path) {
-                                                if let Err(hit) = rate_limiter
-                                                    .check_request(
-                                                        &client_ip,
-                                                        req.method(),
-                                                        req.uri()
-                                                            .path_and_query()
-                                                            .map(|pq| pq.as_str())
-                                                            .unwrap_or("/"),
-                                                    )
-                                                    .await
-                                                {
-                                                    warn!(
-                                                        "Combined HTTP rate limit hit for {} via rule {}",
-                                                        client_ip, hit.rule_id
-                                                    );
-                                                    return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
-                                                }
-
-                                                // Serve static file
-                                                match static_handler.handle_request(&req).await {
-                                                    Ok(response) => Ok::<_, Infallible>(response),
-                                                    Err(ProxyError::NotFound(_)) => {
-                                                        // Fall back to reverse proxy if static file not found
-                                                        let context = crate::reverse_proxy::RequestContext {
-                                                            client_ip: Some(remote_addr.ip().to_string()),
-                                                        };
-                                                        match reverse_proxy.handle_request_with_context(req, context).await {
-                                                            Ok(response) => {
-                                                                // Convert Full<Bytes> to FileBody
-                                                                let (parts, body) = response.into_parts();
-                                                                let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
-                                                                Ok::<_, Infallible>(response_with_file_body)
-                                                            }
-                                                            Err(_) => {
-                                                                Ok::<_, Infallible>(Response::builder()
-                                                                    .status(StatusCode::BAD_GATEWAY)
-                                                                    .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
-                                                                    .unwrap())
-                                                            }
-                                                        }
-                                                    },
-                                                    Err(_) => {
-                                                        Ok::<_, Infallible>(Response::builder()
-                                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
-                                                            .unwrap())
-                                                    }
-                                                }
-                                            } else {
-                                                // Forward to reverse proxy
-                                                let context = crate::reverse_proxy::RequestContext {
-                                                    client_ip: Some(remote_addr.ip().to_string()),
-                                                };
-                                                match reverse_proxy.handle_request_with_context(req, context).await {
-                                                    Ok(response) => {
-                                                        // Convert Full<Bytes> to FileBody
-                                                        let (parts, body) = response.into_parts();
-                                                        let response_with_file_body = Response::from_parts(parts, FileBody::InMemory(body));
-                                                        Ok::<_, Infallible>(response_with_file_body)
-                                                    }
-                                                    Err(_) => {
-                                                        Ok::<_, Infallible>(Response::builder()
-                                                            .status(StatusCode::BAD_GATEWAY)
-                                                            .body(FileBody::InMemory(Full::new(Bytes::from("Proxy Error"))))
-                                                            .unwrap())
-                                                    }
-                                                }
+                                            // Rate limiting check
+                                            if let Err(hit) = rate_limiter
+                                                .check_request(
+                                                    &client_ip,
+                                                    req.method(),
+                                                    req.uri()
+                                                        .path_and_query()
+                                                        .map(|pq| pq.as_str())
+                                                        .unwrap_or("/"),
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Combined HTTP rate limit hit for {} via rule {}",
+                                                    client_ip, hit.rule_id
+                                                );
+                                                return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
                                             }
 
+                                            // Route request using unified route table
+                                            CombinedProxyAdapter::route_request(
+                                                &static_handler,
+                                                &reverse_proxy,
+                                                &route_table,
+                                                req,
+                                                remote_addr,
+                                            ).await
                                         }
                                     })
                                 )
@@ -765,6 +810,50 @@ mod tests {
 
         let proxy = ProxyFactory::create_proxy(config);
         assert!(proxy.is_err());
+    }
+
+    #[test]
+    fn test_route_entry_order() {
+        let static_entry = RouteEntry::StaticMount {
+            order: 100,
+            mount_index: 0,
+            path: "/".to_string(),
+        };
+        let proxy_entry = RouteEntry::ReverseProxy {
+            order: 50,
+            route_id: "api".to_string(),
+        };
+
+        assert_eq!(static_entry.order(), 100);
+        assert_eq!(proxy_entry.order(), 50);
+        assert!(proxy_entry.order() < static_entry.order());
+    }
+
+    #[test]
+    fn test_route_table_sorting() {
+        let mut routes = vec![
+            RouteEntry::StaticMount {
+                order: 100,
+                mount_index: 0,
+                path: "/".to_string(),
+            },
+            RouteEntry::ReverseProxy {
+                order: 50,
+                route_id: "api".to_string(),
+            },
+            RouteEntry::StaticMount {
+                order: 10,
+                mount_index: 1,
+                path: "/admin".to_string(),
+            },
+        ];
+
+        routes.sort_by_key(|entry| entry.order());
+
+        // Verify order after sorting
+        assert_eq!(routes[0].order(), 10);
+        assert_eq!(routes[1].order(), 50);
+        assert_eq!(routes[2].order(), 100);
     }
 }
 

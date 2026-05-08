@@ -492,6 +492,7 @@ mod config_validation_tests {
             reverse_proxy_config: None,
             strip_path_prefix: None,
             priority: Some(0),
+            order: None,
             predicates: vec![RoutePredicateConfig::Path {
                 patterns: vec!["/**".to_string()],
                 match_trailing_slash: true,

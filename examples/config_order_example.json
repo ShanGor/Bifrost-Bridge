@@ -9,8 +9,8 @@
   "static_files": {
     "mounts": [
       {
-        "path": "/blog",
-        "root_dir": "D:\\sources\\rust\\sam-blog\\frontend\\dist",
+        "path": "/",
+        "root_dir": "./dist",
         "order": 100
       }
     ],
@@ -21,18 +21,12 @@
   },
   "reverse_proxy_routes": [
     {
-      "id": "primary-api",
+      "id": "api-route",
       "target": "http://127.0.0.1:8080",
-      "priority": 0,
       "order": 50,
-      "reverse_proxy_config": {
-        "pool_max_idle_per_host": 4,
-        "pool_idle_timeout_secs": 120
-      },
       "predicates": [
-        { "type": "Path", "patterns": ["/blog-api/**"], "match_trailing_slash": true }
-      ],
-      "strip_path_prefix": "/blog-api"
+        { "type": "Path", "patterns": ["/api/**"], "match_trailing_slash": true }
+      ]
     }
   ],
   "monitoring": {

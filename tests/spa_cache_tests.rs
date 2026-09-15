@@ -34,7 +34,6 @@ async fn test_spa_index_files_no_cache() {
             no_cache_files: None,
             cache_millisecs: None,
             order: None,
-            order: None,
         }],
         enable_directory_listing: false,
         index_files: vec!["index.html".to_string(), "index.htm".to_string()],

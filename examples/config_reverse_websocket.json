@@ -1,0 +1,29 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8000",
+  "reverse_proxy_routes": [
+    {
+      "id": "app",
+      "target": "http://localhost:3000",
+      "priority": 0,
+      "predicates": [
+        {
+          "type": "Path",
+          "patterns": ["/**"],
+          "match_trailing_slash": true
+        }
+      ],
+      "reverse_proxy_config": {
+        "pool_max_idle_per_host": 32,
+        "pool_idle_timeout_secs": 30
+      }
+    }
+  ],
+  "max_connections": 1000,
+  "connect_timeout_secs": 10,
+  "idle_timeout_secs": 90,
+  "max_connection_lifetime_secs": 300,
+  "monitoring": {
+    "enabled": false
+  }
+}

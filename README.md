@@ -321,6 +321,39 @@ The reverse proxy automatically adds the following headers:
 - `X-Forwarded-Host`: Original Host header
 - `X-Proxy-Server`: Proxy server identification
 
+### WebSocket / WSS Support
+
+WebSocket traffic shares the same listener and routes as regular HTTP traffic — no separate
+port or route is required. A WebSocket connection starts as an ordinary HTTP GET with
+`Upgrade: websocket` headers; Bifrost-Bridge detects the upgrade on any route and tunnels it
+to the selected target, while all other requests on the same port continue through the normal
+HTTP path.
+
+The protocol used on each side is independent and follows your configuration:
+
+| Listener (client side) | Target scheme | Result |
+|---|---|---|
+| plain (no `private_key`/`certificate`) | `http://` or `ws://` | `ws://` client → plain backend |
+| plain | `https://` or `wss://` | `ws://` client → TLS backend |
+| TLS (`private_key` + `certificate` set) | `http://` or `ws://` | `wss://` client → plain backend (TLS termination) |
+| TLS | `https://` or `wss://` | `wss://` client → TLS backend (end-to-end TLS) |
+
+Notes:
+
+- `ws://` / `wss://` target schemes are accepted as aliases for `http://` / `https://`.
+- When TLS is enabled on the listener, only HTTPS/WSS clients are accepted (plain HTTP is not
+  served on that port).
+- Backend TLS is verified against the system trust store (via native-tls). For backends with
+  self-signed certificates, install the CA in the system store or set `SSL_CERT_FILE=/path/to/ca.crt`.
+
+Example configurations:
+
+- `examples/config_reverse_websocket.json` — HTTP + WS on one plain port
+- `examples/config_reverse_wss_tls_termination.json` — HTTPS + WSS on one TLS port, plain
+  HTTP/WS backend (TLS terminated at the proxy)
+- `examples/config_reverse_wss.json` — HTTPS + WSS on one TLS port, HTTPS/WSS backend
+  (end-to-end TLS; generate dev certs with `examples/gen-certs.sh`)
+
 ## SPA (Single Page Application) Support
 
 The proxy server includes built-in support for serving Single Page Applications with client-side routing.

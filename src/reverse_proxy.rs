@@ -1,5 +1,6 @@
 use crate::common::{
-    ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, is_websocket_upgrade,
+    ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, TlsConfig,
+    is_websocket_upgrade,
 };
 use crate::config::{
     HeaderOverrideConfig, HealthCheckConfig, LoadBalancingPolicy, ReverseProxyConfig,
@@ -16,6 +17,7 @@ use hyper::header::{HeaderName, HOST, ORIGIN};
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use ipnet::IpNet;
@@ -32,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::time::Duration;
+use tokio_rustls::TlsAcceptor;
 use url::form_urlencoded;
 use url::Url;
 
@@ -42,6 +45,9 @@ static X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host"
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type BoxedBody = BoxBody<Bytes, BoxError>;
+
+/// Connector supporting both plain HTTP and TLS (HTTPS/WSS) backends
+type BackendConnector = HttpsConnector<HttpConnector>;
 
 /// Wrapper to store request data including client IP
 #[derive(Clone, Debug)]
@@ -68,7 +74,7 @@ struct CompiledTarget {
 struct CompiledRoute {
     id: String,
     targets: Vec<CompiledTarget>,
-    http_client: Arc<Client<HttpConnector, BoxedBody>>,
+    http_client: Arc<Client<BackendConnector, BoxedBody>>,
     health_check_config: Option<HealthCheckConfig>,
     strip_path_prefix: Option<String>,
     priority: i32,
@@ -253,6 +259,22 @@ impl RouteMatcher {
                         cfg.id, target_cfg.id, e
                     ))
                 })?;
+                // Normalize WebSocket schemes to their HTTP equivalents so the
+                // forwarding client can handle them; wss:// implies TLS.
+                let url = match url.scheme() {
+                    "ws" | "wss" => {
+                        let normalized = if url.scheme() == "wss" { "https" } else { "http" };
+                        let mut url = url;
+                        url.set_scheme(normalized).map_err(|_| {
+                            ProxyError::Config(format!(
+                                "Cannot normalize target URL scheme for {} ({})",
+                                cfg.id, target_cfg.id
+                            ))
+                        })?;
+                        url
+                    }
+                    _ => url,
+                };
                 targets.push(CompiledTarget {
                     id: target_cfg.id,
                     url,
@@ -434,7 +456,7 @@ impl RouteMatcher {
 
     fn routes_with_health_checks(
         &self,
-    ) -> Vec<(String, Url, Arc<Client<HttpConnector, BoxedBody>>, HealthCheckConfig, Arc<AtomicBool>)> {
+    ) -> Vec<(String, Url, Arc<Client<BackendConnector, BoxedBody>>, HealthCheckConfig, Arc<AtomicBool>)> {
         let mut entries = Vec::new();
         for route in &self.routes {
             if let Some(cfg) = route.health_check_config.clone() {
@@ -1215,16 +1237,23 @@ impl ReverseProxy {
         })
     }
 
-    /// Build HTTP client for reverse proxy with connection pooling
+    /// Build HTTP client for reverse proxy with connection pooling.
+    /// The connector supports both plain HTTP and TLS (HTTPS/WSS) backends;
+    /// the scheme of the route target URL decides which is used.
     fn build_http_client(
         connect_timeout_secs: u64,
         pool_max_idle_per_host: usize,
         pool_idle_timeout_secs: u64,
-    ) -> Client<HttpConnector, BoxedBody> {
+    ) -> Client<BackendConnector, BoxedBody> {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(connect_timeout_secs)));
         connector.set_keepalive(Some(Duration::from_secs(pool_idle_timeout_secs)));
         connector.set_nodelay(true);
+        // Allow https:// URIs through the inner connector so the TLS layer can
+        // handle them (HttpConnector defaults to rejecting non-http schemes).
+        connector.enforce_http(false);
+        // Enforce DNS resolution + TLS for https:// targets
+        let connector = HttpsConnector::new_with_connector(connector);
 
         let mut builder = Client::builder(TokioExecutor::new());
 
@@ -1278,11 +1307,37 @@ impl ReverseProxy {
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
+        self.run_with_config(addr, None, None).await
+    }
+
+    /// Run the reverse proxy, optionally terminating TLS (HTTPS/WSS) on the
+    /// listener when both a private key and certificate are provided.
+    pub async fn run_with_config(
+        self,
+        addr: SocketAddr,
+        private_key: Option<String>,
+        certificate: Option<String>,
+    ) -> Result<(), ProxyError> {
+        let tls_acceptor = match (private_key, certificate) {
+            (Some(private_key_path), Some(cert_path)) => {
+                info!("Enabling TLS mode for reverse proxy");
+                debug!("Loading TLS certificate from: {}", cert_path);
+                debug!("Loading TLS private key from: {}", private_key_path);
+                let tls_config = TlsConfig::create_config(&private_key_path, &cert_path)?;
+                Some(TlsAcceptor::from(Arc::new(tls_config)))
+            }
+            _ => None,
+        };
+
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| ProxyError::Hyper(e.to_string()))?;
 
-        info!("Reverse proxy listening on: {}", addr);
+        if tls_acceptor.is_some() {
+            info!("Reverse proxy listening on: https://{} (wss capable)", addr);
+        } else {
+            info!("Reverse proxy listening on: http://{}", addr);
+        }
 
         for (target_id, target_url, client, cfg, healthy) in self.routes.routes_with_health_checks() {
             tokio::spawn(async move {
@@ -1307,55 +1362,107 @@ impl ReverseProxy {
             let websocket_cfg = websocket_config.clone();
             let rate_limiter = rate_limiter.clone();
 
-            tokio::spawn(async move {
-                let _connection = ConnectionTracker::new(metrics.clone());
-                let io = TokioIo::new(stream);
-
-                if let Err(err) = ServerBuilder::new()
-                    .serve_connection(
-                        io,
-                        service_fn(move |req| {
-                            let routes = routes.clone();
-                            let client_ip = Some(remote_addr.ip().to_string());
-                            let metrics = metrics.clone();
-                            let websocket_cfg = websocket_cfg.clone();
-                            let rate_limiter = rate_limiter.clone();
-
-                            let context = RequestContext {
-                                client_ip: client_ip.clone(),
-                            };
-
-                            async move {
-                                metrics.increment_requests();
-                                let timer = RequestTimer::with_metrics(metrics.clone());
-                                let result = Self::handle_request_static(
-                                    req,
-                                    context,
+            match &tls_acceptor {
+                Some(acceptor) => {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                Self::serve_stream(
+                                    tls_stream,
+                                    remote_addr,
                                     routes,
                                     preserve_host,
                                     websocket_cfg,
-                                    metrics.clone(),
-                                    rate_limiter.clone(),
+                                    metrics,
+                                    rate_limiter,
                                 )
                                 .await;
-
-                                if let Some(len) = result
-                                    .as_ref()
-                                    .ok()
-                                    .and_then(|response| response.body().size_hint().exact())
-                                {
-                                    metrics.record_response_bytes(len as u64);
-                                }
-                                timer.finish();
-                                result
                             }
-                        }),
-                    )
-                    .await
-                {
-                    error!("Error serving reverse proxy connection: {}", err);
+                            Err(e) => {
+                                warn!("TLS handshake failed from {}: {}", remote_addr, e);
+                            }
+                        }
+                    });
                 }
-            });
+                None => {
+                    tokio::spawn(async move {
+                        Self::serve_stream(
+                            stream,
+                            remote_addr,
+                            routes,
+                            preserve_host,
+                            websocket_cfg,
+                            metrics,
+                            rate_limiter,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Serve a single accepted connection (plain TCP or TLS) over HTTP/1,
+    /// with support for connection upgrades (WebSocket).
+    async fn serve_stream<S>(
+        stream: S,
+        remote_addr: SocketAddr,
+        routes: Arc<RouteMatcher>,
+        preserve_host: bool,
+        websocket_cfg: Arc<WebSocketConfig>,
+        metrics: Arc<PerformanceMetrics>,
+        rate_limiter: Arc<RateLimiter>,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let _connection = ConnectionTracker::new(metrics.clone());
+        let io = TokioIo::new(stream);
+
+        if let Err(err) = ServerBuilder::new()
+            .serve_connection(
+                io,
+                service_fn(move |req| {
+                    let routes = routes.clone();
+                    let client_ip = Some(remote_addr.ip().to_string());
+                    let metrics = metrics.clone();
+                    let websocket_cfg = websocket_cfg.clone();
+                    let rate_limiter = rate_limiter.clone();
+
+                    let context = RequestContext {
+                        client_ip: client_ip.clone(),
+                    };
+
+                    async move {
+                        metrics.increment_requests();
+                        let timer = RequestTimer::with_metrics(metrics.clone());
+                        let result = Self::handle_request_static(
+                            req,
+                            context,
+                            routes,
+                            preserve_host,
+                            websocket_cfg,
+                            metrics.clone(),
+                            rate_limiter.clone(),
+                        )
+                        .await;
+
+                        if let Some(len) = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|response| response.body().size_hint().exact())
+                        {
+                            metrics.record_response_bytes(len as u64);
+                        }
+                        timer.finish();
+                        result
+                    }
+                }),
+            )
+            .with_upgrades()
+            .await
+        {
+            error!("Error serving reverse proxy connection: {}", err);
         }
     }
 
@@ -1957,7 +2064,7 @@ impl ReverseProxy {
     /// Health check loop (runs in background)
     async fn health_check_loop(
         target_id: String,
-        http_client: Arc<Client<HttpConnector, BoxedBody>>,
+    http_client: Arc<Client<BackendConnector, BoxedBody>>,
         target_url: Url,
         config: HealthCheckConfig,
         healthy: Arc<AtomicBool>,
@@ -1966,7 +2073,7 @@ impl ReverseProxy {
         let timeout = Duration::from_secs(config.timeout_secs);
         let endpoint = config.endpoint.clone();
 
-        let port = target_url.port().unwrap_or(80);
+        let port = target_url.port_or_known_default().unwrap_or(80);
         info!(
             "Starting health check for target '{}' on {} (interval={}s, timeout={}s, endpoint={})",
             target_id,
@@ -2023,7 +2130,7 @@ impl ReverseProxy {
             Some(h) => h,
             None => return false,
         };
-        let port = target_url.port().unwrap_or(80);
+        let port = target_url.port_or_known_default().unwrap_or(80);
 
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await {
             Ok(Ok(_)) => true,
@@ -2040,16 +2147,17 @@ impl ReverseProxy {
 
     /// HTTP endpoint health check
     async fn http_health_check(
-        _http_client: &Client<HttpConnector, BoxedBody>,
+        _http_client: &Client<BackendConnector, BoxedBody>,
         target_url: &Url,
         endpoint: &str,
         timeout: Duration,
     ) -> bool {
         let health_url = format!("{}{}", target_url.as_str().trim_end_matches('/'), endpoint);
 
-        // Use a simple HTTP client for health check (not the pooled client)
-        let connector = HttpConnector::new();
-        let simple_client: Client<HttpConnector, Empty<Bytes>> =
+        // Use a simple HTTP client for health check (not the pooled client).
+        // HttpsConnector handles both http:// and https:// targets.
+        let connector = HttpsConnector::new();
+        let simple_client: Client<BackendConnector, Empty<Bytes>> =
             Client::builder(TokioExecutor::new()).build(connector);
 
         let request = match Request::builder()

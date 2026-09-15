@@ -11,10 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive documentation system in `docs/` folder
 - Requirements tracking system in `requirements/` folder
 - Development guidelines and contribution standards
+- **Reverse Proxy TLS Termination**
+  - Reverse proxy mode now honors `private_key`/`certificate` config and terminates TLS on the listener (HTTPS/WSS capable)
+  - Reverse proxy can now forward to `https://` backends (native-tls connector with system root certificates)
+  - Route targets may use `ws://`/`wss://` schemes, normalized to `http://`/`https://` internally; `wss://` implies TLS to the backend
+  - New example configs: `config_reverse_websocket.json`, `config_reverse_wss_tls_termination.json`, `config_reverse_wss.json`
 
 ### Changed
 - Updated example configurations to use inheritance
 - Improved code organization and documentation
+- Health check default port now respects the target URL scheme (443 for HTTPS/WSS)
 
 ### Fixed
 - **Client IP Detection Fix** (R014)
@@ -23,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Critical for access logging, rate limiting, and security auditing
   - Added comprehensive unit tests for client IP extraction
   - Updated documentation in `docs/configuration.md`
+- **WebSocket Reverse Proxy Tunnel Failure**
+  - Fixed broken WebSocket tunneling: hyper's `serve_connection` requires `.with_upgrades()` or every `hyper::upgrade::on()` fails with "upgrade expected but low level API in use", so the 101 handshake completed but no data flowed
+  - Applied to reverse proxy, combined (reverse + static) proxy, and forward proxy serving paths
+  - Fixed backend TLS connect failure (`invalid URL, scheme is not http`) by disabling `enforce_http` on the inner connector
+- Fixed duplicate `order` field in `tests/spa_cache_tests.rs` that prevented the test suite from compiling
 
 ## [0.1.0] - 2025-11-15
 

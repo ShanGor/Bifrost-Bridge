@@ -304,9 +304,7 @@ impl Proxy for ForwardProxyAdapter {
 struct ReverseProxyAdapter {
     proxy: ReverseProxy,
     addr: std::net::SocketAddr,
-    #[allow(dead_code)]
     private_key: Option<String>,
-    #[allow(dead_code)]
     certificate: Option<String>,
 }
 
@@ -314,7 +312,10 @@ impl Proxy for ReverseProxyAdapter {
     fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
         Box::pin(async move {
             let addr = self.addr;
-            self.proxy.run(addr).await
+            let private_key = self.private_key;
+            let certificate = self.certificate;
+
+            self.proxy.run_with_config(addr, private_key, certificate).await
         })
     }
 }
@@ -692,6 +693,7 @@ impl Proxy for CombinedProxyAdapter {
                                     if let Err(e) = ServerBuilder::new()
                                         .keep_alive(true)
                                         .serve_connection(TokioIo::new(tls_stream), service)
+                                        .with_upgrades()
                                         .await
                                     {
                                         error!("Error serving TLS connection: {}", e);
@@ -765,6 +767,7 @@ impl Proxy for CombinedProxyAdapter {
                                         }
                                     })
                                 )
+                                .with_upgrades()
                                 .await
                             {
                                 error!("Error serving HTTP connection: {}", err);

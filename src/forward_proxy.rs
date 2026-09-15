@@ -383,6 +383,7 @@ impl ForwardProxy {
                             }
                         })
                     )
+                    .with_upgrades()
                     .await
                 {
                     error!("Error serving forward proxy connection: {}", err);
@@ -609,6 +610,7 @@ impl ForwardProxy {
                             if let Err(e) = ServerBuilder::new()
                                 .keep_alive(true)
                                 .serve_connection(TokioIo::new(tls_stream), service)
+                                .with_upgrades()
                                 .await
                             {
                                 error!("Error serving HTTPS connection: {}", e);

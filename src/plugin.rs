@@ -1,29 +1,35 @@
 //! Signed, capability-gated QuickJS access plugins.
 //!
-//! This module deliberately exposes a small data-only PDK. JavaScript never
+//! This module deliberately exposes a small capability-gated PDK. JavaScript never
 //! receives a raw value for a header that its own attachment declares as a
 //! credential, nor does it receive filesystem handles, sockets, or process
 //! APIs. The service owner may deliberately grant another plugin access to
 //! that header through its `permitted_headers`; plugins on one route are an
-//! explicitly configured, trusted composition. Networked identity exchange
-//! and JWT verification are host services and are intentionally not emulated
-//! by arbitrary JavaScript here.
+//! explicitly configured, trusted composition. Networked identity exchange,
+//! sensitive caching, and JWT verification execute in native host services;
+//! JavaScript receives promises and opaque credential handles.
 
 use crate::config::{PluginRuntimeConfig, RoutePluginConfig};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use crate::plugin_host::{CredentialVault, HostRuntime};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use jsonschema::validator_for;
-use rquickjs::{Context, Runtime};
+use rquickjs::{
+    AsyncContext, AsyncRuntime, Promise, async_with,
+    function::{Async, Func},
+};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 const RESERVED_HEADERS: &[&str] = &[
     "authorization",
@@ -63,6 +69,9 @@ struct Manifest {
 #[derive(Clone)]
 struct LoadedPlugin {
     package: String,
+    route_id: String,
+    namespace: String,
+    phases: HashSet<String>,
     capabilities: HashSet<String>,
     code: Arc<String>,
     attachment: RoutePluginConfig,
@@ -76,6 +85,7 @@ pub struct PluginChain {
     fingerprint_key: [u8; 32],
     memory_limit_bytes: usize,
     execution_timeout_millis: u64,
+    host: Option<Arc<HostRuntime>>,
 }
 
 impl PluginChain {
@@ -102,39 +112,83 @@ impl PluginChain {
     /// callers apply the returned headers only after an allow outcome.
     pub fn run_access_headers(
         &self,
+        headers: HeaderMap,
+        method: &str,
+        path: &str,
+    ) -> Result<(PluginOutcome, HeaderMap), PluginError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PluginError::Execution(error.to_string()))?;
+        runtime.block_on(self.run_access_headers_async(headers, method, path))
+    }
+
+    pub fn run_access_headers_with_cancel(
+        &self,
+        headers: HeaderMap,
+        method: &str,
+        path: &str,
+        cancellation: CancellationToken,
+    ) -> Result<(PluginOutcome, HeaderMap), PluginError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PluginError::Execution(error.to_string()))?;
+        runtime.block_on(async {
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(PluginError::Execution("plugin request was cancelled".to_string())),
+                result = self.run_access_headers_async(headers, method, path) => result,
+            }
+        })
+    }
+
+    /// Async implementation used by the dedicated plugin workers. QuickJS
+    /// promises may suspend while native host services perform bounded I/O.
+    pub async fn run_access_headers_async(
+        &self,
         mut headers: HeaderMap,
         method: &str,
         path: &str,
     ) -> Result<(PluginOutcome, HeaderMap), PluginError> {
-        for plugin in &self.plugins {
-            let input = self.input_for(plugin, &headers, method, path);
-            let result = self.run_one(plugin, input)?;
-            match result.outcome.as_str() {
-                "allow" => self.apply_upstream_plan(plugin, &mut headers, &result)?,
-                "deny" => {
-                    let status = result.status.unwrap_or(403);
-                    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
-                    if !status.is_client_error() {
+        // Remove an untrusted inbound bearer before any plugin plan is applied.
+        // A later `upstream.authorization` plan may install a new value from an
+        // opaque credential handle.
+        headers.remove(http::header::AUTHORIZATION);
+        for phase in ["ingress", "access", "upstream"] {
+            for plugin in self
+                .plugins
+                .iter()
+                .filter(|plugin| plugin.phases.contains(phase))
+            {
+                let (input, vault) = self.input_for(plugin, &headers, method, path);
+                let result = self.run_one(plugin, phase, input, vault.clone()).await?;
+                match result.outcome.as_str() {
+                    "allow" => self.apply_upstream_plan(plugin, &mut headers, &result, &vault)?,
+                    "deny" if phase == "access" => {
+                        let status = result.status.unwrap_or(403);
+                        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+                        if !status.is_client_error() {
+                            return Err(PluginError::Execution(format!(
+                                "{} returned an invalid deny status",
+                                plugin.package
+                            )));
+                        }
+                        let code = result.code.unwrap_or_else(|| "access_denied".to_string());
+                        if !is_safe_public_code(&code) {
+                            return Err(PluginError::Execution(format!(
+                                "{} returned an invalid public error code",
+                                plugin.package
+                            )));
+                        }
+                        return Ok((PluginOutcome::Deny { status, code }, headers));
+                    }
+                    "error" => return Ok((PluginOutcome::Error, headers)),
+                    _ => {
                         return Err(PluginError::Execution(format!(
-                            "{} returned an invalid deny status",
+                            "{} returned an invalid {phase} outcome",
                             plugin.package
                         )));
                     }
-                    let code = result.code.unwrap_or_else(|| "access_denied".to_string());
-                    if !is_safe_public_code(&code) {
-                        return Err(PluginError::Execution(format!(
-                            "{} returned an invalid public error code",
-                            plugin.package
-                        )));
-                    }
-                    return Ok((PluginOutcome::Deny { status, code }, headers));
-                }
-                "error" => return Ok((PluginOutcome::Error, headers)),
-                _ => {
-                    return Err(PluginError::Execution(format!(
-                        "{} returned an unknown outcome",
-                        plugin.package
-                    )));
                 }
             }
         }
@@ -142,7 +196,9 @@ impl PluginChain {
         // after a plugin has consumed them. This also prevents an externally
         // supplied forwarded-header value from becoming an upstream fact.
         for reserved in RESERVED_HEADERS {
-            headers.remove(*reserved);
+            if *reserved != "authorization" {
+                headers.remove(*reserved);
+            }
         }
         for plugin in &self.plugins {
             for header in plugin.attachment.credential_headers.values() {
@@ -152,13 +208,137 @@ impl PluginChain {
         Ok((PluginOutcome::Allow, headers))
     }
 
+    pub fn run_response_headers_with_cancel(
+        &self,
+        headers: HeaderMap,
+        status: StatusCode,
+        method: &str,
+        path: &str,
+        cancellation: CancellationToken,
+    ) -> Result<HeaderMap, PluginError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PluginError::Execution(error.to_string()))?;
+        runtime.block_on(async {
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(PluginError::Execution("plugin request was cancelled".to_string())),
+                result = self.run_response_headers_async(headers, status, method, path) => result,
+            }
+        })
+    }
+
+    async fn run_response_headers_async(
+        &self,
+        mut headers: HeaderMap,
+        status: StatusCode,
+        method: &str,
+        path: &str,
+    ) -> Result<HeaderMap, PluginError> {
+        for plugin in self
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.phases.contains("response"))
+        {
+            let input = self.response_input_for(plugin, &headers, status, method, path);
+            let result = self
+                .run_one(plugin, "response", input, CredentialVault::default())
+                .await?;
+            if result.outcome != "allow" {
+                return Err(PluginError::Execution(format!(
+                    "{} returned an invalid response outcome",
+                    plugin.package
+                )));
+            }
+            self.apply_response_plan(plugin, &mut headers, &result)?;
+        }
+        Ok(headers)
+    }
+
+    pub fn run_log_with_cancel(
+        &self,
+        headers: HeaderMap,
+        status: StatusCode,
+        method: &str,
+        path: &str,
+        cancellation: CancellationToken,
+    ) -> Result<(), PluginError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PluginError::Execution(error.to_string()))?;
+        runtime.block_on(async {
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(PluginError::Execution("plugin log was cancelled".to_string())),
+                result = self.run_log_async(headers, status, method, path) => result,
+            }
+        })
+    }
+
+    async fn run_log_async(
+        &self,
+        headers: HeaderMap,
+        status: StatusCode,
+        method: &str,
+        path: &str,
+    ) -> Result<(), PluginError> {
+        for plugin in self
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.phases.contains("log"))
+        {
+            let input = self.response_input_for(plugin, &headers, status, method, path);
+            let result = self
+                .run_one(plugin, "log", input, CredentialVault::default())
+                .await?;
+            if result.outcome != "allow" {
+                return Err(PluginError::Execution(format!(
+                    "{} returned an invalid log outcome",
+                    plugin.package
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn response_input_for(
+        &self,
+        plugin: &LoadedPlugin,
+        headers: &HeaderMap,
+        status: StatusCode,
+        method: &str,
+        path: &str,
+    ) -> Value {
+        let safe_headers: serde_json::Map<String, Value> = headers
+            .iter()
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "set-cookie" | "www-authenticate" | "proxy-authenticate"
+                )
+            })
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), Value::String(value.to_string())))
+            })
+            .collect();
+        json!({
+            "request": {"method": method, "path": path, "headers": {}},
+            "response": {"status": status.as_u16(), "headers": safe_headers},
+            "credentials": {"fingerprints": {}, "handles": {}},
+            "config": plugin.attachment.config,
+        })
+    }
+
     fn input_for(
         &self,
         plugin: &LoadedPlugin,
         headers: &HeaderMap,
         method: &str,
         path: &str,
-    ) -> Value {
+    ) -> (Value, CredentialVault) {
         let credential_headers: HashSet<String> = plugin
             .attachment
             .credential_headers
@@ -186,6 +366,8 @@ impl PluginChain {
         }
 
         let mut fingerprints = serde_json::Map::new();
+        let mut handles = serde_json::Map::new();
+        let vault = CredentialVault::default();
         for (credential, header) in &plugin.attachment.credential_headers {
             if let Some(value) = headers.get(header) {
                 let mut mac = Hmac::<Sha256>::new_from_slice(&self.fingerprint_key)
@@ -195,40 +377,169 @@ impl PluginChain {
                     credential.clone(),
                     Value::String(STANDARD.encode(mac.finalize().into_bytes())),
                 );
+                handles.insert(
+                    credential.clone(),
+                    Value::String(vault.insert_source(value.as_bytes())),
+                );
             }
         }
 
-        json!({
-            "request": { "method": method, "path": path, "headers": safe_headers },
-            "credentials": { "fingerprints": fingerprints },
-            "config": plugin.attachment.config,
-        })
+        (
+            json!({
+                "request": { "method": method, "path": path, "headers": safe_headers },
+                "credentials": { "fingerprints": fingerprints, "handles": handles },
+                "config": plugin.attachment.config,
+            }),
+            vault,
+        )
     }
 
-    fn run_one(&self, plugin: &LoadedPlugin, input: Value) -> Result<PluginResult, PluginError> {
+    async fn run_one(
+        &self,
+        plugin: &LoadedPlugin,
+        phase: &str,
+        input: Value,
+        vault: CredentialVault,
+    ) -> Result<PluginResult, PluginError> {
         // QuickJS is created for every invocation, so globals cannot leak from
         // one request or tenant to another. There is deliberately no module
         // loader, which rules out imports and filesystem access.
-        let runtime = Runtime::new().map_err(|e| PluginError::Execution(e.to_string()))?;
-        runtime.set_memory_limit(self.memory_limit_bytes);
-        runtime.set_max_stack_size(self.memory_limit_bytes.min(1024 * 1024));
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(self.execution_timeout_millis);
-        runtime.set_interrupt_handler(Some(Box::new(move || {
-            std::time::Instant::now() >= deadline
-        })));
-        let context = Context::full(&runtime).map_err(|e| PluginError::Execution(e.to_string()))?;
+        let runtime = AsyncRuntime::new().map_err(|e| PluginError::Execution(e.to_string()))?;
+        runtime.set_memory_limit(self.memory_limit_bytes).await;
+        runtime
+            .set_max_stack_size(self.memory_limit_bytes.min(1024 * 1024))
+            .await;
+        let cpu_window = std::time::Duration::from_millis(self.execution_timeout_millis);
+        let deadline = Arc::new(Mutex::new(std::time::Instant::now() + cpu_window));
+        let interrupt_deadline = deadline.clone();
+        runtime
+            .set_interrupt_handler(Some(Box::new(move || {
+                std::time::Instant::now()
+                    >= *interrupt_deadline.lock().expect("plugin deadline lock")
+            })))
+            .await;
+        let context = AsyncContext::full(&runtime)
+            .await
+            .map_err(|e| PluginError::Execution(e.to_string()))?;
         let input =
             serde_json::to_string(&input).map_err(|e| PluginError::Execution(e.to_string()))?;
+        let host = self.host.clone().ok_or_else(|| {
+            PluginError::Execution("plugin host runtime is unavailable".to_string())
+        })?;
+        let namespace = plugin.namespace.clone();
+        let capabilities = plugin.capabilities.clone();
+        let audits = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let audits_output = audits.clone();
+        let phase_json = serde_json::to_string(phase)
+            .map_err(|error| PluginError::Execution(error.to_string()))?;
         let bootstrap = format!(
-            "'use strict';\nconst module={{exports:{{}}}}; const exports=module.exports;\n{}\n\nconst __candidate = globalThis.access || module.exports.access || exports.access;\nif (typeof __candidate !== 'function') throw new Error('plugin must export access(ctx)');\nconst __result = __candidate(Object.freeze(__bifrost_input));\nif (__result && typeof __result.then === 'function') throw new Error('async access is not supported by this PDK version');\nJSON.stringify(__result);",
-            plugin.code
+            "'use strict';\nconst module={{exports:{{}}}}; const exports=module.exports;\n{}\n\nconst __unwrap = async p => {{ const r=JSON.parse(await p); if(!r.ok) throw new Error(r.error); return r.value; }};\nconst __need = (name, fn) => {{ if(typeof fn !== 'function') throw new Error('missing capability: '+name); return fn; }};\n__bifrost_input.identity={{exchange: o => __unwrap(__need('identity.exchange',globalThis.__bifrost_exchange)(JSON.stringify(o)))}};\n__bifrost_input.jwt={{verify: (credential,policy) => __unwrap(__need('jwt.verify',globalThis.__bifrost_jwt_verify)(JSON.stringify({{credential,policy}})))}};\n__bifrost_input.cache={{\n getOrLoad: async (key,options,loader) => {{ const first=await __unwrap(__need('cache.sensitive',globalThis.__bifrost_cache_begin)(String(key))); if(first.hit) return first; try {{ const loaded=await loader(); await __unwrap(__bifrost_cache_complete(JSON.stringify({{key:String(key),lease:first.lease,credential:loaded.credential,ttl_seconds:options.ttl_seconds,tags:options.tags||[]}}))); return loaded; }} catch(e) {{ await __unwrap(__bifrost_cache_abort(JSON.stringify({{key:String(key),lease:first.lease}}))); throw e; }} }},\n delete: key => __unwrap(__need('cache.sensitive',globalThis.__bifrost_cache_delete)(String(key))),\n invalidateTag: tag => __unwrap(__need('cache.sensitive',globalThis.__bifrost_cache_invalidate_tag)(String(tag)))\n}};\n__bifrost_input.audit={{emit: event => {{ const emit=__need('audit.emit',globalThis.__bifrost_audit); if(!emit(JSON.stringify(event))) throw new Error('audit event rejected'); }}}};\nObject.freeze(__bifrost_input.request); Object.freeze(__bifrost_input.credentials); Object.freeze(__bifrost_input.config);\nconst __phase={}; const __candidate = globalThis[__phase] || module.exports[__phase] || exports[__phase];\nif (typeof __candidate !== 'function') throw new Error('plugin must export '+__phase+'(ctx)');\nPromise.resolve(__candidate(Object.freeze(__bifrost_input))).then(r => JSON.stringify(r == null ? {{outcome:'allow'}} : r));",
+            plugin.code, phase_json
         );
         // JSON is generated by serde, never by string interpolation from a request.
         let bootstrap = format!("const __bifrost_input = {};\n{}", input, bootstrap);
-        let encoded: String = context
-            .with(|ctx| ctx.eval(bootstrap))
-            .map_err(|e| PluginError::Execution(format!("{}: {}", plugin.package, e)))?;
+        let encoded: Result<String, rquickjs::Error> = async_with!(context => |ctx| {
+            let globals = ctx.globals();
+            if capabilities.contains("audit.emit") {
+                let audits = audits.clone();
+                globals.set("__bifrost_audit", Func::from(move |input: String| {
+                    if input.len() > 8192 {
+                        return false;
+                    }
+                    let Ok(event) = serde_json::from_str::<Value>(&input) else {
+                        return false;
+                    };
+                    if !safe_audit_event(&event) {
+                        return false;
+                    }
+                    audits.lock().expect("plugin audit lock").push(event);
+                    true
+                }))?;
+            }
+            if capabilities.contains("identity.exchange") {
+                let host = host.clone();
+                let vault = vault.clone();
+                let deadline = deadline.clone();
+                globals.set("__bifrost_exchange", Func::from(Async(move |input: String| {
+                    let host = host.clone();
+                    let vault = vault.clone();
+                    let deadline = deadline.clone();
+                    async move {
+                        let result = host.exchange(vault, &input).await;
+                        *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window;
+                        result
+                    }
+                })))?;
+            }
+            if capabilities.contains("jwt.verify") {
+                let host = host.clone();
+                let vault = vault.clone();
+                let deadline = deadline.clone();
+                globals.set("__bifrost_jwt_verify", Func::from(Async(move |input: String| {
+                    let host = host.clone();
+                    let vault = vault.clone();
+                    let deadline = deadline.clone();
+                    async move {
+                        let result = host.verify_jwt(vault, &input).await;
+                        *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window;
+                        result
+                    }
+                })))?;
+            }
+            if capabilities.contains("cache.sensitive") {
+                let host_begin = host.clone();
+                let vault_begin = vault.clone();
+                let namespace_begin = namespace.clone();
+                let deadline_begin = deadline.clone();
+                globals.set("__bifrost_cache_begin", Func::from(Async(move |key: String| {
+                    let host = host_begin.clone(); let vault = vault_begin.clone(); let namespace = namespace_begin.clone(); let deadline = deadline_begin.clone();
+                    async move { let result = host.cache_begin(&namespace, vault, &key).await; *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window; result }
+                })))?;
+                let host_complete = host.clone();
+                let vault_complete = vault.clone();
+                let namespace_complete = namespace.clone();
+                let deadline_complete = deadline.clone();
+                globals.set("__bifrost_cache_complete", Func::from(Async(move |input: String| {
+                    let host = host_complete.clone(); let vault = vault_complete.clone(); let namespace = namespace_complete.clone(); let deadline = deadline_complete.clone();
+                    async move { let result = host.cache_complete(&namespace, vault, &input).await; *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window; result }
+                })))?;
+                let host_abort = host.clone();
+                let namespace_abort = namespace.clone();
+                let deadline_abort = deadline.clone();
+                globals.set("__bifrost_cache_abort", Func::from(Async(move |input: String| {
+                    let host = host_abort.clone(); let namespace = namespace_abort.clone(); let deadline = deadline_abort.clone();
+                    async move { let result = host.cache_abort(&namespace, &input).await; *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window; result }
+                })))?;
+                let host_delete = host.clone();
+                let namespace_delete = namespace.clone();
+                let deadline_delete = deadline.clone();
+                globals.set("__bifrost_cache_delete", Func::from(Async(move |key: String| {
+                    let host = host_delete.clone(); let namespace = namespace_delete.clone(); let deadline = deadline_delete.clone();
+                    async move { let result = host.cache_delete(&namespace, &key).await; *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window; result }
+                })))?;
+                let host_invalidate = host.clone();
+                let namespace_invalidate = namespace.clone();
+                let deadline_invalidate = deadline.clone();
+                globals.set("__bifrost_cache_invalidate_tag", Func::from(Async(move |tag: String| {
+                    let host = host_invalidate.clone(); let namespace = namespace_invalidate.clone(); let deadline = deadline_invalidate.clone();
+                    async move { let result = host.cache_invalidate_tag(&namespace, &tag).await; *deadline.lock().expect("plugin deadline lock") = std::time::Instant::now() + cpu_window; result }
+                })))?;
+            }
+            let promise: Promise = ctx.eval(bootstrap)?;
+            promise.into_future::<String>().await
+        }).await;
+        let encoded =
+            encoded.map_err(|e| PluginError::Execution(format!("{}: {}", plugin.package, e)))?;
+        for event in audits_output.lock().expect("plugin audit lock").iter() {
+            log::info!(
+                target: "bifrost_plugin_audit",
+                "route={} package={} phase={} event={}",
+                plugin.route_id,
+                plugin.package,
+                phase,
+                event
+            );
+        }
         serde_json::from_str(&encoded).map_err(|e| {
             PluginError::Execution(format!("{} returned non-JSON data: {}", plugin.package, e))
         })
@@ -239,11 +550,12 @@ impl PluginChain {
         plugin: &LoadedPlugin,
         headers: &mut HeaderMap,
         result: &PluginResult,
+        vault: &CredentialVault,
     ) -> Result<(), PluginError> {
         let Some(plan) = result.upstream.as_ref() else {
             return Ok(());
         };
-        if !plugin.capabilities.contains("upstream.headers") {
+        if !plan.headers.is_empty() && !plugin.capabilities.contains("upstream.headers") {
             return Err(PluginError::Execution(format!(
                 "{} attempted an upstream header plan without upstream.headers capability",
                 plugin.package
@@ -268,7 +580,76 @@ impl PluginChain {
             })?;
             headers.insert(name, value);
         }
+        if let Some(handle) = plan.bearer.as_deref() {
+            if !plugin.capabilities.contains("upstream.authorization") {
+                return Err(PluginError::Execution(format!(
+                    "{} attempted bearer injection without upstream.authorization capability",
+                    plugin.package
+                )));
+            }
+            let secret = vault.bearer(handle).ok_or_else(|| {
+                PluginError::Execution(format!(
+                    "{} returned an unknown credential handle",
+                    plugin.package
+                ))
+            })?;
+            let value = HeaderValue::from_str(&format!("Bearer {secret}"))
+                .map_err(|_| PluginError::Execution("invalid bearer credential".to_string()))?;
+            headers.insert(http::header::AUTHORIZATION, value);
+        }
         Ok(())
+    }
+
+    fn apply_response_plan(
+        &self,
+        plugin: &LoadedPlugin,
+        headers: &mut HeaderMap,
+        result: &PluginResult,
+    ) -> Result<(), PluginError> {
+        let Some(plan) = result.response.as_ref() else {
+            return Ok(());
+        };
+        if !plugin.capabilities.contains("response.headers") {
+            return Err(PluginError::Execution(format!(
+                "{} attempted a response plan without response.headers capability",
+                plugin.package
+            )));
+        }
+        for (name, value) in &plan.headers {
+            let lower = name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "connection" | "content-length" | "transfer-encoding" | "upgrade"
+            ) {
+                return Err(PluginError::Execution(format!(
+                    "{} attempted to set protected response header {name}",
+                    plugin.package
+                )));
+            }
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                PluginError::Execution(format!("{} returned invalid header name", plugin.package))
+            })?;
+            let value = HeaderValue::from_str(value).map_err(|_| {
+                PluginError::Execution(format!("{} returned invalid header value", plugin.package))
+            })?;
+            headers.insert(name, value);
+        }
+        Ok(())
+    }
+}
+
+fn safe_audit_event(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().all(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            !["authorization", "credential", "password", "secret", "token"]
+                .iter()
+                .any(|reserved| name.contains(reserved))
+                && safe_audit_event(value)
+        }),
+        Value::Array(values) => values.iter().all(safe_audit_event),
+        Value::String(value) => value.len() <= 2048,
+        _ => true,
     }
 }
 
@@ -288,10 +669,20 @@ struct PluginResult {
     code: Option<String>,
     #[serde(default)]
     upstream: Option<UpstreamPlan>,
+    #[serde(default)]
+    response: Option<ResponsePlan>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpstreamPlan {
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    bearer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsePlan {
     #[serde(default)]
     headers: HashMap<String, String>,
 }
@@ -311,18 +702,35 @@ pub fn load_route_plugins(
             "plugin memory_limit_bytes must be at least 1MiB and execution_timeout_millis must be non-zero".into(),
         ));
     }
+    let host = Arc::new(HostRuntime::new(config).map_err(PluginError::Config)?);
     let mut plugins = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         validate_attachment(route_id, attachment)?;
-        plugins.push(load_plugin(attachment, config)?);
+        plugins.push(load_plugin(route_id, attachment, config)?);
+    }
+    if plugins
+        .iter()
+        .any(|plugin| plugin.capabilities.contains("jwt.verify"))
+    {
+        host.preload_jwt_policies().map_err(PluginError::Config)?;
+        host.start_jwt_refresh().map_err(PluginError::Config)?;
     }
     plugins.sort_by_key(|plugin| plugin.attachment.priority);
+    if plugins.windows(2).any(|pair| {
+        pair[0].attachment.priority == pair[1].attachment.priority
+            && !pair[0].phases.is_disjoint(&pair[1].phases)
+    }) {
+        return Err(PluginError::Config(format!(
+            "route {route_id} has ambiguous plugin priorities"
+        )));
+    }
     let fingerprint_key = rand::random();
     Ok(PluginChain {
         plugins,
         fingerprint_key,
         memory_limit_bytes: config.memory_limit_bytes,
         execution_timeout_millis: config.execution_timeout_millis,
+        host: Some(host),
     })
 }
 
@@ -345,10 +753,39 @@ fn validate_attachment(route_id: &str, attachment: &RoutePluginConfig) -> Result
             ))
         })?;
     }
+    for name in &attachment.permitted_headers {
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+            || name.eq_ignore_ascii_case("host")
+        {
+            return Err(PluginError::Config(format!(
+                "route {route_id} grants a reserved header to a plugin"
+            )));
+        }
+    }
+    if attachment
+        .credential_headers
+        .keys()
+        .any(|name| name.is_empty())
+    {
+        return Err(PluginError::Config(format!(
+            "route {route_id} has an empty plugin credential name"
+        )));
+    }
     Ok(())
 }
 
+fn plugin_namespace(route_id: &str, attachment: &RoutePluginConfig) -> String {
+    let mut digest = Sha256::new();
+    digest.update(route_id.as_bytes());
+    digest.update([0]);
+    digest.update(attachment.package.as_bytes());
+    digest.update([0]);
+    digest.update(serde_json::to_vec(&attachment.config).unwrap_or_default());
+    format!("{route_id}:{}", STANDARD.encode(digest.finalize()))
+}
+
 fn load_plugin(
+    route_id: &str,
     attachment: &RoutePluginConfig,
     config: &PluginRuntimeConfig,
 ) -> Result<LoadedPlugin, PluginError> {
@@ -365,12 +802,56 @@ fn load_plugin(
             "manifest id/version/runtime does not match attachment".into(),
         ));
     }
-    if !manifest.phases.iter().all(|phase| phase == "access")
-        || !manifest.phases.iter().any(|p| p == "access")
+    const SUPPORTED_PHASES: &[&str] = &["ingress", "access", "upstream", "response", "log"];
+    if manifest.phases.is_empty()
+        || manifest
+            .phases
+            .iter()
+            .any(|phase| !SUPPORTED_PHASES.contains(&phase.as_str()))
     {
         return Err(PluginError::Package(
-            "this runtime currently accepts packages that implement the access phase only".into(),
+            "manifest contains no phases or an unsupported plugin phase".into(),
         ));
+    }
+    const SUPPORTED_CAPABILITIES: &[&str] = &[
+        "identity.exchange",
+        "jwt.verify",
+        "cache.sensitive",
+        "upstream.headers",
+        "upstream.authorization",
+        "response.headers",
+        "audit.emit",
+    ];
+    if let Some(capability) = manifest
+        .capabilities
+        .iter()
+        .find(|capability| !SUPPORTED_CAPABILITIES.contains(&capability.as_str()))
+    {
+        return Err(PluginError::Package(format!(
+            "unsupported plugin capability {capability}"
+        )));
+    }
+    if manifest
+        .capabilities
+        .iter()
+        .any(|value| value == "identity.exchange")
+        && config.allowed_egress_hosts.is_empty()
+    {
+        return Err(PluginError::Config(format!(
+            "{} requires identity.exchange but plugin egress is disabled",
+            attachment.package
+        )));
+    }
+    if manifest
+        .capabilities
+        .iter()
+        .any(|value| value == "jwt.verify")
+        && config.jwt_verifiers.is_empty()
+    {
+        return Err(PluginError::Config(format!(
+            "{} requires jwt.verify but no verifier policies are configured",
+            attachment.package
+        )));
     }
     if config.require_signatures {
         verify_signature(&directory, &manifest, &manifest_bytes, config)?;
@@ -395,6 +876,9 @@ fn load_plugin(
     }
     Ok(LoadedPlugin {
         package: attachment.package.clone(),
+        route_id: route_id.to_string(),
+        namespace: plugin_namespace(route_id, attachment),
+        phases: manifest.phases.into_iter().collect(),
         capabilities: manifest.capabilities.into_iter().collect(),
         code: Arc::new(code),
         attachment: attachment.clone(),
@@ -714,6 +1198,79 @@ mod tests {
             PluginOutcome::Allow
         ));
         assert!(request.headers().get("x-am-token").is_none());
+    }
+
+    #[test]
+    fn lifecycle_phases_apply_request_and_response_plans() {
+        let temp = tempdir().unwrap();
+        let config = package(
+            temp.path(),
+            r#"
+            function ingress() {
+              return {outcome: 'allow', upstream: {headers: {'x-ingress': 'yes'}}};
+            }
+            function access(ctx) {
+              if (ctx.request.headers['x-request-id'] !== 'req-1') throw new Error('request context missing');
+              return {outcome: 'allow'};
+            }
+            function upstream(ctx) {
+              return {outcome: 'allow', upstream: {headers: {'x-upstream': 'yes'}}};
+            }
+            function response(ctx) {
+              if (ctx.response.status !== 200) throw new Error('response status missing');
+              ctx.audit.emit({event: 'response_ready', status: ctx.response.status});
+              return {outcome: 'allow', response: {headers: {'x-response': 'yes'}}};
+            }
+            function log(ctx) {
+              ctx.audit.emit({event: 'request_complete', status: ctx.response.status});
+              return {outcome: 'allow'};
+            }
+        "#,
+        );
+        fs::write(
+            temp.path().join("example/manifest.json"),
+            r#"{
+                "id":"com.example.access", "version":"1.0.0", "runtime":"quickjs",
+                "entrypoint":"index.js",
+                "phases":["ingress","access","upstream","response","log"],
+                "capabilities":["upstream.headers","response.headers","audit.emit"],
+                "configuration_schema":"schema.json", "publisher":"test"
+            }"#,
+        )
+        .unwrap();
+        let chain = load_route_plugins("orders", &[attachment()], &config).unwrap();
+        let mut request = Request::builder()
+            .uri("/orders")
+            .header("x-request-id", "req-1")
+            .body(())
+            .unwrap();
+
+        assert!(matches!(
+            chain.run_access(&mut request).unwrap(),
+            PluginOutcome::Allow
+        ));
+        assert_eq!(request.headers()["x-ingress"], "yes");
+        assert_eq!(request.headers()["x-upstream"], "yes");
+
+        let response_headers = chain
+            .run_response_headers_with_cancel(
+                HeaderMap::new(),
+                StatusCode::OK,
+                "GET",
+                "/orders",
+                CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(response_headers["x-response"], "yes");
+        chain
+            .run_log_with_cancel(
+                response_headers,
+                StatusCode::OK,
+                "GET",
+                "/orders",
+                CancellationToken::new(),
+            )
+            .unwrap();
     }
 
     #[cfg(unix)]

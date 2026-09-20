@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Completed the signed QuickJS lifecycle plugin runtime with asynchronous host calls, exact-host HTTPS
+  egress policy, opaque credential handles, AES-256-GCM sensitive caching, JWKS/OIDC JWT validation,
+  X.509 certificate keys, custom CA and mTLS support, scheduled refresh, cancellable execution,
+  five lifecycle phases, audit events, safe request/response plans, and an AM/OAuth token-exchange example
 - **Zero-downtime configuration reloads**
   - Added a supervisor-owned listener and replaceable worker generations
   - Added `--reload`/`--pid-file` using Unix `SIGHUP`

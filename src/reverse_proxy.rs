@@ -54,13 +54,38 @@ type BoxedBody = BoxBody<Bytes, BoxError>;
 /// Connector supporting both plain HTTP and TLS (HTTPS/WSS) backends
 type BackendConnector = HttpsConnector<HttpConnector>;
 
-type PluginWorkResult = Result<(PluginOutcome, HeaderMap), crate::plugin::PluginError>;
+type PluginWorkResult = Result<PluginWorkOutput, crate::plugin::PluginError>;
+
+enum PluginWorkKind {
+    Request {
+        headers: HeaderMap,
+        method: String,
+        path: String,
+    },
+    Response {
+        headers: HeaderMap,
+        status: StatusCode,
+        method: String,
+        path: String,
+    },
+    Log {
+        headers: HeaderMap,
+        status: StatusCode,
+        method: String,
+        path: String,
+    },
+}
+
+enum PluginWorkOutput {
+    Request(PluginOutcome, HeaderMap),
+    Response(HeaderMap),
+    Log,
+}
 
 struct PluginWork {
     chain: PluginChain,
-    headers: HeaderMap,
-    method: String,
-    path: String,
+    kind: PluginWorkKind,
+    cancellation: CancellationToken,
     result: oneshot::Sender<PluginWorkResult>,
 }
 
@@ -90,11 +115,49 @@ impl PluginWorkerPool {
                         Err(_) => return,
                     };
                     let Ok(work) = work else { return };
-                    let outcome = work
-                        .chain
-                        .run_access_headers(work.headers, &work.method, &work.path);
-                    // The request may have been cancelled; the calculation has
-                    // still completed and the worker is immediately reusable.
+                    let outcome = match work.kind {
+                        PluginWorkKind::Request { headers, method, path } => work
+                            .chain
+                            .run_access_headers_with_cancel(
+                                headers,
+                                &method,
+                                &path,
+                                work.cancellation,
+                            )
+                            .map(|(outcome, headers)| {
+                                PluginWorkOutput::Request(outcome, headers)
+                            }),
+                        PluginWorkKind::Response {
+                            headers,
+                            status,
+                            method,
+                            path,
+                        } => work
+                            .chain
+                            .run_response_headers_with_cancel(
+                                headers,
+                                status,
+                                &method,
+                                &path,
+                                work.cancellation,
+                            )
+                            .map(PluginWorkOutput::Response),
+                        PluginWorkKind::Log {
+                            headers,
+                            status,
+                            method,
+                            path,
+                        } => work
+                            .chain
+                            .run_log_with_cancel(
+                                headers,
+                                status,
+                                &method,
+                                &path,
+                                work.cancellation,
+                            )
+                            .map(|_| PluginWorkOutput::Log),
+                    };
                     let _ = work.result.send(outcome);
                 })
                 .map_err(ProxyError::Io)?;
@@ -108,21 +171,34 @@ impl PluginWorkerPool {
         headers: HeaderMap,
         method: String,
         path: String,
-    ) -> PluginWorkResult {
+    ) -> Result<(PluginOutcome, HeaderMap), crate::plugin::PluginError> {
         let (result, receiver) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let _cancel_on_drop = CancelPluginWork(cancellation.clone());
         let work = PluginWork {
             chain,
-            headers,
-            method,
-            path,
+            kind: PluginWorkKind::Request {
+                headers,
+                method,
+                path,
+            },
+            cancellation,
             result,
         };
         match self.sender.try_send(work) {
-            Ok(()) => receiver.await.map_err(|_| {
+            Ok(()) => match receiver.await.map_err(|_| {
                 crate::plugin::PluginError::Execution(
                     "plugin worker stopped before completing evaluation".to_string(),
                 )
-            })?,
+            })?? {
+                PluginWorkOutput::Request(outcome, headers) => Ok((outcome, headers)),
+                PluginWorkOutput::Response(_) => Err(crate::plugin::PluginError::Execution(
+                    "plugin worker returned the wrong result type".to_string(),
+                )),
+                PluginWorkOutput::Log => Err(crate::plugin::PluginError::Execution(
+                    "plugin worker returned the wrong result type".to_string(),
+                )),
+            },
             Err(mpsc::TrySendError::Full(_)) => Err(crate::plugin::PluginError::Execution(
                 "plugin worker pool is saturated".to_string(),
             )),
@@ -130,6 +206,84 @@ impl PluginWorkerPool {
                 "plugin worker pool is unavailable".to_string(),
             )),
         }
+    }
+
+    async fn run_response(
+        &self,
+        chain: PluginChain,
+        headers: HeaderMap,
+        status: StatusCode,
+        method: String,
+        path: String,
+    ) -> Result<HeaderMap, crate::plugin::PluginError> {
+        let (result, receiver) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let _cancel_on_drop = CancelPluginWork(cancellation.clone());
+        let work = PluginWork {
+            chain,
+            kind: PluginWorkKind::Response {
+                headers,
+                status,
+                method,
+                path,
+            },
+            cancellation,
+            result,
+        };
+        self.sender.try_send(work).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => crate::plugin::PluginError::Execution(
+                "plugin worker pool is saturated".to_string(),
+            ),
+            mpsc::TrySendError::Disconnected(_) => crate::plugin::PluginError::Execution(
+                "plugin worker pool is unavailable".to_string(),
+            ),
+        })?;
+        match receiver.await.map_err(|_| {
+            crate::plugin::PluginError::Execution(
+                "plugin worker stopped before completing evaluation".to_string(),
+            )
+        })?? {
+            PluginWorkOutput::Response(headers) => Ok(headers),
+            PluginWorkOutput::Request(_, _) => Err(crate::plugin::PluginError::Execution(
+                "plugin worker returned the wrong result type".to_string(),
+            )),
+            PluginWorkOutput::Log => Err(crate::plugin::PluginError::Execution(
+                "plugin worker returned the wrong result type".to_string(),
+            )),
+        }
+    }
+
+    fn submit_log(
+        &self,
+        chain: PluginChain,
+        headers: HeaderMap,
+        status: StatusCode,
+        method: String,
+        path: String,
+    ) {
+        let (result, _receiver) = oneshot::channel();
+        let work = PluginWork {
+            chain,
+            kind: PluginWorkKind::Log {
+                headers,
+                status,
+                method,
+                path,
+            },
+            cancellation: CancellationToken::new(),
+            result,
+        };
+        if self.sender.try_send(work).is_err() {
+            warn!("plugin log phase dropped because the worker pool is unavailable");
+        }
+    }
+}
+
+struct CancelPluginWork(CancellationToken);
+
+impl Drop for CancelPluginWork {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1882,25 +2036,48 @@ impl ReverseProxy {
         };
 
         let mut req = req;
+        let plugin_method = req.method().as_str().to_owned();
+        let plugin_path = req.uri().path().to_owned();
         if !selected_route.plugins.is_empty() {
             let headers = req.headers().clone();
-            let method = req.method().as_str().to_owned();
-            let path = req.uri().path().to_owned();
             match plugin_workers
-                .run(selected_route.plugins.clone(), headers, method, path)
+                .run(
+                    selected_route.plugins.clone(),
+                    headers,
+                    plugin_method.clone(),
+                    plugin_path.clone(),
+                )
                 .await
             {
                 Ok((PluginOutcome::Allow, headers)) => *req.headers_mut() = headers,
                 Ok((PluginOutcome::Deny { status, code }, _)) => {
-                    return Ok(Self::boxed_response(ResponseBuilder::error(status, &code)));
+                    let mut response = Self::boxed_response(ResponseBuilder::error(status, &code));
+                    let _ = Self::apply_plugin_response(
+                        &mut response,
+                        selected_route,
+                        &plugin_workers,
+                        plugin_method,
+                        plugin_path,
+                    )
+                    .await;
+                    return Ok(response);
                 }
                 Ok((PluginOutcome::Error, _)) | Err(_) => {
                     // Plugin exceptions and dependency-style failures are not
                     // disclosed to callers; access plugins fail closed.
-                    return Ok(Self::boxed_response(ResponseBuilder::error(
+                    let mut response = Self::boxed_response(ResponseBuilder::error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "plugin_unavailable",
-                    )));
+                    ));
+                    let _ = Self::apply_plugin_response(
+                        &mut response,
+                        selected_route,
+                        &plugin_workers,
+                        plugin_method,
+                        plugin_path,
+                    )
+                    .await;
+                    return Ok(response);
                 }
             }
         }
@@ -1914,10 +2091,19 @@ impl ReverseProxy {
                             "Target selection failed for route {}: {}",
                             selected_route.id, e
                         );
-                        return Ok(Self::boxed_response(ResponseBuilder::error(
+                        let mut response = Self::boxed_response(ResponseBuilder::error(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &e.to_string(),
-                        )));
+                        ));
+                        let _ = Self::apply_plugin_response(
+                            &mut response,
+                            selected_route,
+                            &plugin_workers,
+                            plugin_method,
+                            plugin_path,
+                        )
+                        .await;
+                        return Ok(response);
                     }
                 };
             let mut response = match Self::handle_websocket_request(
@@ -1939,7 +2125,23 @@ impl ReverseProxy {
                     response.headers_mut().append("Set-Cookie", value);
                 }
             }
-            return Ok(Self::boxed_response(response));
+            let mut response = Self::boxed_response(response);
+            if Self::apply_plugin_response(
+                &mut response,
+                selected_route,
+                &plugin_workers,
+                plugin_method,
+                plugin_path,
+            )
+            .await
+            .is_err()
+            {
+                return Ok(Self::boxed_response(ResponseBuilder::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "plugin_unavailable",
+                )));
+            }
+            return Ok(response);
         }
 
         match Self::process_request_with_retries(req, context, selected_route, preserve_host).await
@@ -1951,6 +2153,21 @@ impl ReverseProxy {
                         response.headers_mut().append("Set-Cookie", value);
                     }
                 }
+                if Self::apply_plugin_response(
+                    &mut response,
+                    selected_route,
+                    &plugin_workers,
+                    plugin_method,
+                    plugin_path,
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Self::boxed_response(ResponseBuilder::error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "plugin_unavailable",
+                    )));
+                }
                 Ok(response)
             }
             Err(RequestFailure::Selection(e)) => {
@@ -1958,10 +2175,19 @@ impl ReverseProxy {
                     "Target selection failed for route {}: {}",
                     selected_route.id, e
                 );
-                Ok(Self::boxed_response(ResponseBuilder::error(
+                let mut response = Self::boxed_response(ResponseBuilder::error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &e.to_string(),
-                )))
+                ));
+                let _ = Self::apply_plugin_response(
+                    &mut response,
+                    selected_route,
+                    &plugin_workers,
+                    plugin_method,
+                    plugin_path,
+                )
+                .await;
+                Ok(response)
             }
             Err(RequestFailure::Forward(e)) => {
                 error!("Proxy error: {}", e);
@@ -1971,7 +2197,16 @@ impl ReverseProxy {
                     .body(body)
                     .unwrap();
                 metrics.increment_connection_errors();
-                Ok(Self::boxed_response(error_response))
+                let mut response = Self::boxed_response(error_response);
+                let _ = Self::apply_plugin_response(
+                    &mut response,
+                    selected_route,
+                    &plugin_workers,
+                    plugin_method,
+                    plugin_path,
+                )
+                .await;
+                Ok(response)
             }
         }
     }
@@ -1981,6 +2216,36 @@ impl ReverseProxy {
         let (parts, body) = response.into_parts();
         let boxed_body = body.map_err(|err| match err {}).boxed();
         Response::from_parts(parts, boxed_body)
+    }
+
+    async fn apply_plugin_response(
+        response: &mut Response<BoxedBody>,
+        selected_route: &CompiledRoute,
+        plugin_workers: &PluginWorkerPool,
+        method: String,
+        path: String,
+    ) -> Result<(), crate::plugin::PluginError> {
+        if selected_route.plugins.is_empty() {
+            return Ok(());
+        }
+        let headers = plugin_workers
+            .run_response(
+                selected_route.plugins.clone(),
+                response.headers().clone(),
+                response.status(),
+                method.clone(),
+                path.clone(),
+            )
+            .await?;
+        *response.headers_mut() = headers;
+        plugin_workers.submit_log(
+            selected_route.plugins.clone(),
+            response.headers().clone(),
+            response.status(),
+            method,
+            path,
+        );
+        Ok(())
     }
 
     /// Process request using HTTP client with connection pooling

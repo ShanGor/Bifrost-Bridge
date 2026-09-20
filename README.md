@@ -14,6 +14,7 @@ A high-performance proxy server written in Rust that can function as both a forw
 - **Graceful shutdown & logging** with Ctrl+C handling and env_logger/CustomLogger backends
 - **Zero-downtime configuration reloads** with a supervisor-owned listener and TLS rotation support
 - **Encrypted configuration secrets** with AES-256 `{encrypted}` payloads backed by a masked key on disk
+- **Signed QuickJS lifecycle plugins** with protected identity exchange, encrypted credential caching, remote JWT verification, audit events, and safe request/response plans
 
 ## Installation
 

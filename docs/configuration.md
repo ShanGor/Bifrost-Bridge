@@ -13,6 +13,7 @@ This guide covers all configuration options for the proxy server, including comm
 - [Configuration Inheritance](#configuration-inheritance)
 - [Routing Order and Priority](#routing-order-and-priority)
 - [Multi-Target Reverse Proxy Routing](#multi-target-reverse-proxy-routing)
+- [Lifecycle Plugins](#lifecycle-plugins)
 - [Reverse Proxy Headers](#reverse-proxy-headers)
 - [Examples](#examples)
 
@@ -277,6 +278,54 @@ and targets.
   ]
 }
 ```
+
+## Lifecycle Plugins
+
+Reverse proxy routes may attach signed QuickJS lifecycle plugins. Packages are loaded and schema
+validated when the route table is built. Lower `priority` values execute first, and priorities must
+be unique within a route.
+
+```json
+{
+  "plugin_runtime": {
+    "package_dir": "./plugins",
+    "trusted_publishers": {"security": "BASE64_ED25519_PUBLIC_KEY"},
+    "allowed_egress_hosts": ["iam.example.com"],
+    "memory_limit_bytes": 16777216,
+    "execution_timeout_millis": 50,
+    "worker_threads": 2,
+    "http_timeout_millis": 3000,
+    "tls": {
+      "custom_ca_bundle": null,
+      "client_certificate": null,
+      "client_private_key": null
+    },
+    "max_response_bytes": 1048576,
+    "max_cache_entries": 4096,
+    "max_cache_entry_bytes": 65536,
+    "max_cache_bytes": 16777216,
+    "max_cache_ttl_seconds": 300
+  },
+  "reverse_proxy_routes": [{
+    "id": "orders",
+    "target": "https://orders.internal",
+    "predicates": [{"type": "Path", "patterns": ["/**"]}],
+    "plugins": [{
+      "package": "com.example.openam-exchange@1.0.0",
+      "priority": 0,
+      "config": {},
+      "permitted_headers": ["x-request-id"],
+      "credential_headers": {"am": "x-am-token"}
+    }]
+  }]
+}
+```
+
+Packages may implement `ingress`, `access`, `upstream`, `response`, and `log`; route-local ingress
+runs after route selection. `require_signatures` defaults to `true`. Disable it only for local package development. An empty
+`allowed_egress_hosts` list disables plugin network access. JWT verifier policies are configured in
+`plugin_runtime.jwt_verifiers`; see [Plugin Design](./plugin-design.md) and the complete
+[`config_plugin_openam.json`](../examples/config_plugin_openam.json) example.
 
 ## Multi-Target Reverse Proxy Routing
 

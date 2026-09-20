@@ -480,6 +480,83 @@ fn default_plugin_worker_threads() -> usize {
     2
 }
 
+fn default_plugin_http_timeout() -> u64 {
+    3_000
+}
+
+fn default_plugin_response_limit() -> usize {
+    1024 * 1024
+}
+
+fn default_plugin_cache_entries() -> usize {
+    4096
+}
+
+fn default_plugin_cache_entry_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_plugin_cache_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_plugin_cache_ttl() -> u64 {
+    300
+}
+
+fn default_jwt_refresh_interval() -> u64 {
+    3600
+}
+
+fn default_jwt_max_stale() -> u64 {
+    7200
+}
+
+fn default_jwt_clock_skew() -> u64 {
+    5
+}
+
+/// A remotely refreshed JWT verification policy available to plugins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginJwtVerifierConfig {
+    pub issuer: String,
+    pub audiences: Vec<String>,
+    pub allowed_algorithms: Vec<String>,
+    pub key_source: PluginJwtKeySourceConfig,
+    #[serde(default)]
+    pub allow_missing_kid: bool,
+    #[serde(default = "default_jwt_refresh_interval")]
+    pub refresh_interval_seconds: u64,
+    #[serde(default = "default_jwt_max_stale")]
+    pub max_stale_seconds: u64,
+    #[serde(default = "default_jwt_clock_skew")]
+    pub clock_skew_seconds: u64,
+}
+
+/// A configured source of public JWT verification keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginJwtKeySourceConfig {
+    Jwks { url: String },
+    OidcDiscovery { url: String },
+    Certificate { url: String },
+}
+
+/// TLS material used by the plugin HTTP client. Paths are read while a route
+/// generation is compiled so reloads atomically replace renewed material.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginTlsConfig {
+    /// Optional PEM or DER CA certificate added to the WebPKI trust roots.
+    #[serde(default)]
+    pub custom_ca_bundle: Option<PathBuf>,
+    /// PEM certificate chain presented to plugin egress services.
+    #[serde(default)]
+    pub client_certificate: Option<PathBuf>,
+    /// PEM private key paired with `client_certificate`.
+    #[serde(default)]
+    pub client_private_key: Option<PathBuf>,
+}
+
 /// Process-wide plugin package and sandbox settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginRuntimeConfig {
@@ -503,6 +580,27 @@ pub struct PluginRuntimeConfig {
     /// fail closed rather than occupying Tokio worker threads.
     #[serde(default = "default_plugin_worker_threads")]
     pub worker_threads: usize,
+    /// Exact DNS names that plugin identity and key requests may contact.
+    /// An empty list disables all plugin egress.
+    #[serde(default)]
+    pub allowed_egress_hosts: Vec<String>,
+    #[serde(default = "default_plugin_http_timeout")]
+    pub http_timeout_millis: u64,
+    #[serde(default)]
+    pub tls: PluginTlsConfig,
+    #[serde(default = "default_plugin_response_limit")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_plugin_cache_entries")]
+    pub max_cache_entries: usize,
+    #[serde(default = "default_plugin_cache_entry_bytes")]
+    pub max_cache_entry_bytes: usize,
+    #[serde(default = "default_plugin_cache_bytes")]
+    pub max_cache_bytes: usize,
+    #[serde(default = "default_plugin_cache_ttl")]
+    pub max_cache_ttl_seconds: u64,
+    /// Named policies used by `ctx.jwt.verify`.
+    #[serde(default)]
+    pub jwt_verifiers: std::collections::HashMap<String, PluginJwtVerifierConfig>,
 }
 
 fn default_true() -> bool {
@@ -518,6 +616,15 @@ impl Default for PluginRuntimeConfig {
             memory_limit_bytes: default_plugin_memory_limit(),
             execution_timeout_millis: default_plugin_execution_timeout(),
             worker_threads: default_plugin_worker_threads(),
+            allowed_egress_hosts: Vec::new(),
+            http_timeout_millis: default_plugin_http_timeout(),
+            tls: PluginTlsConfig::default(),
+            max_response_bytes: default_plugin_response_limit(),
+            max_cache_entries: default_plugin_cache_entries(),
+            max_cache_entry_bytes: default_plugin_cache_entry_bytes(),
+            max_cache_bytes: default_plugin_cache_bytes(),
+            max_cache_ttl_seconds: default_plugin_cache_ttl(),
+            jwt_verifiers: std::collections::HashMap::new(),
         }
     }
 }

@@ -1,6 +1,8 @@
 # Plugin Design
 
-**Status:** Partially implemented. Bifrost Bridge loads signed QuickJS access plugins; the identity exchange, sensitive cache, remote JWT verification, and asynchronous host PDK described here remain proposed.
+**Status:** Implemented. Signed QuickJS packages can run the route-local ingress, access, upstream,
+response, and log phases with allowlisted identity exchange, encrypted sensitive caching, remote
+JWT verification, audit events, and safe request or response plans through the asynchronous host PDK.
 
 This document describes a programmable gateway extension model for organizations that need
 company-specific authentication, authorization, and request transformation. It uses QuickJS for
@@ -15,8 +17,7 @@ See the [glossary](./glossary.md) for shared gateway terminology.
 - Attach plugins to a route and run them at defined points in the proxy lifecycle.
 - Support AM/OpenAM session or access-token exchange into a short-lived JWT for a downstream API.
 - Let a plugin configure its own translation URL and cache semantics.
-- Verify JWTs against remotely refreshed public-key manifests, including ordinary JWKS endpoints
-  and a single X.509 certificate endpoint.
+- Verify JWTs against remotely refreshed JWKS endpoints, directly or through OIDC discovery.
 - Keep credentials, signing keys, and outbound network access out of arbitrary JavaScript unless
   the route's service owner explicitly grants a plugin access to a request header.
 
@@ -39,7 +40,7 @@ flowchart LR
     Translator -->|JWT| Runtime
     Plugin -->|upstream authorization plan| Gateway
     Gateway -->|Authorization: Bearer JWT| API
-    KeyManifest[Key manifest / certificate URL] -->|scheduled refresh| JWTVerifier
+    KeyManifest[JWKS / OIDC discovery URL] -->|bounded refresh| JWTVerifier
 ```
 
 The **native plugin runtime** and **native JWT verifier** are Bifrost Bridge components written in
@@ -55,8 +56,8 @@ own the mechanics that must remain reliable and secure across all plugins:
 | Plugin responsibility | Bifrost native responsibility |
 |---|---|
 | Translator URL and protocol mapping | TLS policy, DNS and egress policy enforcement |
-| Requested resource, audience, and scopes | Async HTTP client, timeout, cancellation, and response size limits |
-| Cache key dimensions, tags, and requested TTL | Atomic cache loading, single-flight, eviction, storage encryption, and metrics |
+| Requested resource, audience, and scopes | Async HTTP client, timeout, egress policy, and response size limits |
+| Cache key dimensions, tags, and requested TTL | Atomic cache loading, single-flight, eviction, and storage encryption |
 | Claim mapping and access decision | JWT signature and claim verification |
 | Header plan within granted permissions | Reserved-header removal and final upstream rewrite |
 
@@ -142,8 +143,8 @@ by default and can be disabled only with `require_signatures: false` for local d
 }
 ```
 
-An access plugin exports synchronous `access(ctx)`, either as a global function or
-`module.exports.access`. It returns `{ outcome: "allow" | "deny" | "error" }`; `deny` may add a
+Each declared phase is exported by name, either as a global function or through `module.exports`.
+The `access(ctx)` hook returns `{ outcome: "allow" | "deny" | "error" }`; `deny` may add a
 4xx `status` and a lowercase underscore-separated public `code`. With the
 `upstream.headers` capability, an allow result may include
 `upstream: { headers: { "x-principal-role": "orders-reader" } }`. Reserved, host, and
@@ -158,12 +159,12 @@ forwarding. Package configuration is validated against the package JSON schema w
 compiled, so an invalid package, signature, schema, or configuration prevents activation rather
 than failing on the first request.
 
-The remaining PDK services in this proposal—identity exchange, sensitive cache, remote JWT key
-refresh, and asynchronous host calls—remain follow-on work. A package requiring those services
-must not rely on this initial access-only runtime.
+`access` may be asynchronous. The host PDK exposes opaque credential handles, identity exchange,
+single-flight sensitive caching, and JWT verification as promises. The complete executable example
+is [`examples/config_plugin_openam.json`](../examples/config_plugin_openam.json), with its package
+under [`examples/plugins`](../examples/plugins/).
 
-The following proposed route configuration is illustrative and is not accepted by the current
-binary:
+The route-local plugin configuration is schema validated and may contain values such as:
 
 ```json
 {
@@ -172,10 +173,6 @@ binary:
     "package": "com.example.openam-exchange@1.2.0",
     "config": {
       "translator_url": "https://iam.example.com/token/translate",
-      "translator_tls": {
-        "client_auth": { "mode": "none" },
-        "server_verification": { "mode": "custom_ca", "ca_bundle_ref": "iam-root-ca" }
-      },
       "resource": "urn:example:orders-api",
       "scopes": ["orders.read"],
       "cache_ttl_seconds": 20
@@ -186,12 +183,13 @@ binary:
 
 ## Request phases
 
-Plugins have a small, ordered lifecycle. Each plugin declares the phases it implements and an
-integer priority within that phase. The configuration compiler rejects ambiguous ordering.
+Plugins have deterministic integer priorities; the configuration compiler rejects equal priorities
+when two attachments share a phase. Because attachments belong to a selected route, route-local
+`ingress` runs immediately after selection and before `access`.
 
 | Phase | Purpose | Principal operations |
 |---|---|---|
-| `ingress` | Normalize an incoming request before routing | Reserved-header removal, trusted-proxy facts |
+| `ingress` | Normalize a request immediately after route selection | Reserved-header removal, trusted-proxy facts |
 | `access` | Authenticate and authorize after route selection | Identity exchange, JWT verification, allow or deny |
 | `upstream` | Prepare the request sent to the selected target | Approved header changes and credential injection |
 | `response` | Apply safe response changes | Approved response headers and audit facts |
@@ -214,8 +212,8 @@ identity dependencies to `503`. It does not reveal credentials or internal excep
 
 QuickJS is a language runtime, not a security boundary by itself. The host creates bounded isolates
 on a dedicated worker pool and never runs arbitrary plugin work on a Tokio request worker. Each
-invocation has a deadline, cancellation token, memory limit, stack limit, and execution-time
-interrupt. QuickJS exposes memory, stack, and interrupt controls that support this model. See the
+invocation has a memory limit, stack limit, and execution-time interrupt. Native HTTP calls have a
+separate configured deadline and response-size bound. QuickJS exposes memory, stack, and interrupt controls that support this model. See the
 [QuickJS documentation](https://bellard.org/quickjs/quickjs.html).
 
 The PDK exposes explicit capabilities. It provides no filesystem, process, dynamic-import, raw
@@ -224,12 +222,13 @@ socket, or unrestricted HTTP API.
 | PDK service | Use |
 |---|---|
 | `ctx.request` | Read normalized method, path, route facts, and permitted headers. |
-| `ctx.credentials` | Obtain a named credential handle and a non-reversible HMAC fingerprint. |
-| `ctx.identity.exchange` | Send a credential handle to the plugin's configured identity service and return a verified credential handle plus safe metadata. |
+| `ctx.credentials` | Read named opaque handles and non-reversible HMAC fingerprints. |
+| `ctx.identity.exchange` | Send a credential handle to the configured identity service and return an opaque exchanged credential plus safe metadata. |
 | `ctx.jwt.verify` | Verify a supplied JWT using a named verifier policy. |
 | `ctx.cache` | Atomically `getOrLoad`, delete, and invalidate tagged entries in the plugin namespace. |
-| `ctx.upstream` | Apply approved upstream headers or set `Authorization` from a bearer-credential handle. |
-| `ctx.audit` | Emit structured, redacted security events. |
+| returned `upstream` plan | Apply approved upstream headers or set `Authorization` from a bearer credential handle. |
+| returned `response` plan | Apply capability checked response headers. |
+| `ctx.audit.emit` | Emit a size bounded structured event after recursive sensitive-field checks. |
 
 `identity.exchange` resolves the URL supplied by the plugin configuration. The host still enforces
 HTTPS, destination policy, connect/read deadlines, response limits, and the configured TLS policy.
@@ -237,9 +236,18 @@ The AM token is represented by a credential handle. It is
 never automatically converted to a JavaScript string, log field, cache key, or generic request
 header.
 
-Async host operations return JavaScript promises backed by Rust futures. When a client disconnects
-or the request deadline expires, Bifrost cancels the outstanding operation and releases the isolate
-only after its pending work is settled or terminated.
+Async host operations return JavaScript promises backed by Rust futures. Each HTTP operation has a
+configured deadline; JavaScript CPU execution also retains its independent interrupt deadline.
+
+`ctx.identity.exchange(options)` accepts an allowlisted HTTPS `url`, an opaque `credential`, the
+top-level JSON `credential_field`, a JSON `body`, optional `accept`/`content-type`/`user-agent`
+headers, response `token_field` and `expires_in_field`, and a list of non-secret `metadata_fields`.
+It returns another opaque credential handle. Redirects are disabled and response bytes are bounded.
+
+`ctx.cache.getOrLoad(key, {ttl_seconds, tags}, loader)` is single-flight within the route, package,
+version, and validated configuration namespace. Cache values are AES-256-GCM encrypted with an
+ephemeral process key, bounded by entry count and size, and capped by the configured TTL and token
+expiry. `delete(key)` and `invalidateTag(tag)` are also available.
 
 ## Identity exchange and cache ownership
 
@@ -290,65 +298,35 @@ use its own identity provider and rotation process.
 
 ```json
 {
-  "id": "example-iam-jwt",
+  "plugin_runtime": {
+    "allowed_egress_hosts": ["iam.example.com"],
+    "jwt_verifiers": {
+      "example-iam-jwt": {
   "issuer": "https://iam.example.com/oauth2",
   "audiences": ["urn:example:orders-api"],
   "allowed_algorithms": ["RS256", "ES256"],
   "key_source": {
     "type": "jwks",
-    "url": "https://iam.example.com/oauth2/keys",
-    "refresh_interval": "1h",
-    "max_stale": "2h",
-    "request_timeout": "2s",
-    "tls": {
-      "server_verification": { "mode": "system" }
-    }
+    "url": "https://iam.example.com/oauth2/keys"
   },
-  "clock_skew": "5s"
-}
-```
-
-This is a proposed configuration shape. It is intentionally explicit: the verifier never follows a
-`jku` or `x5u` URL embedded in an untrusted JWT.
-
-### HTTPS and TLS policy
-
-Translator and key-manifest URLs use HTTPS. Client authentication and server verification are
-independent settings. mTLS is optional: many enterprise translators use ordinary HTTPS with no
-client certificate.
-
-```json
-{
-  "translator_tls": {
-    "client_auth": {
-      "mode": "mtls",
-      "certificate_ref": "gateway-client-cert",
-      "private_key_ref": "gateway-client-key"
-    },
-    "server_verification": {
-      "mode": "system"
+  "refresh_interval_seconds": 3600,
+  "max_stale_seconds": 7200,
+  "clock_skew_seconds": 5
+      }
     }
   }
 }
 ```
 
-`client_auth.mode` is one of `none` or `mtls`. `server_verification` is one of:
+The verifier never follows a `jku` or `x5u` URL embedded in an untrusted JWT.
 
-| Mode | Use |
-|---|---|
-| `system` | Verify the server chain and hostname with the operating-system trust store. This is the default. |
-| `custom_ca` | Verify the server chain and hostname with a configured internal root/intermediate CA bundle. Use it for private PKI or a self-signed enterprise CA. |
-| `pinned_certificate` | Verify the server certificate or public-key hash against a configured pin. Use it when a provider publishes a stable leaf certificate. |
-| `insecure_skip_verify` | Establish HTTPS without validating the server certificate or hostname. This requires an explicit route/plugin setting and produces a high-severity audit event and metric. |
+### HTTPS and TLS policy
 
-A CA bundle or pin verifies the remote HTTPS server. A client certificate serves a different
-purpose: it identifies Bifrost to that server for mTLS. `custom_ca` and
-`pinned_certificate` keep hostname verification enabled; an optional configured `server_name`
-supports enterprise endpoints whose connection address differs from their certificate name.
-
-`insecure_skip_verify` exists for legacy enterprise environments and should be scoped to the one
-configured service. It is never the default and is not inherited by other plugin egress or key
-manifest sources.
+Translator and key-manifest URLs must use HTTPS, must not contain user information, and must match
+an exact name in `allowed_egress_hosts`. The runtime uses WebPKI roots, verifies the certificate and
+hostname, and does not follow redirects. `plugin_runtime.tls.custom_ca_bundle` adds a PEM or DER
+trust root. `client_certificate` and `client_private_key` configure a PEM mTLS identity and must be
+set together. TLS material is reloaded with each proxy generation.
 
 ### Supported key sources
 
@@ -356,18 +334,12 @@ manifest sources.
 |---|---|---|
 | `jwks` | RFC 7517 JSON Web Key Set containing `keys` | Match JWT `kid` to a usable JWK. |
 | `oidc_discovery` | OpenID Connect or OAuth authorization-server metadata | Fetch configured metadata URL, then its configured `jwks_uri`. |
-| `certificate` | One PEM or DER X.509 certificate | Use the certificate public key as the sole eligible verification key. |
+| `certificate` | One PEM or DER X.509 certificate | Use its RSA, EC, or EdDSA public key as the sole verification key. |
 
 JWKS entries may carry a bare public key or an `x5c` certificate chain. The verifier accepts only
 public signing keys compatible with the configured algorithms. It respects `use: "sig"` and
 `key_ops` when supplied, rejects unsupported key types and weak keys, and uses only explicitly
 configured algorithms.
-
-The `certificate` source supports issuers that publish one signing certificate rather than a JWKS
-document. It is valid when the configured policy permits a missing JWT `kid`; there is exactly one
-eligible public key, so verification remains unambiguous. Its HTTPS fetch uses the configured key
-source TLS policy. Deployments can use `custom_ca` for private PKI or `pinned_certificate` for a
-stronger binding to the expected certificate or public key.
 
 ### `kid` handling
 
@@ -386,10 +358,10 @@ unbounded work caused by an attacker-crafted token.
 
 ### Refresh, rotation, and failure behaviour
 
-The verifier fetches the initial key source before serving a route that requires it. It refreshes in
-the background at `refresh_interval`; one hour is an appropriate default. Fetches use conditional
-HTTP requests (`ETag`/`If-None-Match` and `Last-Modified` when available), a small response-size
-limit, and per-source single-flight. A successful refresh atomically replaces the active key set.
+The verifier fetches the initial key source before serving a route that requires it. After
+`refresh_interval`, the next verification refreshes the key set before validation; one hour is an
+appropriate default. Fetches have a small response-size limit and are single-flight within the
+runtime. A successful refresh atomically replaces the active key set.
 
 Key providers should publish the new key alongside the previous key until every JWT made with the
 previous key has expired. Bifrost removes keys that disappear from a successful manifest immediately
@@ -428,24 +400,17 @@ Plugins cannot forge Bifrost's route identity, client connection facts, audit co
 trusted forwarded headers. The upstream network should accept traffic only from the gateway or
 perform its own JWT validation.
 
-## Observability
+## Operational visibility
 
-The host emits metrics and audit fields without secrets:
+Plugin failures fail closed and callers receive only a public denial code or `plugin_unavailable`.
+Credential values, fingerprints, exchanged JWTs, authorization headers, remote response bodies, and
+private keys are not logged. Detailed plugin metrics and audit sinks can be added independently of
+the PDK without widening JavaScript access to sensitive values.
 
-- plugin package, version, phase, route, and outcome;
-- translator and key-manifest latency, status class, cache hit/miss, and refresh result;
-- JWT verifier source, `kid` presence, unknown-key refresh count, and validation failure class;
-- cache entry count, eviction count, single-flight waiters, and invalidation count.
+## Implementation status
 
-Logs include credential fingerprints only when a deployment explicitly permits a redacted correlation
-identifier. They never include AM tokens, exchanged JWTs, authorization headers, response bodies, or
-private keys.
-
-## Implementation sequence
-
-1. Define package manifests, signature validation, route attachment, and configuration schemas.
-2. Add the bounded QuickJS runtime, capability-gated PDK, phase ordering, and reload lifecycle.
-3. Add protected egress, credential handles, and sensitive `getOrLoad` caching.
-4. Add JWT verification with JWKS, discovery, and single-certificate key sources.
-5. Add the first AM/OpenAM exchange plugin and integration tests for key rotation, cache expiry,
-   revocation, and failure modes.
+The plugin sequence is complete: signed packages and schema validation; five ordered route phases;
+bounded and cancellable async QuickJS execution; protected HTTPS or mTLS egress and opaque
+credentials; encrypted single-flight caching; JWKS, OIDC discovery, and certificate verification;
+periodic key refresh; request and response plans; structured audit events; and an AM/OAuth
+token-exchange example.

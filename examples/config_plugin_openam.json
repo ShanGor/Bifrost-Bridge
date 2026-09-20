@@ -1,0 +1,56 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8888",
+  "plugin_runtime": {
+    "package_dir": "./examples/plugins",
+    "require_signatures": false,
+    "allowed_egress_hosts": ["iam.example.com"],
+    "http_timeout_millis": 3000,
+    "tls": {
+      "custom_ca_bundle": null,
+      "client_certificate": null,
+      "client_private_key": null
+    },
+    "max_response_bytes": 1048576,
+    "max_cache_entries": 4096,
+    "max_cache_entry_bytes": 65536,
+    "max_cache_bytes": 16777216,
+    "max_cache_ttl_seconds": 300,
+    "jwt_verifiers": {
+      "example-iam": {
+        "issuer": "https://iam.example.com/oauth2",
+        "audiences": ["urn:example:orders-api"],
+        "allowed_algorithms": ["RS256", "ES256"],
+        "key_source": {
+          "type": "jwks",
+          "url": "https://iam.example.com/oauth2/keys"
+        },
+        "allow_missing_kid": false,
+        "refresh_interval_seconds": 3600,
+        "max_stale_seconds": 7200,
+        "clock_skew_seconds": 5
+      }
+    }
+  },
+  "reverse_proxy_routes": [
+    {
+      "id": "orders-api",
+      "target": "https://orders.internal",
+      "predicates": [{"type": "Path", "patterns": ["/**"]}],
+      "plugins": [
+        {
+          "package": "com.example.openam-exchange@1.0.0",
+          "config": {
+            "translator_url": "https://iam.example.com/token/translate",
+            "verifier": "example-iam",
+            "resource": "urn:example:orders-api",
+            "scopes": ["orders.read"],
+            "cache_ttl_seconds": 20
+          },
+          "credential_headers": {"am": "x-am-token"}
+        }
+      ]
+    }
+  ],
+  "monitoring": {"enabled": false}
+}

@@ -13,6 +13,7 @@ pub mod monitoring;
 pub mod rate_limit;
 pub mod secrets;
 pub mod plugin;
+mod plugin_host;
 
 pub use config::{Config, ProxyMode};
 pub use error::ProxyError;

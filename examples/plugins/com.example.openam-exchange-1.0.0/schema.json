@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["translator_url", "verifier", "resource", "cache_ttl_seconds"],
+  "properties": {
+    "translator_url": {"type": "string", "format": "uri"},
+    "verifier": {"type": "string", "minLength": 1},
+    "resource": {"type": "string", "minLength": 1},
+    "scopes": {"type": "array", "items": {"type": "string"}, "default": []},
+    "cache_ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 300}
+  }
+}

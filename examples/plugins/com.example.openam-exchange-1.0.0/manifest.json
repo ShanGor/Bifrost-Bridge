@@ -1,0 +1,18 @@
+{
+  "id": "com.example.openam-exchange",
+  "version": "1.0.0",
+  "runtime": "quickjs",
+  "entrypoint": "index.js",
+  "phases": ["ingress", "access", "upstream", "response", "log"],
+  "capabilities": [
+    "identity.exchange",
+    "cache.sensitive",
+    "jwt.verify",
+    "upstream.authorization",
+    "response.headers",
+    "audit.emit"
+  ],
+  "configuration_schema": "schema.json",
+  "publisher": "local-example",
+  "files": {}
+}

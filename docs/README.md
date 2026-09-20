@@ -16,6 +16,7 @@ This folder contains documentation for the Bifrost Bridge proxy server.
 - [`architecture-overview.md`](./architecture-overview.md) - Current runtime/adapters architecture with diagrams
 - [`error-recovery-architecture.md`](./error-recovery-architecture.md) - Error handling and recovery mechanisms
 - [`maintenance.md`](./maintenance.md) - System maintenance and operational guidance
+- [`plugin-design.md`](./plugin-design.md) - Proposed QuickJS plugin, identity exchange, cache, and JWT verification design
 
 ### **Development Documentation**
 - [`development.md`](./development.md) - Development setup and guidelines

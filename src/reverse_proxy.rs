@@ -4,12 +4,14 @@ use crate::common::{
 };
 use crate::config::{
     HeaderOverrideConfig, HealthCheckConfig, LoadBalancingPolicy, ReverseProxyConfig,
-    ReverseProxyRouteConfig, ReverseProxyTargetConfig, RoutePredicateConfig, StickyConfig,
+    PluginRuntimeConfig, ReverseProxyRouteConfig, ReverseProxyTargetConfig, RoutePredicateConfig, StickyConfig,
     StickyMode, WebSocketConfig,
 };
 use crate::error::ProxyError;
+use crate::plugin::{load_route_plugins, PluginOutcome, PluginChain};
 use crate::rate_limit::RateLimiter;
 use chrono::{DateTime, FixedOffset, Utc};
+use http::HeaderMap;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body as _, Bytes, Incoming};
@@ -30,10 +32,11 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +53,85 @@ type BoxedBody = BoxBody<Bytes, BoxError>;
 
 /// Connector supporting both plain HTTP and TLS (HTTPS/WSS) backends
 type BackendConnector = HttpsConnector<HttpConnector>;
+
+type PluginWorkResult = Result<(PluginOutcome, HeaderMap), crate::plugin::PluginError>;
+
+struct PluginWork {
+    chain: PluginChain,
+    headers: HeaderMap,
+    method: String,
+    path: String,
+    result: oneshot::Sender<PluginWorkResult>,
+}
+
+/// A small, bounded pool solely for synchronous JavaScript evaluation. Using
+/// OS threads rather than Tokio's blocking pool keeps plugin saturation from
+/// consuming capacity needed by unrelated blocking runtime work.
+struct PluginWorkerPool {
+    sender: mpsc::SyncSender<PluginWork>,
+}
+
+impl PluginWorkerPool {
+    fn new(worker_threads: usize) -> Result<Self, ProxyError> {
+        if worker_threads == 0 {
+            return Err(ProxyError::Config(
+                "plugin worker_threads must be non-zero".to_string(),
+            ));
+        }
+        let (sender, receiver) = mpsc::sync_channel::<PluginWork>(worker_threads);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..worker_threads {
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name(format!("bifrost-plugin-{}", index))
+                .spawn(move || loop {
+                    let work = match receiver.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(work) = work else { return };
+                    let outcome = work
+                        .chain
+                        .run_access_headers(work.headers, &work.method, &work.path);
+                    // The request may have been cancelled; the calculation has
+                    // still completed and the worker is immediately reusable.
+                    let _ = work.result.send(outcome);
+                })
+                .map_err(ProxyError::Io)?;
+        }
+        Ok(Self { sender })
+    }
+
+    async fn run(
+        &self,
+        chain: PluginChain,
+        headers: HeaderMap,
+        method: String,
+        path: String,
+    ) -> PluginWorkResult {
+        let (result, receiver) = oneshot::channel();
+        let work = PluginWork {
+            chain,
+            headers,
+            method,
+            path,
+            result,
+        };
+        match self.sender.try_send(work) {
+            Ok(()) => receiver.await.map_err(|_| {
+                crate::plugin::PluginError::Execution(
+                    "plugin worker stopped before completing evaluation".to_string(),
+                )
+            })?,
+            Err(mpsc::TrySendError::Full(_)) => Err(crate::plugin::PluginError::Execution(
+                "plugin worker pool is saturated".to_string(),
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(crate::plugin::PluginError::Execution(
+                "plugin worker pool is unavailable".to_string(),
+            )),
+        }
+    }
+}
 
 /// Wrapper to store request data including client IP
 #[derive(Clone, Debug)]
@@ -87,6 +169,7 @@ struct CompiledRoute {
     sticky: Option<StickyConfig>,
     header_override: Option<HeaderOverrideConfig>,
     retry_policy: Option<CompiledRetryPolicy>,
+    plugins: PluginChain,
     rr_counter: AtomicU64,
 }
 
@@ -159,10 +242,25 @@ struct RouteMatcher {
 }
 
 impl RouteMatcher {
+    #[cfg(test)]
     fn new(
         route_configs: Vec<ReverseProxyRouteConfig>,
         connect_timeout_secs: u64,
         default_pool_config: Option<ReverseProxyConfig>,
+    ) -> Result<Self, ProxyError> {
+        Self::new_with_plugins(
+            route_configs,
+            connect_timeout_secs,
+            default_pool_config,
+            &PluginRuntimeConfig::default(),
+        )
+    }
+
+    fn new_with_plugins(
+        route_configs: Vec<ReverseProxyRouteConfig>,
+        connect_timeout_secs: u64,
+        default_pool_config: Option<ReverseProxyConfig>,
+        plugin_runtime: &PluginRuntimeConfig,
     ) -> Result<Self, ProxyError> {
         if route_configs.is_empty() {
             return Err(ProxyError::Config(
@@ -188,6 +286,9 @@ impl RouteMatcher {
                     cfg.id
                 )));
             }
+
+            let plugins = load_route_plugins(&cfg.id, &cfg.plugins, plugin_runtime)
+                .map_err(|e| ProxyError::Config(e.to_string()))?;
 
             let mut target_configs = cfg.targets;
             if !target_configs.is_empty() {
@@ -427,6 +528,7 @@ impl RouteMatcher {
                 sticky: cfg.sticky,
                 header_override: cfg.header_override,
                 retry_policy,
+                plugins,
                 rr_counter: AtomicU64::new(0),
             });
         }
@@ -1181,6 +1283,7 @@ pub struct ReverseProxy {
     metrics: Arc<PerformanceMetrics>,
     websocket_config: WebSocketConfig,
     rate_limiter: Arc<RateLimiter>,
+    plugin_workers: Arc<PluginWorkerPool>,
 }
 
 impl ReverseProxy {
@@ -1226,6 +1329,7 @@ impl ReverseProxy {
                 patterns: vec!["/**".to_string()],
                 match_trailing_slash: true,
             }],
+            plugins: Vec::new(),
         };
         Self::new_with_routes(
             vec![route],
@@ -1246,11 +1350,34 @@ impl ReverseProxy {
         reverse_proxy_config: Option<ReverseProxyConfig>,
         websocket_config: Option<WebSocketConfig>,
     ) -> Result<Self, ProxyError> {
-        let router = Arc::new(RouteMatcher::new(
+        Self::new_with_routes_and_plugins(
+            routes,
+            connect_timeout_secs,
+            _idle_timeout_secs,
+            _max_connection_lifetime_secs,
+            reverse_proxy_config,
+            websocket_config,
+            PluginRuntimeConfig::default(),
+        )
+    }
+
+    /// Creates a proxy with the process-wide plugin sandbox configuration.
+    pub fn new_with_routes_and_plugins(
+        routes: Vec<ReverseProxyRouteConfig>,
+        connect_timeout_secs: u64,
+        _idle_timeout_secs: u64,
+        _max_connection_lifetime_secs: u64,
+        reverse_proxy_config: Option<ReverseProxyConfig>,
+        websocket_config: Option<WebSocketConfig>,
+        plugin_runtime: PluginRuntimeConfig,
+    ) -> Result<Self, ProxyError> {
+        let router = Arc::new(RouteMatcher::new_with_plugins(
             routes,
             connect_timeout_secs,
             reverse_proxy_config,
+            &plugin_runtime,
         )?);
+        let plugin_workers = Arc::new(PluginWorkerPool::new(plugin_runtime.worker_threads)?);
 
         info!(
             "Reverse proxy configuration: {} routes",
@@ -1263,6 +1390,7 @@ impl ReverseProxy {
             metrics: Arc::new(PerformanceMetrics::new()),
             websocket_config: websocket_config.unwrap_or_default(),
             rate_limiter: Arc::new(RateLimiter::new(None)),
+            plugin_workers,
         })
     }
 
@@ -1331,6 +1459,7 @@ impl ReverseProxy {
             Arc::new(self.websocket_config.clone()),
             self.metrics.clone(),
             self.rate_limiter.clone(),
+            self.plugin_workers.clone(),
         )
         .await
     }
@@ -1388,6 +1517,7 @@ impl ReverseProxy {
         let websocket_config = Arc::new(self.websocket_config.clone());
         let metrics = self.metrics.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let plugin_workers = self.plugin_workers.clone();
 
         loop {
             let (stream, remote_addr) = listener
@@ -1399,6 +1529,7 @@ impl ReverseProxy {
             let metrics = metrics.clone();
             let websocket_cfg = websocket_config.clone();
             let rate_limiter = rate_limiter.clone();
+            let plugin_workers = plugin_workers.clone();
 
             match &tls_acceptor {
                 Some(acceptor) => {
@@ -1414,6 +1545,7 @@ impl ReverseProxy {
                                     websocket_cfg,
                                     metrics,
                                     rate_limiter,
+                                    plugin_workers,
                                 )
                                 .await;
                             }
@@ -1433,6 +1565,7 @@ impl ReverseProxy {
                             websocket_cfg,
                             metrics,
                             rate_limiter,
+                            plugin_workers,
                         )
                         .await;
                     });
@@ -1476,6 +1609,7 @@ impl ReverseProxy {
         let websocket_config = Arc::new(self.websocket_config.clone());
         let metrics = self.metrics.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let plugin_workers = self.plugin_workers.clone();
 
         loop {
             let (stream, remote_addr) = tokio::select! {
@@ -1487,6 +1621,7 @@ impl ReverseProxy {
             let metrics = metrics.clone();
             let websocket_cfg = websocket_config.clone();
             let rate_limiter = rate_limiter.clone();
+            let plugin_workers = plugin_workers.clone();
 
             match &tls_acceptor {
                 Some(acceptor) => {
@@ -1502,6 +1637,7 @@ impl ReverseProxy {
                                     websocket_cfg,
                                     metrics,
                                     rate_limiter,
+                                    plugin_workers,
                                 )
                                 .await;
                             }
@@ -1519,6 +1655,7 @@ impl ReverseProxy {
                             websocket_cfg,
                             metrics,
                             rate_limiter,
+                            plugin_workers,
                         )
                         .await;
                     });
@@ -1537,6 +1674,7 @@ impl ReverseProxy {
         websocket_cfg: Arc<WebSocketConfig>,
         metrics: Arc<PerformanceMetrics>,
         rate_limiter: Arc<RateLimiter>,
+        plugin_workers: Arc<PluginWorkerPool>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -1552,6 +1690,7 @@ impl ReverseProxy {
                     let metrics = metrics.clone();
                     let websocket_cfg = websocket_cfg.clone();
                     let rate_limiter = rate_limiter.clone();
+                    let plugin_workers = plugin_workers.clone();
 
                     let context = RequestContext {
                         client_ip: client_ip.clone(),
@@ -1568,6 +1707,7 @@ impl ReverseProxy {
                             websocket_cfg,
                             metrics.clone(),
                             rate_limiter.clone(),
+                            plugin_workers,
                         )
                         .await;
 
@@ -1599,6 +1739,7 @@ impl ReverseProxy {
         websocket_config: Arc<WebSocketConfig>,
         metrics: Arc<PerformanceMetrics>,
         rate_limiter: Arc<RateLimiter>,
+        plugin_workers: Arc<PluginWorkerPool>,
     ) -> Result<Response<BoxedBody>, Infallible> {
         if rate_limiter.is_enabled() {
             if let Some(client_ip) = context.client_ip.as_deref() {
@@ -1634,6 +1775,30 @@ impl ReverseProxy {
                 )));
             }
         };
+
+        let mut req = req;
+        if !selected_route.plugins.is_empty() {
+            let headers = req.headers().clone();
+            let method = req.method().as_str().to_owned();
+            let path = req.uri().path().to_owned();
+            match plugin_workers
+                .run(selected_route.plugins.clone(), headers, method, path)
+                .await
+            {
+                Ok((PluginOutcome::Allow, headers)) => *req.headers_mut() = headers,
+                Ok((PluginOutcome::Deny { status, code }, _)) => {
+                    return Ok(Self::boxed_response(ResponseBuilder::error(status, &code)));
+                }
+                Ok((PluginOutcome::Error, _)) | Err(_) => {
+                    // Plugin exceptions and dependency-style failures are not
+                    // disclosed to callers; access plugins fail closed.
+                    return Ok(Self::boxed_response(ResponseBuilder::error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "plugin_unavailable",
+                    )));
+                }
+            }
+        }
 
         if is_websocket_upgrade(req.headers()) {
             let TargetSelection { target, set_cookie } =
@@ -2371,6 +2536,7 @@ mod tests {
                     patterns: vec!["/api/**".to_string()],
                     match_trailing_slash: true,
                 }],
+                plugins: Vec::new(),
             },
             ReverseProxyRouteConfig {
                 id: "low".to_string(),
@@ -2388,6 +2554,7 @@ mod tests {
                     patterns: vec!["/**".to_string()],
                     match_trailing_slash: true,
                 }],
+                plugins: Vec::new(),
             },
         ];
         let matcher = RouteMatcher::new(routes, 10, None).unwrap();
@@ -2428,6 +2595,7 @@ mod tests {
                         weight: 1,
                     },
                 ],
+                plugins: Vec::new(),
             },
             ReverseProxyRouteConfig {
                 id: "b".to_string(),
@@ -2451,6 +2619,7 @@ mod tests {
                         weight: 3,
                     },
                 ],
+                plugins: Vec::new(),
             },
         ];
         let matcher = RouteMatcher::new(routes, 10, None).unwrap();
@@ -2509,6 +2678,7 @@ mod tests {
                 match_trailing_slash: true,
             }],
             retry_policy: None,
+            plugins: Vec::new(),
         }];
 
         let matcher = RouteMatcher::new(routes, 10, None).unwrap();
@@ -2568,6 +2738,7 @@ mod tests {
                 match_trailing_slash: true,
             }],
             retry_policy: None,
+            plugins: Vec::new(),
         }];
 
         let matcher = RouteMatcher::new(routes, 10, None).unwrap();
@@ -2624,6 +2795,7 @@ mod tests {
                 match_trailing_slash: true,
             }],
             retry_policy: None,
+            plugins: Vec::new(),
         }];
 
         let matcher = RouteMatcher::new(routes, 10, None).unwrap();
@@ -2669,6 +2841,7 @@ mod tests {
                 retry_on_statuses: Vec::new(),
                 methods: vec!["BAD METHOD".to_string()],
             }),
+            plugins: Vec::new(),
         }];
 
         let err = match RouteMatcher::new(routes, 10, None) {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -366,11 +367,7 @@ fn default_retry_on_connect_error() -> bool {
 }
 
 fn default_retry_methods() -> Vec<String> {
-    vec![
-        "GET".to_string(),
-        "HEAD".to_string(),
-        "OPTIONS".to_string(),
-    ]
+    vec!["GET".to_string(), "HEAD".to_string(), "OPTIONS".to_string()]
 }
 
 /// Retry policy for reverse proxy routes
@@ -429,6 +426,92 @@ pub struct ReverseProxyRouteConfig {
     /// Predicate list (logical AND). Empty list is invalid.
     #[serde(default)]
     pub predicates: Vec<RoutePredicateConfig>,
+    /// Plugins attached to this route. They are loaded and validated when the
+    /// reverse proxy configuration is compiled.
+    #[serde(default)]
+    pub plugins: Vec<RoutePluginConfig>,
+}
+
+/// A package reference and its route-local, schema-validated configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutePluginConfig {
+    /// Immutable package reference, for example
+    /// `com.example.openam-exchange@1.2.0`.
+    pub package: String,
+    /// Values validated against the package's `configuration_schema`.
+    #[serde(default)]
+    pub config: Value,
+    /// Lower values execute first within a phase.
+    #[serde(default)]
+    pub priority: i32,
+    /// Request headers the plugin may inspect. This is an explicit grant by
+    /// the route's service owner: it may deliberately include a header another
+    /// plugin attachment declares as a credential. Headers this attachment
+    /// itself declares in `credential_headers` are exposed only as fingerprints.
+    #[serde(default)]
+    pub permitted_headers: Vec<String>,
+    /// Maps this plugin's credential name to an inbound header. JavaScript
+    /// receives only an HMAC fingerprint for these values.
+    #[serde(default)]
+    pub credential_headers: std::collections::HashMap<String, String>,
+}
+
+fn default_plugin_package_dir() -> PathBuf {
+    PathBuf::from("plugins")
+}
+
+fn default_plugin_memory_limit() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_plugin_execution_timeout() -> u64 {
+    50
+}
+
+fn default_plugin_worker_threads() -> usize {
+    2
+}
+
+/// Process-wide plugin package and sandbox settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginRuntimeConfig {
+    /// Root containing package directories. Package manifests are discovered
+    /// below this directory during configuration compilation.
+    #[serde(default = "default_plugin_package_dir")]
+    pub package_dir: PathBuf,
+    /// Base64-encoded Ed25519 public keys indexed by publisher id.
+    #[serde(default)]
+    pub trusted_publishers: std::collections::HashMap<String, String>,
+    /// Packages must be signed unless this is explicitly disabled for local
+    /// development. Production configurations should retain the default.
+    #[serde(default = "default_true")]
+    pub require_signatures: bool,
+    #[serde(default = "default_plugin_memory_limit")]
+    pub memory_limit_bytes: usize,
+    #[serde(default = "default_plugin_execution_timeout")]
+    pub execution_timeout_millis: u64,
+    /// Number of dedicated operating-system threads allowed to execute
+    /// synchronous QuickJS access plugins. Requests above the bounded queue
+    /// fail closed rather than occupying Tokio worker threads.
+    #[serde(default = "default_plugin_worker_threads")]
+    pub worker_threads: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PluginRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            package_dir: default_plugin_package_dir(),
+            trusted_publishers: std::collections::HashMap::new(),
+            require_signatures: true,
+            memory_limit_bytes: default_plugin_memory_limit(),
+            execution_timeout_millis: default_plugin_execution_timeout(),
+            worker_threads: default_plugin_worker_threads(),
+        }
+    }
 }
 
 /// Predicate configuration for reverse proxy routing
@@ -474,19 +557,31 @@ pub enum RoutePredicateConfig {
         regex: Option<String>,
     },
     /// Time-based predicates
-    After { instant: String },
-    Before { instant: String },
-    Between { start: String, end: String },
+    After {
+        instant: String,
+    },
+    Before {
+        instant: String,
+    },
+    Between {
+        start: String,
+        end: String,
+    },
     /// Remote address in CIDR ranges
-    RemoteAddr { cidrs: Vec<String> },
+    RemoteAddr {
+        cidrs: Vec<String>,
+    },
     /// Weighted routing participation
-    Weight { group: String, weight: u32 },
+    Weight {
+        group: String,
+        weight: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticMount {
-    pub path: String,        // URL path prefix (e.g., "/app", "/api", "/assets")
-    pub root_dir: String,     // Filesystem directory path
+    pub path: String,     // URL path prefix (e.g., "/app", "/api", "/assets")
+    pub root_dir: String, // Filesystem directory path
     #[serde(default)]
     pub enable_directory_listing: Option<bool>,
     #[serde(default)]
@@ -510,20 +605,24 @@ impl StaticMount {
         ResolvedStaticMount {
             path: self.path.clone(),
             root_dir: self.root_dir.clone(),
-            enable_directory_listing: self.enable_directory_listing
+            enable_directory_listing: self
+                .enable_directory_listing
                 .unwrap_or(parent_config.enable_directory_listing),
-            index_files: self.index_files
+            index_files: self
+                .index_files
                 .clone()
                 .unwrap_or_else(|| parent_config.index_files.clone()),
-            spa_mode: self.spa_mode
-                .unwrap_or(parent_config.spa_mode),
-            spa_fallback_file: self.spa_fallback_file
+            spa_mode: self.spa_mode.unwrap_or(parent_config.spa_mode),
+            spa_fallback_file: self
+                .spa_fallback_file
                 .clone()
                 .unwrap_or_else(|| parent_config.spa_fallback_file.clone()),
-            no_cache_files: self.no_cache_files
+            no_cache_files: self
+                .no_cache_files
                 .clone()
                 .unwrap_or_else(|| parent_config.no_cache_files.clone()),
-            cache_millisecs: self.cache_millisecs
+            cache_millisecs: self
+                .cache_millisecs
                 .unwrap_or(parent_config.cache_millisecs),
             order: self.order.unwrap_or(100), // Default order for static mounts
         }
@@ -567,12 +666,12 @@ impl Default for StaticFileConfig {
                 path: "/".to_string(),
                 root_dir: "./public".to_string(),
                 enable_directory_listing: None, // Will inherit from parent
-                index_files: None, // Will inherit from parent
-                spa_mode: None, // Will inherit from parent
-                spa_fallback_file: None, // Will inherit from parent
-                no_cache_files: None, // Will inherit from parent
-                cache_millisecs: None, // Will inherit from parent
-                order: None, // Will use default (100)
+                index_files: None,              // Will inherit from parent
+                spa_mode: None,                 // Will inherit from parent
+                spa_fallback_file: None,        // Will inherit from parent
+                no_cache_files: None,           // Will inherit from parent
+                cache_millisecs: None,          // Will inherit from parent
+                order: None,                    // Will use default (100)
             }],
             enable_directory_listing: false,
             index_files: vec!["index.html".to_string(), "index.htm".to_string()],
@@ -593,12 +692,12 @@ impl StaticFileConfig {
                 path: "/".to_string(),
                 root_dir,
                 enable_directory_listing: None, // Will inherit from parent
-                index_files: None, // Will inherit from parent
-                spa_mode: Some(spa_mode), // Override SPA mode
-                spa_fallback_file: None, // Will inherit from parent
-                no_cache_files: None, // Will inherit from parent
-                cache_millisecs: None, // Will inherit from parent
-                order: None, // Will use default (100)
+                index_files: None,              // Will inherit from parent
+                spa_mode: Some(spa_mode),       // Override SPA mode
+                spa_fallback_file: None,        // Will inherit from parent
+                no_cache_files: None,           // Will inherit from parent
+                cache_millisecs: None,          // Will inherit from parent
+                order: None,                    // Will use default (100)
             }],
             enable_directory_listing: false,
             index_files: vec!["index.html".to_string(), "index.htm".to_string()],
@@ -616,18 +715,21 @@ impl StaticFileConfig {
             path,
             root_dir,
             enable_directory_listing: None, // Will inherit from parent
-            index_files: None, // Will inherit from parent
-            spa_mode: Some(spa_mode), // Override SPA mode
-            spa_fallback_file: None, // Will inherit from parent
-            no_cache_files: None, // Will inherit from parent
-            cache_millisecs: None, // Will inherit from parent
-            order: None, // Will use default (100)
+            index_files: None,              // Will inherit from parent
+            spa_mode: Some(spa_mode),       // Override SPA mode
+            spa_fallback_file: None,        // Will inherit from parent
+            no_cache_files: None,           // Will inherit from parent
+            cache_millisecs: None,          // Will inherit from parent
+            order: None,                    // Will use default (100)
         });
     }
 
     pub fn add_custom_mime_type(&mut self, extension: String, mime_type: String) {
         // Remove leading dot if present
-        let clean_ext = extension.strip_prefix('.').unwrap_or(&extension).to_lowercase();
+        let clean_ext = extension
+            .strip_prefix('.')
+            .unwrap_or(&extension)
+            .to_lowercase();
         self.custom_mime_types.insert(clean_ext, mime_type);
     }
 }
@@ -704,6 +806,8 @@ pub struct Config {
     pub websocket: Option<WebSocketConfig>,
     #[serde(default)]
     pub rate_limiting: Option<RateLimitingConfig>,
+    #[serde(default)]
+    pub plugin_runtime: PluginRuntimeConfig,
 }
 
 fn default_max_header_size() -> Option<usize> {
@@ -762,10 +866,7 @@ where
     let mut i = 0;
 
     while i < input.len() {
-        let ch = input[i..]
-            .chars()
-            .next()
-            .expect("valid UTF-8 iteration");
+        let ch = input[i..].chars().next().expect("valid UTF-8 iteration");
         if ch != '$' {
             output.push(ch);
             i += ch.len_utf8();
@@ -793,10 +894,7 @@ where
             let mut j = i + 2;
             let mut end = None;
             while j < input.len() {
-                let current = input[j..]
-                    .chars()
-                    .next()
-                    .expect("valid UTF-8 iteration");
+                let current = input[j..].chars().next().expect("valid UTF-8 iteration");
                 if current == '}' {
                     end = Some(j);
                     break;
@@ -907,6 +1005,7 @@ impl Default for Config {
             monitoring: MonitoringConfig::default(),
             websocket: None,
             rate_limiting: None,
+            plugin_runtime: PluginRuntimeConfig::default(),
         }
     }
 }
@@ -949,17 +1048,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            interpolated,
-            "http://alice:s3cr3t@localhost:3128?cost=$20"
-        );
+        assert_eq!(interpolated, "http://alice:s3cr3t@localhost:3128?cost=$20");
     }
 
     #[test]
     fn interpolate_env_string_errors_when_var_missing() {
         let mut resolver = |_name: &str| None;
-        let err = interpolate_env_string_with("$MISSING", "$.proxy_password", &mut resolver)
-            .unwrap_err();
+        let err =
+            interpolate_env_string_with("$MISSING", "$.proxy_password", &mut resolver).unwrap_err();
 
         match err {
             ConfigLoadError::MissingEnvVar { var, path } => {

@@ -157,13 +157,14 @@ impl ProxyFactory {
                         config.max_connection_lifetime_secs.unwrap_or(300);
                     let proxy = if !reverse_routes.is_empty() {
                         info!("Reverse proxy routes: {}", reverse_routes.len());
-                        ReverseProxy::new_with_routes(
+                        ReverseProxy::new_with_routes_and_plugins(
                             reverse_routes.clone(),
                             connect_timeout_secs,
                             idle_timeout_secs,
                             max_connection_lifetime_secs,
                             config.reverse_proxy_config.clone(),
                             config.websocket.clone(),
+                            config.plugin_runtime.clone(),
                         )?
                     } else {
                         let target_url = config.reverse_proxy_target.unwrap();
@@ -243,13 +244,14 @@ impl ProxyFactory {
                     let reverse_routes = config.reverse_proxy_routes.clone();
                     let proxy = if !reverse_routes.is_empty() {
                         info!("Reverse proxy routes: {}", reverse_routes.len());
-                        ReverseProxy::new_with_routes(
+                        ReverseProxy::new_with_routes_and_plugins(
                             reverse_routes,
                             connect_timeout_secs,
                             idle_timeout_secs,
                             max_connection_lifetime_secs,
                             config.reverse_proxy_config.clone(),
                             config.websocket.clone(),
+                            config.plugin_runtime.clone(),
                         )?
                     } else {
                         let target_url = config.reverse_proxy_target.ok_or_else(|| {

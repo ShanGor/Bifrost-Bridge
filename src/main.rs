@@ -694,6 +694,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         monitoring: bifrost_bridge::config::MonitoringConfig::default(),
         websocket: None,
         rate_limiting: None,
+        plugin_runtime: bifrost_bridge::config::PluginRuntimeConfig::default(),
     };
 
     // Configure static files if specified
@@ -849,6 +850,7 @@ mod config_validation_tests {
                 patterns: vec!["/**".to_string()],
                 match_trailing_slash: true,
             }],
+            plugins: Vec::new(),
         };
 
         let config = Config {

@@ -158,6 +158,8 @@ cargo run -- \
 | `--spa` | Enable SPA mode | |
 | `--mount` | Mount directory | `/app:./dist` |
 | `--config` | Config file | `config.json` |
+| `--reload` | Reload the running server from its JSON config | `--reload` |
+| `--pid-file` | PID file path shared by server and reload command | `--pid-file /run/bifrost-bridge.pid` |
 
 ### JSON Configuration
 See [Configuration Guide](./configuration.md) for detailed options.

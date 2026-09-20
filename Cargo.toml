@@ -23,7 +23,7 @@ regex = "1.11.1"
 ipnet = "2.10.1"
 futures = "0.3.31"
 bytes = "1.11.0"
-tokio-util = { version = "0.7.17", features = ["io"] }
+tokio-util = { version = "0.7.17", features = ["io", "rt"] }
 hyper-util = { version = "0.1.18", features = ["full"] }
 http-body-util = "0.1.2"
 percent-encoding = "2.3.2"
@@ -39,6 +39,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 dirs = "5.0"
 zeroize = "1.8"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

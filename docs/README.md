@@ -8,6 +8,7 @@ This folder contains documentation for the Bifrost Bridge proxy server.
 - [`installation.md`](./installation.md) - How to install and set up the proxy server
 - [`quick-start.md`](./quick-start.md) - Get started quickly with basic usage
 - [`configuration.md`](./configuration.md) - Detailed configuration options (CLI and JSON)
+- [`faq.md`](./faq.md) - Answers about reloads, generations, and long-lived connections
 - [`https-setup.md`](./https-setup.md) - HTTPS/SSL configuration guide
 - [`glossary.md`](./glossary.md) - Shared definitions for proxy terms and jargon
 

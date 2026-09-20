@@ -12,6 +12,7 @@ A high-performance proxy server written in Rust that can function as both a forw
 - **Rate limiting & monitoring hooks** via the built-in rate limiter and optional Prometheus endpoint
 - **CLI and JSON configuration** plus sample config generator and logging customization
 - **Graceful shutdown & logging** with Ctrl+C handling and env_logger/CustomLogger backends
+- **Zero-downtime configuration reloads** with a supervisor-owned listener and TLS rotation support
 - **Encrypted configuration secrets** with AES-256 `{encrypted}` payloads backed by a masked key on disk
 
 ## Installation
@@ -45,6 +46,11 @@ cargo run -- --mode reverse --listen 127.0.0.1:8080 --target http://backend:3000
 
 # Using configuration file
 cargo run -- --config config.json
+
+# Reload config.json and renewed TLS files in a running instance
+cargo run -- --reload
+# Use an explicit PID file when running multiple instances
+cargo run -- --reload --pid-file /run/bifrost-bridge.pid
 
 # Set custom timeouts
 cargo run -- --mode forward --listen 127.0.0.1:8080 \
@@ -541,11 +547,12 @@ The server uses **Tokio worker threads** for CPU-intensive static file operation
 
 ### Overview
 
-Bifrost Bridge runs a single multi-threaded Tokio runtime per process. At startup the CLI/config data
-is converted into a `Config`, then `ProxyFactory` instantiates the one adapter that matches that mode:
+Bifrost Bridge runs a single multi-threaded Tokio runtime per process. A supervisor owns the listening
+socket for the process lifetime. At startup, and after each reload, `ProxyFactory` creates a worker
+generation from the current `Config`:
 
-- **Forward proxy** – `ForwardProxyAdapter` binds a listener and drives `ForwardProxy`.
-- **Reverse proxy** – `ReverseProxyAdapter` binds a listener and drives `ReverseProxy`.
+- **Forward proxy** – `ForwardProxyAdapter` drives `ForwardProxy`.
+- **Reverse proxy** – `ReverseProxyAdapter` drives `ReverseProxy`.
 - **Static-only** – `StaticFileProxyAdapter` serves mount points and SPA fallbacks.
 - **Combined reverse + static** – `CombinedProxyAdapter` routes requests between the reverse proxy
   and the `StaticFileHandler` so both share the same port.
@@ -554,17 +561,40 @@ is converted into a `Config`, then `ProxyFactory` instantiates the one adapter t
 ┌────────────────────────────────────────────────────────────────┐
 │           Tokio Runtime                                        │
 ├────────────────────────────────────────────────────────────────┤
-│ ProxyFactory                                                   │
-│   ├ ForwardProxyAdapter  ─▶ ForwardProxy                       │
-│   ├ ReverseProxyAdapter  ─▶ ReverseProxy                       │
-│   ├ StaticFileProxyAdapter ─▶ StaticFileHandler                │
-│   └ CombinedProxyAdapter ─▶ ReverseProxy + StaticFileHandler   │
+│ Supervisor: listener + SIGHUP/--reload control                │
+│   └─ Worker generation (replaceable; existing connections drain)│
+│      └─ ProxyFactory                                           │
+│         ├ ForwardProxyAdapter  ─▶ ForwardProxy                 │
+│         ├ ReverseProxyAdapter  ─▶ ReverseProxy                 │
+│         ├ StaticFileProxyAdapter ─▶ StaticFileHandler           │
+│         └ CombinedProxyAdapter ─▶ ReverseProxy + StaticFileHandler│
 └────────────────────────────────────────────────────────────────┘
 ```
 
 All adapters share the same runtime, connection limits, and logging pipeline. Reverse proxy mode can
 optionally embed the static handler; forward proxy mode cannot. Monitoring/rate limiting hooks are
 enabled per adapter when configuration requests them.
+
+### Reloading Configuration and Certificates
+
+On Unix, each server writes `bifrost-bridge.pid` in its working directory by default. Send a
+reload request with:
+
+```bash
+bifrost-bridge --reload
+# or, for a non-default PID file:
+bifrost-bridge --reload --pid-file /run/bifrost-bridge.pid
+```
+
+The running process handles `SIGHUP`. It reads and validates the complete JSON configuration,
+decrypts secrets, and validates the TLS key/certificate pair before replacing the worker. The
+listening socket stays open; existing connections continue using their current generation, while
+new connections use the new configuration. A malformed or invalid reload is rejected and the
+current generation continues serving.
+
+`listen_addr` and the effective Tokio `worker_threads` value cannot change during a reload; restart
+the process for those changes. Reloading a server started only with CLI flags is not supported yet,
+because there is no config file to reread.
 
 ### Project Structure
 

@@ -1,28 +1,36 @@
+use crate::common::{
+    FileBody, IsolatedWorker, MonitoringHandles, ProxyType, ResponseBuilder, TlsConfig,
+};
 use crate::config::{Config, ProxyMode, RelayProxyConfig};
-use crate::error::{ProxyError, ErrorContext, ContextualError};
+use crate::error::{ContextualError, ErrorContext, ProxyError};
 use crate::error_recovery::ErrorRecoveryManager;
 use crate::forward_proxy::ForwardProxy;
+use crate::monitoring::MonitoringServer;
+use crate::rate_limit::{RateLimitHit, RateLimiter};
 use crate::reverse_proxy::ReverseProxy;
 use crate::static_files::StaticFileHandler;
-use crate::common::{MonitoringHandles, ResponseBuilder, TlsConfig, FileBody, ProxyType, IsolatedWorker};
-use crate::monitoring::MonitoringServer;
-use crate::rate_limit::{RateLimiter, RateLimitHit};
-use log::{info, debug, warn, error};
-use hyper::{Response, StatusCode};
-use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper::server::conn::http1::Builder as ServerBuilder;
-use hyper_util::rt::TokioIo;
 use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1::Builder as ServerBuilder;
+use hyper::service::service_fn;
+use hyper::{Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use log::{debug, error, info, warn};
 use std::convert::Infallible;
 use std::future::Future;
-use std::pin::Pin;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
 pub trait Proxy {
-    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>>;
+    fn run(
+        self: Box<Self>,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>>;
 }
 
 // TLS configuration is now handled by TlsConfig::create_config in common.rs
@@ -32,8 +40,24 @@ pub struct ProxyFactory;
 impl ProxyFactory {
     pub fn create_proxy(config: Config) -> Result<Box<dyn Proxy + Send>, ProxyError> {
         info!("Creating proxy instance for mode: {:?}", config.mode);
-        debug!("Proxy configuration - listen_addr: {}, max_connections: {:?}",
-               config.listen_addr, config.max_connections);
+        debug!(
+            "Proxy configuration - listen_addr: {}, max_connections: {:?}",
+            config.listen_addr, config.max_connections
+        );
+
+        // Prepare TLS material as part of generation construction, before the
+        // supervisor stops the currently active generation during reload.
+        let tls_config = match (&config.private_key, &config.certificate) {
+            (Some(private_key), Some(certificate)) => {
+                Some(Arc::new(TlsConfig::create_config(private_key, certificate)?))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(ProxyError::Config(
+                    "Both private_key and certificate must be configured together".to_string(),
+                ));
+            }
+        };
 
         let monitoring_handles = MonitoringHandles::new();
         let monitoring_config = config.monitoring.clone();
@@ -42,18 +66,20 @@ impl ProxyFactory {
         let proxy: Box<dyn Proxy + Send> = match config.mode {
             ProxyMode::Forward => {
                 info!("Initializing Forward Proxy mode");
-                debug!("Forward proxy configuration - connection_pool: {:?}",
-                       config.connection_pool_enabled);
+                debug!(
+                    "Forward proxy configuration - connection_pool: {:?}",
+                    config.connection_pool_enabled
+                );
                 // Support backward compatibility with timeout_secs
-                let connect_timeout_secs = config.connect_timeout_secs
+                let connect_timeout_secs = config
+                    .connect_timeout_secs
                     .or(config.timeout_secs)
                     .unwrap_or(10);
-                let idle_timeout_secs = config.idle_timeout_secs
-                    .unwrap_or(90);
-                let max_connection_lifetime_secs = config.max_connection_lifetime_secs
-                    .unwrap_or(300);
+                let idle_timeout_secs = config.idle_timeout_secs.unwrap_or(90);
+                let max_connection_lifetime_secs =
+                    config.max_connection_lifetime_secs.unwrap_or(300);
                 let connection_pool_enabled = config.connection_pool_enabled.unwrap_or(true);
-                
+
                 // Support both new relay_proxies and legacy relay_proxy fields
                 let relay_configs = if let Some(relay_proxies) = config.relay_proxies {
                     // Use new multi-relay configuration
@@ -69,7 +95,7 @@ impl ProxyFactory {
                 } else {
                     Vec::new()
                 };
-                
+
                 let proxy = ForwardProxy::new_with_relay_proxies(
                     connect_timeout_secs,
                     idle_timeout_secs,
@@ -81,47 +107,54 @@ impl ProxyFactory {
                     config.websocket.clone(),
                     rate_limiter.clone(),
                 );
-                
+
                 Box::new(ForwardProxyAdapter {
                     proxy,
-                    addr: config.listen_addr,
-                    private_key: config.private_key,
-                    certificate: config.certificate,
+                    tls_config: tls_config.clone(),
                 })
             }
             ProxyMode::Reverse => {
                 info!("Initializing Reverse Proxy mode");
 
                 let reverse_routes = config.reverse_proxy_routes.clone();
-                if config.static_files.is_some() && config.reverse_proxy_target.is_none() && reverse_routes.is_empty() {
+                if config.static_files.is_some()
+                    && config.reverse_proxy_target.is_none()
+                    && reverse_routes.is_empty()
+                {
                     info!("Static files only mode (no reverse proxy target)");
                     let static_config = config.static_files.unwrap();
-                    debug!("Static files configuration - mounts: {}", static_config.mounts.len());
+                    debug!(
+                        "Static files configuration - mounts: {}",
+                        static_config.mounts.len()
+                    );
                     let handler = StaticFileHandler::new(static_config)?
                         .with_metrics(monitoring_handles.static_metrics());
                     Box::new(StaticFileProxyAdapter {
                         handler,
-                        addr: config.listen_addr,
-                        private_key: config.private_key,
-                        certificate: config.certificate,
+                        tls_config: tls_config.clone(),
                         rate_limiter: rate_limiter.clone(),
                     })
-                } else if config.static_files.is_some() && (config.reverse_proxy_target.is_some() || !reverse_routes.is_empty()) {
+                } else if config.static_files.is_some()
+                    && (config.reverse_proxy_target.is_some() || !reverse_routes.is_empty())
+                {
                     // Combined mode: both reverse proxy and static files
                     info!("Combined reverse proxy + static files mode");
                     let static_config = config.static_files.unwrap();
-                    debug!("Static files configuration - mounts: {}", static_config.mounts.len());
+                    debug!(
+                        "Static files configuration - mounts: {}",
+                        static_config.mounts.len()
+                    );
                     let handler = StaticFileHandler::new(static_config.clone())?
                         .with_metrics(monitoring_handles.static_metrics());
 
                     // Support backward compatibility with timeout_secs
-                    let connect_timeout_secs = config.connect_timeout_secs
+                    let connect_timeout_secs = config
+                        .connect_timeout_secs
                         .or(config.timeout_secs)
                         .unwrap_or(10);
-                    let idle_timeout_secs = config.idle_timeout_secs
-                        .unwrap_or(90);
-                    let max_connection_lifetime_secs = config.max_connection_lifetime_secs
-                        .unwrap_or(300);
+                    let idle_timeout_secs = config.idle_timeout_secs.unwrap_or(90);
+                    let max_connection_lifetime_secs =
+                        config.max_connection_lifetime_secs.unwrap_or(300);
                     let proxy = if !reverse_routes.is_empty() {
                         info!("Reverse proxy routes: {}", reverse_routes.len());
                         ReverseProxy::new_with_routes(
@@ -149,7 +182,7 @@ impl ProxyFactory {
 
                     // Build unified route table
                     let mut route_table = Vec::new();
-                    
+
                     // Add static mounts to route table
                     for (idx, mount) in static_config.mounts.iter().enumerate() {
                         let resolved = mount.resolve_inheritance(&static_config);
@@ -159,7 +192,7 @@ impl ProxyFactory {
                             path: resolved.path.clone(),
                         });
                     }
-                    
+
                     // Add reverse proxy routes to route table
                     for route in &reverse_routes {
                         let order = route.order.unwrap_or(50); // Default order for reverse proxy
@@ -168,18 +201,24 @@ impl ProxyFactory {
                             route_id: route.id.clone(),
                         });
                     }
-                    
+
                     // Sort route table by order (ascending - lower order = higher priority)
                     route_table.sort_by_key(|entry| entry.order());
-                    
-                    info!("Built unified route table with {} entries", route_table.len());
+
+                    info!(
+                        "Built unified route table with {} entries",
+                        route_table.len()
+                    );
                     for entry in &route_table {
                         match entry {
                             RouteEntry::StaticMount { order, path, .. } => {
                                 info!("  Route order {}: Static mount '{}'", order, path);
                             }
                             RouteEntry::ReverseProxy { order, route_id } => {
-                                info!("  Route order {}: Reverse proxy route '{}'", order, route_id);
+                                info!(
+                                    "  Route order {}: Reverse proxy route '{}'",
+                                    order, route_id
+                                );
                             }
                         }
                     }
@@ -187,22 +226,20 @@ impl ProxyFactory {
                     Box::new(CombinedProxyAdapter {
                         reverse_proxy: proxy,
                         static_handler: handler,
-                        addr: config.listen_addr,
-                        private_key: config.private_key,
-                        certificate: config.certificate,
+                        tls_config: tls_config.clone(),
                         rate_limiter: rate_limiter.clone(),
                         route_table,
                     })
                 } else {
                     // Reverse proxy only mode
                     // Support backward compatibility with timeout_secs
-                    let connect_timeout_secs = config.connect_timeout_secs
+                    let connect_timeout_secs = config
+                        .connect_timeout_secs
                         .or(config.timeout_secs)
                         .unwrap_or(10);
-                    let idle_timeout_secs = config.idle_timeout_secs
-                        .unwrap_or(90);
-                    let max_connection_lifetime_secs = config.max_connection_lifetime_secs
-                        .unwrap_or(300);
+                    let idle_timeout_secs = config.idle_timeout_secs.unwrap_or(90);
+                    let max_connection_lifetime_secs =
+                        config.max_connection_lifetime_secs.unwrap_or(300);
                     let reverse_routes = config.reverse_proxy_routes.clone();
                     let proxy = if !reverse_routes.is_empty() {
                         info!("Reverse proxy routes: {}", reverse_routes.len());
@@ -215,8 +252,12 @@ impl ProxyFactory {
                             config.websocket.clone(),
                         )?
                     } else {
-                        let target_url = config.reverse_proxy_target
-                            .ok_or_else(|| ProxyError::Config("Reverse proxy target URL is required for reverse proxy mode".to_string()))?;
+                        let target_url = config.reverse_proxy_target.ok_or_else(|| {
+                            ProxyError::Config(
+                                "Reverse proxy target URL is required for reverse proxy mode"
+                                    .to_string(),
+                            )
+                        })?;
                         info!("Reverse proxy target: {}", target_url);
                         ReverseProxy::new_with_config(
                             target_url,
@@ -231,9 +272,7 @@ impl ProxyFactory {
                     .with_rate_limiter(rate_limiter.clone());
                     Box::new(ReverseProxyAdapter {
                         proxy,
-                        addr: config.listen_addr,
-                        private_key: config.private_key,
-                        certificate: config.certificate,
+                        tls_config: tls_config.clone(),
                     })
                 }
             }
@@ -260,7 +299,11 @@ impl ProxyWithMonitoring {
 }
 
 impl Proxy for ProxyWithMonitoring {
-    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+    fn run(
+        self: Box<Self>,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
         Box::pin(async move {
             let ProxyWithMonitoring { inner, monitoring } = *self;
             let monitoring_task = monitoring.map(|server| {
@@ -271,10 +314,11 @@ impl Proxy for ProxyWithMonitoring {
                 })
             });
 
-            let result = inner.run().await;
+            let result = inner.run(listener, shutdown).await;
 
             if let Some(task) = monitoring_task {
                 task.abort();
+                let _ = task.await;
             }
 
             result
@@ -284,47 +328,47 @@ impl Proxy for ProxyWithMonitoring {
 
 struct ForwardProxyAdapter {
     proxy: ForwardProxy,
-    addr: std::net::SocketAddr,
-    private_key: Option<String>,
-    certificate: Option<String>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Proxy for ForwardProxyAdapter {
-    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+    fn run(
+        self: Box<Self>,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
         Box::pin(async move {
-            let addr = self.addr;
-            let private_key = self.private_key;
-            let certificate = self.certificate;
+            let tls_config = self.tls_config;
 
-            self.proxy.run_with_config(addr, private_key, certificate).await
+            self.proxy.run_with_listener(listener, tls_config, shutdown)
+                .await
         })
     }
 }
 
 struct ReverseProxyAdapter {
     proxy: ReverseProxy,
-    addr: std::net::SocketAddr,
-    private_key: Option<String>,
-    certificate: Option<String>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Proxy for ReverseProxyAdapter {
-    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+    fn run(
+        self: Box<Self>,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
         Box::pin(async move {
-            let addr = self.addr;
-            let private_key = self.private_key;
-            let certificate = self.certificate;
+            let tls_config = self.tls_config;
 
-            self.proxy.run_with_config(addr, private_key, certificate).await
+            self.proxy.run_with_listener(listener, tls_config, shutdown)
+                .await
         })
     }
 }
 
 struct StaticFileProxyAdapter {
     handler: StaticFileHandler,
-    addr: SocketAddr,
-    private_key: Option<String>,
-    certificate: Option<String>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     rate_limiter: Arc<RateLimiter>,
 }
 
@@ -348,36 +392,32 @@ impl StaticFileProxyAdapter {
 }
 
 impl Proxy for StaticFileProxyAdapter {
-    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+    fn run(
+        self: Box<Self>,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
         Box::pin(async move {
             let handler = Arc::new(self.handler);
-            let addr = self.addr;
-            let private_key = self.private_key;
-            let certificate = self.certificate;
+            let tls_config = self.tls_config;
             let rate_limiter = self.rate_limiter.clone();
 
-            match (private_key, certificate) {
-                (Some(private_key_path), Some(cert_path)) => {
+            match tls_config {
+                Some(tls_config) => {
                     // HTTPS mode
                     info!("Enabling HTTPS/TLS mode");
-                    debug!("Loading TLS certificate from: {}", cert_path);
-                    debug!("Loading TLS private key from: {}", private_key_path);
-
-                    let tls_config = TlsConfig::create_config(&private_key_path, &cert_path)?;
-                    let tls_config = Arc::new(tls_config);
                     let acceptor = TlsAcceptor::from(tls_config.clone());
 
-                    info!("Binding TCP listener to: {}", addr);
-                    let tcp_listener = tokio::net::TcpListener::bind(&addr).await
-                        .map_err(|e| ProxyError::Io(e))?;
-
-                    info!("HTTPS static file server listening on: https://{}", addr);
-                    debug!("TLS certificate file: {}", cert_path);
-                    debug!("TLS private key file: {}", private_key_path);
+                    info!(
+                        "HTTPS static file server listening on: https://{}",
+                        listener.local_addr().map_err(ProxyError::Io)?
+                    );
 
                     loop {
-                        let (tcp_stream, remote_addr) = tcp_listener.accept().await
-                            .map_err(|e| ProxyError::Io(e))?;
+                        let (tcp_stream, remote_addr) = tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            result = listener.accept() => result.map_err(ProxyError::Io)?,
+                        };
                         let acceptor = acceptor.clone();
                         let handler_ref = handler.clone();
                         let rate_limiter = rate_limiter.clone();
@@ -407,7 +447,9 @@ impl Proxy for StaticFileProxyAdapter {
                                                     client_ip, hit.rule_id
                                                 );
                                                 return Ok::<_, Infallible>(
-                                                    StaticFileProxyAdapter::rate_limited_response(&hit),
+                                                    StaticFileProxyAdapter::rate_limited_response(
+                                                        &hit,
+                                                    ),
                                                 );
                                             }
                                             match handler.handle_request(&req).await {
@@ -428,8 +470,10 @@ impl Proxy for StaticFileProxyAdapter {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Error establishing TLS connection from {}: {}",
-                                          remote_addr, e);
+                                    warn!(
+                                        "Error establishing TLS connection from {}: {}",
+                                        remote_addr, e
+                                    );
                                 }
                             }
                         });
@@ -438,14 +482,18 @@ impl Proxy for StaticFileProxyAdapter {
                 _ => {
                     // HTTP mode
                     info!("Running in HTTP mode (no TLS)");
-                    info!("Binding HTTP listener to: {}", addr);
-                    let listener = tokio::net::TcpListener::bind(addr).await
-                        .map_err(|e| ProxyError::Hyper(e.to_string()))?;
-                    info!("HTTP static file server listening on: http://{}", addr);
+                    info!(
+                        "HTTP static file server listening on: http://{}",
+                        listener
+                            .local_addr()
+                            .map_err(|e| ProxyError::Hyper(e.to_string()))?
+                    );
 
                     loop {
-                        let (stream, remote_addr) = listener.accept().await
-                            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+                        let (stream, remote_addr) = tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
+                        };
 
                         let handler = handler.clone();
                         let rate_limiter = rate_limiter.clone();
@@ -527,11 +575,7 @@ impl RouteEntry {
 struct CombinedProxyAdapter {
     reverse_proxy: ReverseProxy,
     static_handler: StaticFileHandler,
-    addr: std::net::SocketAddr,
-    #[allow(dead_code)]
-    private_key: Option<String>,
-    #[allow(dead_code)]
-    certificate: Option<String>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     rate_limiter: Arc<RateLimiter>,
     route_table: Vec<RouteEntry>,
 }
@@ -556,7 +600,9 @@ impl CombinedProxyAdapter {
                 RouteEntry::StaticMount { path, .. } => {
                     // Check if request path matches this static mount
                     if path == "/" || request_path.starts_with(path) {
-                        if let Some((_mount_info, _relative_path)) = static_handler.find_mount_for_path(&request_path) {
+                        if let Some((_mount_info, _relative_path)) =
+                            static_handler.find_mount_for_path(&request_path)
+                        {
                             match static_handler.handle_request(&req).await {
                                 Ok(response) => {
                                     // Static file found and served successfully
@@ -564,15 +610,22 @@ impl CombinedProxyAdapter {
                                 }
                                 Err(ProxyError::NotFound(_)) => {
                                     // Static file not found, continue to next route
-                                    debug!("Static file not found for path {}, continuing to next route", request_path);
+                                    debug!(
+                                        "Static file not found for path {}, continuing to next route",
+                                        request_path
+                                    );
                                     continue;
                                 }
                                 Err(_) => {
                                     // Other error, return 500
-                                    return Ok::<_, Infallible>(Response::builder()
-                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(FileBody::InMemory(Full::new(Bytes::from("Internal Server Error"))))
-                                        .unwrap());
+                                    return Ok::<_, Infallible>(
+                                        Response::builder()
+                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(FileBody::InMemory(Full::new(Bytes::from(
+                                                "Internal Server Error",
+                                            ))))
+                                            .unwrap(),
+                                    );
                                 }
                             }
                         }
@@ -580,7 +633,10 @@ impl CombinedProxyAdapter {
                 }
                 RouteEntry::ReverseProxy { .. } => {
                     // Try reverse proxy - this consumes req, so we must return here
-                    match reverse_proxy.handle_request_with_context(req, context).await {
+                    match reverse_proxy
+                        .handle_request_with_context(req, context)
+                        .await
+                    {
                         Ok(response) => {
                             // Convert BoxedBody to FileBody::Streaming
                             let (parts, body) = response.into_parts();
@@ -592,10 +648,12 @@ impl CombinedProxyAdapter {
                         Err(_) => {
                             // Reverse proxy failed, but we can't continue because req was consumed
                             // Return error response
-                            return Ok::<_, Infallible>(Response::builder()
-                                .status(StatusCode::BAD_GATEWAY)
-                                .body(FileBody::InMemory(Full::new(Bytes::from("Bad Gateway"))))
-                                .unwrap());
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .body(FileBody::InMemory(Full::new(Bytes::from("Bad Gateway"))))
+                                    .unwrap(),
+                            );
                         }
                     }
                 }
@@ -603,46 +661,44 @@ impl CombinedProxyAdapter {
         }
 
         // No route matched or all routes failed
-        Ok::<_, Infallible>(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(FileBody::InMemory(Full::new(Bytes::from("Not Found"))))
-            .unwrap())
+        Ok::<_, Infallible>(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(FileBody::InMemory(Full::new(Bytes::from("Not Found"))))
+                .unwrap(),
+        )
     }
 }
 
 impl Proxy for CombinedProxyAdapter {
-    fn run(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
+    fn run(
+        self: Box<Self>,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>> {
         Box::pin(async move {
-            let addr = self.addr;
-            let private_key = self.private_key;
-            let certificate = self.certificate;
+            let tls_config = self.tls_config;
             let reverse_proxy = Arc::new(self.reverse_proxy);
             let static_handler = Arc::new(self.static_handler);
             let rate_limiter = self.rate_limiter.clone();
             let route_table = Arc::new(self.route_table);
 
-            match (private_key, certificate) {
-                (Some(private_key_path), Some(cert_path)) => {
+            match tls_config {
+                Some(tls_config) => {
                     // HTTPS mode
                     info!("Enabling HTTPS/TLS mode for combined proxy");
-                    debug!("Loading TLS certificate from: {}", cert_path);
-                    debug!("Loading TLS private key from: {}", private_key_path);
-
-                    let tls_config = TlsConfig::create_config(&private_key_path, &cert_path)?;
-                    let tls_config = Arc::new(tls_config);
                     let acceptor = TlsAcceptor::from(tls_config.clone());
 
-                    info!("Binding TCP listener to: {}", addr);
-                    let tcp_listener = tokio::net::TcpListener::bind(&addr).await
-                        .map_err(|e| ProxyError::Io(e))?;
-
-                    info!("HTTPS combined proxy server listening on: https://{}", addr);
-                    debug!("TLS certificate file: {}", cert_path);
-                    debug!("TLS private key file: {}", private_key_path);
+                    info!(
+                        "HTTPS combined proxy server listening on: https://{}",
+                        listener.local_addr().map_err(ProxyError::Io)?
+                    );
 
                     loop {
-                        let (tcp_stream, remote_addr) = tcp_listener.accept().await
-                            .map_err(|e| ProxyError::Io(e))?;
+                        let (tcp_stream, remote_addr) = tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            result = listener.accept() => result.map_err(ProxyError::Io)?,
+                        };
                         let acceptor = acceptor.clone();
                         let reverse_proxy_ref = reverse_proxy.clone();
                         let static_handler_ref = static_handler.clone();
@@ -676,7 +732,11 @@ impl Proxy for CombinedProxyAdapter {
                                                     "Combined HTTPS rate limit hit for {} via rule {}",
                                                     client_ip, hit.rule_id
                                                 );
-                                                return Ok::<_, Infallible>(StaticFileProxyAdapter::rate_limited_response(&hit));
+                                                return Ok::<_, Infallible>(
+                                                    StaticFileProxyAdapter::rate_limited_response(
+                                                        &hit,
+                                                    ),
+                                                );
                                             }
 
                                             // Route request using unified route table
@@ -686,7 +746,8 @@ impl Proxy for CombinedProxyAdapter {
                                                 &route_table,
                                                 req,
                                                 remote_addr,
-                                            ).await
+                                            )
+                                            .await
                                         }
                                     });
 
@@ -700,8 +761,10 @@ impl Proxy for CombinedProxyAdapter {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Error establishing TLS connection from {}: {}",
-                                          remote_addr, e);
+                                    warn!(
+                                        "Error establishing TLS connection from {}: {}",
+                                        remote_addr, e
+                                    );
                                 }
                             }
                         });
@@ -710,14 +773,18 @@ impl Proxy for CombinedProxyAdapter {
                 _ => {
                     // HTTP mode
                     info!("Running in HTTP mode for combined proxy");
-                    info!("Binding HTTP listener to: {}", addr);
-                    let listener = tokio::net::TcpListener::bind(addr).await
-                        .map_err(|e| ProxyError::Hyper(e.to_string()))?;
-                    info!("HTTP combined proxy server listening on: http://{}", addr);
+                    info!(
+                        "HTTP combined proxy server listening on: http://{}",
+                        listener
+                            .local_addr()
+                            .map_err(|e| ProxyError::Hyper(e.to_string()))?
+                    );
 
                     loop {
-                        let (stream, remote_addr) = listener.accept().await
-                            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+                        let (stream, remote_addr) = tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
+                        };
 
                         let reverse_proxy = reverse_proxy.clone();
                         let static_handler = static_handler.clone();
@@ -880,7 +947,8 @@ impl IsolatedProxyAdapter {
         certificate: Option<String>,
         worker: Arc<IsolatedWorker>,
     ) -> Result<Self, ProxyError> {
-        let addr = addr.parse()
+        let addr = addr
+            .parse()
             .map_err(|e| ProxyError::Config(format!("Invalid bind address: {}", e)))?;
 
         let error_recovery = Arc::new(ErrorRecoveryManager::default());
@@ -907,7 +975,10 @@ impl IsolatedProxyAdapter {
 
         // Handle error through recovery manager
         if let Err(recovery_error) = self.error_recovery.handle_error(contextual_error).await {
-            error!("Recovery failed for operation {}: {}", operation, recovery_error);
+            error!(
+                "Recovery failed for operation {}: {}",
+                operation, recovery_error
+            );
             return false;
         }
 
@@ -932,19 +1003,30 @@ impl IsolatedProxyAdapter {
                 Ok(result) => {
                     // Success - update worker health
                     let worker_id = format!("{:?}", self.worker.proxy_type);
-                    self.error_recovery.update_worker_health(&worker_id, true).await;
+                    self.error_recovery
+                        .update_worker_health(&worker_id, true)
+                        .await;
                     return Some(result);
                 }
                 Err(error) => {
-                    warn!("Error in operation {} (attempt {}): {}", operation, attempts, error);
+                    warn!(
+                        "Error in operation {} (attempt {}): {}",
+                        operation, attempts, error
+                    );
 
                     if !self.handle_error_with_recovery(error, operation).await {
-                        error!("Error recovery failed, not retrying operation: {}", operation);
+                        error!(
+                            "Error recovery failed, not retrying operation: {}",
+                            operation
+                        );
                         return None;
                     }
 
                     if attempts >= max_attempts {
-                        error!("Max retry attempts ({}) reached for operation: {}", max_attempts, operation);
+                        error!(
+                            "Max retry attempts ({}) reached for operation: {}",
+                            max_attempts, operation
+                        );
                         return None;
                     }
 
@@ -969,9 +1051,10 @@ impl IsolatedProxyAdapter {
     /// Run the server with worker resource management and error recovery
     pub async fn run(&self) -> Result<(), ProxyError> {
         info!("Starting {} server on {}", self.get_proxy_type(), self.addr);
-        info!("Worker configuration - max_connections: {}, max_memory: {}MB",
-               self.worker.resource_limits.max_connections,
-               self.worker.resource_limits.max_memory_mb);
+        info!(
+            "Worker configuration - max_connections: {}, max_memory: {}MB",
+            self.worker.resource_limits.max_connections, self.worker.resource_limits.max_memory_mb
+        );
 
         // Register worker with error recovery manager
         self.error_recovery.register_worker(&self.worker).await;
@@ -989,17 +1072,18 @@ impl IsolatedProxyAdapter {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                error_recovery_clone.update_worker_health(&worker_id, true).await;
+                error_recovery_clone
+                    .update_worker_health(&worker_id, true)
+                    .await;
             }
         });
 
         match (private_key, certificate) {
             (Some(private_key_path), Some(cert_path)) => {
-                self.run_https_server(worker, handler, addr, &private_key_path, &cert_path).await
+                self.run_https_server(worker, handler, addr, &private_key_path, &cert_path)
+                    .await
             }
-            _ => {
-                self.run_http_server(worker, handler, addr).await
-            }
+            _ => self.run_http_server(worker, handler, addr).await,
         }
     }
 
@@ -1010,25 +1094,42 @@ impl IsolatedProxyAdapter {
         addr: SocketAddr,
         private_key_path: &str,
         cert_path: &str,
-    ) -> Result<(), ProxyError>
-    {
+    ) -> Result<(), ProxyError> {
         info!("Enabling HTTPS/TLS mode for {}", worker.get_proxy_type());
 
         // Create TLS config with error recovery
-        let tls_config = self.execute_with_recovery("tls_config_creation", || async {
-            TlsConfig::create_config(private_key_path, cert_path)
-                .map(|config| Arc::new(config))
-        }).await.ok_or_else(|| ProxyError::WorkerCreationFailed("TLS config creation failed after retries".to_string()))?;
+        let tls_config = self
+            .execute_with_recovery("tls_config_creation", || async {
+                TlsConfig::create_config(private_key_path, cert_path).map(|config| Arc::new(config))
+            })
+            .await
+            .ok_or_else(|| {
+                ProxyError::WorkerCreationFailed(
+                    "TLS config creation failed after retries".to_string(),
+                )
+            })?;
 
         let acceptor = TlsAcceptor::from(tls_config.clone());
 
         // Bind TCP listener with error recovery
-        let tcp_listener = self.execute_with_recovery("tcp_listener_bind", || async {
-            tokio::net::TcpListener::bind(&addr).await
-                .map_err(|e| ProxyError::Io(e))
-        }).await.ok_or_else(|| ProxyError::WorkerCreationFailed("TCP listener bind failed after retries".to_string()))?;
+        let tcp_listener = self
+            .execute_with_recovery("tcp_listener_bind", || async {
+                tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .map_err(|e| ProxyError::Io(e))
+            })
+            .await
+            .ok_or_else(|| {
+                ProxyError::WorkerCreationFailed(
+                    "TCP listener bind failed after retries".to_string(),
+                )
+            })?;
 
-        info!("{} HTTPS server listening on: https://{}", worker.get_proxy_type(), addr);
+        info!(
+            "{} HTTPS server listening on: https://{}",
+            worker.get_proxy_type(),
+            addr
+        );
 
         loop {
             if !worker.can_accept_connection() {
@@ -1036,8 +1137,8 @@ impl IsolatedProxyAdapter {
                 continue;
             }
 
-            let (tcp_stream, remote_addr) = tcp_listener.accept().await
-                .map_err(|e| ProxyError::Io(e))?;
+            let (tcp_stream, remote_addr) =
+                tcp_listener.accept().await.map_err(|e| ProxyError::Io(e))?;
 
             let worker_ref = worker.clone();
             let acceptor_ref = acceptor.clone();
@@ -1049,15 +1150,25 @@ impl IsolatedProxyAdapter {
 
                 worker_ref.increment_connections();
 
-                let request_timer = crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
+                let request_timer =
+                    crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
 
                 match acceptor_ref.accept(tcp_stream).await {
                     Ok(_tls_stream) => {
-                        debug!("TLS connection established from {} to {}", remote_addr, worker_ref.get_proxy_type());
+                        debug!(
+                            "TLS connection established from {} to {}",
+                            remote_addr,
+                            worker_ref.get_proxy_type()
+                        );
                         request_timer.finish();
                     }
                     Err(e) => {
-                        error!("TLS handshake failed from {} to {}: {}", remote_addr, worker_ref.get_proxy_type(), e);
+                        error!(
+                            "TLS handshake failed from {} to {}: {}",
+                            remote_addr,
+                            worker_ref.get_proxy_type(),
+                            e
+                        );
                         worker_ref.metrics.increment_connection_errors();
                     }
                 }
@@ -1072,13 +1183,17 @@ impl IsolatedProxyAdapter {
         worker: Arc<IsolatedWorker>,
         _handler: Arc<dyn Proxy + Send + Sync>,
         addr: SocketAddr,
-    ) -> Result<(), ProxyError>
-    {
+    ) -> Result<(), ProxyError> {
         info!("Binding TCP listener to: {}", addr);
-        let tcp_listener = tokio::net::TcpListener::bind(&addr).await
+        let tcp_listener = tokio::net::TcpListener::bind(&addr)
+            .await
             .map_err(|e| ProxyError::Io(e))?;
 
-        info!("{} HTTP server listening on: http://{}", worker.get_proxy_type(), addr);
+        info!(
+            "{} HTTP server listening on: http://{}",
+            worker.get_proxy_type(),
+            addr
+        );
 
         loop {
             if !worker.can_accept_connection() {
@@ -1086,8 +1201,8 @@ impl IsolatedProxyAdapter {
                 continue;
             }
 
-            let (tcp_stream, remote_addr) = tcp_listener.accept().await
-                .map_err(|e| ProxyError::Io(e))?;
+            let (tcp_stream, remote_addr) =
+                tcp_listener.accept().await.map_err(|e| ProxyError::Io(e))?;
 
             let worker_ref = worker.clone();
 
@@ -1098,12 +1213,17 @@ impl IsolatedProxyAdapter {
 
                 worker_ref.increment_connections();
 
-                let request_timer = crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
+                let request_timer =
+                    crate::common::RequestTimer::with_metrics(worker_ref.metrics.clone());
 
                 // For now, we just accept the connection and close it
                 // In a real implementation, this would handle HTTP requests
                 drop(tcp_stream);
-                debug!("HTTP connection established from {} to {}", remote_addr, worker_ref.get_proxy_type());
+                debug!(
+                    "HTTP connection established from {} to {}",
+                    remote_addr,
+                    worker_ref.get_proxy_type()
+                );
                 request_timer.finish();
 
                 worker_ref.decrement_connections();

@@ -1,15 +1,17 @@
-use clap::Parser;
-use log::{info, error};
 use bifrost_bridge::{
     config::{Config, ProxyMode},
     logging,
     proxy::ProxyFactory,
-    secrets::{config_has_encrypted_values, SecretManager},
+    secrets::{SecretManager, config_has_encrypted_values},
 };
-use std::path::Path;
-use tokio::signal;
-use tokio::sync::oneshot;
+use clap::Parser;
+use log::{error, info, warn};
 use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 const ENCRYPT_STDIN_PLACEHOLDER: &str = "__BIFROST_STDIN__";
 
@@ -20,17 +22,45 @@ const ENCRYPT_STDIN_PLACEHOLDER: &str = "__BIFROST_STDIN__";
     about = "A Rust proxy server that can function as both forward and reverse proxy"
 )]
 struct Args {
-    #[clap(short, long, value_name = "MODE", help = "Proxy mode: forward or reverse")]
+    #[clap(
+        short,
+        long,
+        value_name = "MODE",
+        help = "Proxy mode: forward or reverse"
+    )]
     mode: Option<String>,
 
-    #[clap(short, long, value_name = "ADDR", help = "Listen address (e.g., 127.0.0.1:8080)")]
+    #[clap(
+        short,
+        long,
+        value_name = "ADDR",
+        help = "Listen address (e.g., 127.0.0.1:8080)"
+    )]
     listen: Option<String>,
 
-    #[clap(short, long, value_name = "URL", help = "Target URL for reverse proxy (e.g., http://backend:3000)")]
+    #[clap(
+        short,
+        long,
+        value_name = "URL",
+        help = "Target URL for reverse proxy (e.g., http://backend:3000)"
+    )]
     target: Option<String>,
 
     #[clap(short, long, value_name = "FILE", help = "Configuration file path")]
     config: Option<String>,
+
+    #[clap(
+        long,
+        help = "Reload the running server configuration and TLS material"
+    )]
+    reload: bool,
+
+    #[clap(
+        long,
+        value_name = "FILE",
+        help = "PID file used by the server and --reload (default: bifrost-bridge.pid)"
+    )]
+    pid_file: Option<PathBuf>,
 
     #[clap(long, value_name = "SECONDS", help = "Connection timeout in seconds")]
     connect_timeout: Option<u64>,
@@ -38,31 +68,63 @@ struct Args {
     #[clap(long, value_name = "SECONDS", help = "Idle timeout in seconds")]
     idle_timeout: Option<u64>,
 
-    #[clap(long, value_name = "SECONDS", help = "Maximum connection lifetime in seconds")]
+    #[clap(
+        long,
+        value_name = "SECONDS",
+        help = "Maximum connection lifetime in seconds"
+    )]
     max_connection_lifetime: Option<u64>,
 
-    #[clap(long, value_name = "SECONDS", help = "Request timeout in seconds (deprecated, use specific timeout options)")]
+    #[clap(
+        long,
+        value_name = "SECONDS",
+        help = "Request timeout in seconds (deprecated, use specific timeout options)"
+    )]
     timeout: Option<u64>,
 
-    #[clap(long, value_name = "FILE", help = "Generate a sample configuration file")]
+    #[clap(
+        long,
+        value_name = "FILE",
+        help = "Generate a sample configuration file"
+    )]
     generate_config: Option<String>,
 
-    #[clap(long, value_name = "DIR", help = "Serve static files from this directory")]
+    #[clap(
+        long,
+        value_name = "DIR",
+        help = "Serve static files from this directory"
+    )]
     static_dir: Option<String>,
 
-    #[clap(long, value_name = "PATH:DIR", help = "Mount static files from PATH to DIR (can be used multiple times)")]
+    #[clap(
+        long,
+        value_name = "PATH:DIR",
+        help = "Mount static files from PATH to DIR (can be used multiple times)"
+    )]
     mount: Vec<String>,
 
     #[clap(long, help = "Enable SPA mode")]
     spa: bool,
 
-    #[clap(long, value_name = "FILE", help = "SPA fallback file name (default: index.html)")]
+    #[clap(
+        long,
+        value_name = "FILE",
+        help = "SPA fallback file name (default: index.html)"
+    )]
     spa_fallback: Option<String>,
 
-    #[clap(long, value_name = "NUM", help = "Number of worker threads for reverse proxy and static file serving (shared)")]
+    #[clap(
+        long,
+        value_name = "NUM",
+        help = "Number of worker threads for reverse proxy and static file serving (shared)"
+    )]
     worker_threads: Option<usize>,
 
-    #[clap(long, value_name = "EXT:MIME", help = "Custom MIME type mapping (e.g., mjs:application/javascript), can be used multiple times")]
+    #[clap(
+        long,
+        value_name = "EXT:MIME",
+        help = "Custom MIME type mapping (e.g., mjs:application/javascript), can be used multiple times"
+    )]
     mime_type: Vec<String>,
 
     #[clap(long, value_name = "FILE", help = "Private key file path for HTTPS")]
@@ -74,22 +136,42 @@ struct Args {
     #[clap(long, help = "Disable connection pooling (no-pool mode)")]
     no_connection_pool: bool,
 
-    #[clap(long, value_name = "NUM", help = "Maximum idle connections per host for connection pooling")]
+    #[clap(
+        long,
+        value_name = "NUM",
+        help = "Maximum idle connections per host for connection pooling"
+    )]
     pool_max_idle: Option<usize>,
 
     #[clap(long, value_name = "BYTES", help = "Maximum HTTP header size in bytes")]
     max_header_size: Option<usize>,
 
-    #[clap(long, value_name = "USERNAME", help = "Username for proxy authentication (Basic Auth)")]
+    #[clap(
+        long,
+        value_name = "USERNAME",
+        help = "Username for proxy authentication (Basic Auth)"
+    )]
     proxy_username: Option<String>,
 
-    #[clap(long, value_name = "PASSWORD", help = "Password for proxy authentication (Basic Auth)")]
+    #[clap(
+        long,
+        value_name = "PASSWORD",
+        help = "Password for proxy authentication (Basic Auth)"
+    )]
     proxy_password: Option<String>,
 
-    #[clap(long, value_name = "LEVEL", help = "Set logging level (trace, debug, info, warn, error)")]
+    #[clap(
+        long,
+        value_name = "LEVEL",
+        help = "Set logging level (trace, debug, info, warn, error)"
+    )]
     log_level: Option<String>,
 
-    #[clap(long, value_name = "FORMAT", help = "Set log output format (text, json)")]
+    #[clap(
+        long,
+        value_name = "FORMAT",
+        help = "Set log output format (text, json)"
+    )]
     log_format: Option<String>,
 
     #[clap(long, help = "Initialize the ~/.bifrost encryption key and exit")]
@@ -105,12 +187,21 @@ struct Args {
     encrypt: Option<String>,
 }
 
-fn init_logging_from_config(config: &Config, args: Option<&Args>) -> Result<(), Box<dyn std::error::Error>> {
+fn init_logging_from_config(
+    config: &Config,
+    args: Option<&Args>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(logging_config) = &config.logging {
         // Use advanced logging configuration from file
         logging::CustomLogger::init(logging_config.clone())?;
-        info!("Initialized advanced logging system with {} targets",
-              logging_config.targets.as_ref().map(|t| t.len()).unwrap_or(0));
+        info!(
+            "Initialized advanced logging system with {} targets",
+            logging_config
+                .targets
+                .as_ref()
+                .map(|t| t.len())
+                .unwrap_or(0)
+        );
     } else {
         // Fallback to CLI arguments or defaults
         let args = args.expect("Args required when no logging config provided");
@@ -126,14 +217,26 @@ fn init_logging_from_args(args: &Args) -> Result<(), Box<dyn std::error::Error>>
     // Use simple env_logger with CLI arguments
     logging::init_fallback(log_level, log_format)?;
 
-    info!("Initialized logging system - level: {}, format: {}",
-          log_level.unwrap_or("info"), log_format.unwrap_or("text"));
+    info!(
+        "Initialized logging system - level: {}, format: {}",
+        log_level.unwrap_or("info"),
+        log_format.unwrap_or("text")
+    );
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse args first to get logging configuration
     let args = Args::parse();
+    let pid_file = args
+        .pid_file
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("bifrost-bridge.pid"));
+
+    // --reload is an operator command, not a second server instance. It only
+    // needs the PID file and therefore must run before config/logging setup.
+    if args.reload {
+        return request_reload(&pid_file);
+    }
 
     // Initialize logging based on configuration
     if let Some(config_file) = &args.config {
@@ -194,15 +297,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validate configuration
     validate_config(&config)?;
+    validate_tls_pair(&config)?;
+
+    let pid_guard = PidFileGuard::acquire(&pid_file)?;
 
     // Create tokio runtime with custom thread pool if configured
     // Priority: static_files.worker_threads > top-level worker_threads > default
-    let worker_threads = config.static_files.as_ref()
+    let worker_threads = config
+        .static_files
+        .as_ref()
         .and_then(|sf| sf.worker_threads)
         .or(config.worker_threads);
 
     let runtime = if let Some(worker_threads) = worker_threads {
-        info!("Starting tokio runtime with {} worker threads (shared for reverse proxy and static files)", worker_threads);
+        info!(
+            "Starting tokio runtime with {} worker threads (shared for reverse proxy and static files)",
+            worker_threads
+        );
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .enable_all()
@@ -213,42 +324,265 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Run the async main function in the configured runtime
-    runtime.block_on(async_main(config))
+    let result = runtime.block_on(async_main(config, args.config.clone()));
+    drop(pid_guard);
+    result
 }
 
-async fn async_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    // Create and run proxy with graceful shutdown
+async fn async_main(
+    config: Config,
+    config_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting proxy server...");
+    let mut signal_waiters = SignalWaiters::new()?;
 
-    let proxy = ProxyFactory::create_proxy(config)?;
+    // The supervisor owns this socket for the entire process lifetime. Worker
+    // generations only borrow it, so a reload never has to re-bind the port.
+    let listener = Arc::new(TcpListener::bind(config.listen_addr).await?);
+    let mut active_config = config.clone();
+    let mut worker_shutdown = CancellationToken::new();
+    let mut worker_handle = spawn_worker(
+        ProxyFactory::create_proxy(config)?,
+        listener.clone(),
+        worker_shutdown.clone(),
+    );
+    let SignalWaiters { reload, terminate } = &mut signal_waiters;
 
-    // Create a shutdown signal
-    let (_shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                info!("\n🛑 Received Ctrl+C, shutting down gracefully...");
+                worker_shutdown.cancel();
+                let _ = worker_handle.await;
+                break;
+            }
+            _ = terminate.recv() => {
+                info!("🛑 Received SIGTERM, shutting down gracefully...");
+                worker_shutdown.cancel();
+                let _ = worker_handle.await;
+                break;
+            }
+            _ = reload.recv() => {
+                let Some(config_path) = config_path.as_deref() else {
+                    warn!("Ignoring reload request: --reload requires a server started with --config");
+                    continue;
+                };
 
-    // Spawn the server in a task
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
-            error!("Server error: {}", e);
-        }
-    });
+                match load_runtime_config(config_path) {
+                    Ok(new_config) => {
+                        if new_config.listen_addr != active_config.listen_addr {
+                            warn!(
+                                "Ignoring reload: listen_addr cannot change while the supervisor owns the active listener ({} -> {})",
+                                active_config.listen_addr,
+                                new_config.listen_addr
+                            );
+                            continue;
+                        }
 
-    // Wait for Ctrl+C signal
-    tokio::select! {
-        _ = signal::ctrl_c() => {
-            info!("\n🛑 Received Ctrl+C, shutting down gracefully...");
-        }
-        _ = &mut shutdown_rx => {
-            info!("🛑 Shutdown signal received, shutting down gracefully...");
-        }
-        result = server_handle => {
-            if let Err(e) = result {
-                error!("Server task error: {}", e);
+                        if effective_worker_threads(&new_config) != effective_worker_threads(&active_config) {
+                            warn!("Ignoring reload: worker thread count is fixed for the lifetime of the Tokio runtime; restart to change it");
+                            continue;
+                        }
+
+                        let new_proxy = match ProxyFactory::create_proxy(new_config.clone()) {
+                            Ok(proxy) => proxy,
+                            Err(err) => {
+                                error!("Rejected configuration reload: {}", err);
+                                continue;
+                            }
+                        };
+
+                        info!("Reloading configuration without closing the listening socket");
+                        worker_shutdown.cancel();
+                        if let Err(err) = worker_handle.await {
+                            error!("Previous worker generation failed during reload: {}", err);
+                        }
+
+                        active_config = new_config;
+                        worker_shutdown = CancellationToken::new();
+                        worker_handle = spawn_worker(
+                            new_proxy,
+                            listener.clone(),
+                            worker_shutdown.clone(),
+                        );
+                        info!("Configuration reload complete; new connections use the new generation");
+                    }
+                    Err(err) => error!("Rejected configuration reload: {}", err),
+                }
+            }
+            result = &mut worker_handle => {
+                match result {
+                    Ok(Ok(())) => info!("Proxy worker stopped"),
+                    Ok(Err(err)) => error!("Server error: {}", err),
+                    Err(err) => error!("Server task error: {}", err),
+                }
+                break;
             }
         }
     }
 
     info!("👋 Proxy server stopped. Goodbye!");
     Ok(())
+}
+
+fn spawn_worker(
+    proxy: Box<dyn bifrost_bridge::proxy::Proxy + Send>,
+    listener: Arc<TcpListener>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<Result<(), bifrost_bridge::ProxyError>> {
+    tokio::spawn(async move { proxy.run(listener, shutdown).await })
+}
+
+fn load_runtime_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut config = Config::from_file(path)?;
+    if config_has_encrypted_values(&config) {
+        let manager = SecretManager::new()?;
+        manager.apply_to_config(&mut config)?;
+    }
+    validate_config(&config)?;
+    validate_tls_pair(&config)?;
+    Ok(config)
+}
+
+fn effective_worker_threads(config: &Config) -> Option<usize> {
+    config
+        .static_files
+        .as_ref()
+        .and_then(|static_files| static_files.worker_threads)
+        .or(config.worker_threads)
+}
+
+fn validate_tls_pair(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    match (&config.private_key, &config.certificate) {
+        (Some(_), Some(_)) => {}
+        (None, None) => {}
+        _ => return Err("Both private_key and certificate must be configured together".into()),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn request_reload(pid_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let pid: libc::pid_t = std::fs::read_to_string(pid_file)
+        .map_err(|err| format!("Cannot read PID file {}: {}", pid_file.display(), err))?
+        .trim()
+        .parse()
+        .map_err(|err| format!("Invalid PID file {}: {}", pid_file.display(), err))?;
+    if pid <= 1 {
+        return Err(format!("Refusing to signal unsafe PID {} from {}", pid, pid_file.display()).into());
+    }
+
+    let result = unsafe { libc::kill(pid, libc::SIGHUP) };
+    if result != 0 {
+        return Err(format!(
+            "Cannot send reload signal to PID {}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+
+    println!("Reload signal sent to bifrost-bridge PID {}", pid);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn request_reload(_pid_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--reload is currently supported on Unix platforms only".into())
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl PidFileGuard {
+    fn acquire(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let pid = std::process::id();
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            if let Ok(existing_pid) = existing.trim().parse::<i32>() {
+                #[cfg(unix)]
+                {
+                    let alive = existing_pid > 1
+                        && (unsafe { libc::kill(existing_pid, 0) == 0 }
+                            || std::io::Error::last_os_error().raw_os_error()
+                                == Some(libc::EPERM));
+                    if alive {
+                        return Err(format!(
+                            "Another bifrost-bridge process is using {}",
+                            path.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        std::fs::write(path, pid.to_string())?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            pid,
+        })
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            == Some(self.pid)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct SignalWaiters {
+    reload: SignalStream,
+    terminate: SignalStream,
+}
+
+enum SignalStream {
+    #[cfg(unix)]
+    Unix(signal::unix::Signal),
+    #[cfg(not(unix))]
+    Disabled,
+}
+
+impl SignalStream {
+    async fn recv(&mut self) {
+        match self {
+            #[cfg(unix)]
+            SignalStream::Unix(signal) => {
+                let _ = signal.recv().await;
+            }
+            #[cfg(not(unix))]
+            SignalStream::Disabled => std::future::pending::<()>().await,
+        }
+    }
+}
+
+impl SignalWaiters {
+    fn new() -> Result<Self, std::io::Error> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                reload: SignalStream::Unix(signal::unix::signal(
+                    signal::unix::SignalKind::hangup(),
+                )?),
+                terminate: SignalStream::Unix(signal::unix::signal(
+                    signal::unix::SignalKind::terminate(),
+                )?),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                reload: SignalStream::Disabled,
+                terminate: SignalStream::Disabled,
+            })
+        }
+    }
 }
 
 fn read_secret_from_stdin() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -366,7 +700,8 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
     if args.static_dir.is_some() || !args.mount.is_empty() {
         let mut static_config = if let Some(static_dir) = &args.static_dir {
             // Single directory mode (backward compatibility)
-            let mut config = bifrost_bridge::config::StaticFileConfig::single(static_dir.clone(), args.spa);
+            let mut config =
+                bifrost_bridge::config::StaticFileConfig::single(static_dir.clone(), args.spa);
             config.worker_threads = args.worker_threads;
             config.custom_mime_types = std::collections::HashMap::new();
             config
@@ -377,7 +712,10 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
                 enable_directory_listing: false,
                 index_files: vec!["index.html".to_string(), "index.htm".to_string()],
                 spa_mode: args.spa,
-                spa_fallback_file: args.spa_fallback.clone().unwrap_or_else(|| "index.html".to_string()),
+                spa_fallback_file: args
+                    .spa_fallback
+                    .clone()
+                    .unwrap_or_else(|| "index.html".to_string()),
                 worker_threads: args.worker_threads,
                 custom_mime_types: std::collections::HashMap::new(),
                 no_cache_files: vec![],
@@ -389,7 +727,11 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         for mount_spec in &args.mount {
             let parts: Vec<&str> = mount_spec.splitn(2, ':').collect();
             if parts.len() != 2 {
-                return Err(format!("Invalid mount specification: '{}'. Use format 'PATH:DIR'", mount_spec).into());
+                return Err(format!(
+                    "Invalid mount specification: '{}'. Use format 'PATH:DIR'",
+                    mount_spec
+                )
+                .into());
             }
 
             let path = parts[0].trim();
@@ -409,7 +751,11 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         for mime_spec in &args.mime_type {
             let parts: Vec<&str> = mime_spec.splitn(2, ':').collect();
             if parts.len() != 2 {
-                return Err(format!("Invalid MIME type specification: '{}'. Use format 'EXT:MIME'", mime_spec).into());
+                return Err(format!(
+                    "Invalid MIME type specification: '{}'. Use format 'EXT:MIME'",
+                    mime_spec
+                )
+                .into());
             }
 
             let extension = parts[0].trim();
@@ -455,7 +801,10 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         if worker_threads > 512 {
             return Err("worker_threads cannot exceed 512".into());
         }
-        info!("Configuration validated: shared worker_threads = {}", worker_threads);
+        info!(
+            "Configuration validated: shared worker_threads = {}",
+            worker_threads
+        );
     }
 
     // Check static_files specific worker_threads (backward compatibility)
@@ -467,7 +816,10 @@ fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             if worker_threads > 512 {
                 return Err("worker_threads cannot exceed 512".into());
             }
-            info!("Configuration validated: static_files worker_threads = {} (takes priority over shared worker_threads)", worker_threads);
+            info!(
+                "Configuration validated: static_files worker_threads = {} (takes priority over shared worker_threads)",
+                worker_threads
+            );
         }
     }
 
@@ -509,5 +861,45 @@ mod config_validation_tests {
         };
 
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn tls_key_and_certificate_must_be_configured_as_a_pair() {
+        let config = Config {
+            private_key: Some("key.pem".to_string()),
+            ..Default::default()
+        };
+
+        assert!(validate_tls_pair(&config).is_err());
+    }
+
+    #[test]
+    fn static_worker_threads_override_top_level_value() {
+        let config = Config {
+            worker_threads: Some(4),
+            static_files: Some(bifrost_bridge::config::StaticFileConfig {
+                worker_threads: Some(8),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(effective_worker_threads(&config), Some(8));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_file_guard_removes_its_pid_file_on_drop() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        drop(file);
+
+        let guard = PidFileGuard::acquire(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+        drop(guard);
+        assert!(!path.exists());
     }
 }

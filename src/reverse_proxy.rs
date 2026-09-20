@@ -10,33 +10,35 @@ use crate::config::{
 use crate::error::ProxyError;
 use crate::rate_limit::RateLimiter;
 use chrono::{DateTime, FixedOffset, Utc};
-use http_body_util::{BodyExt, Empty, Full};
 use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body as _, Bytes, Incoming};
-use hyper::header::{HeaderName, HOST, ORIGIN};
+use hyper::header::{HOST, HeaderName, ORIGIN};
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use ipnet::IpNet;
 use log::{debug, error, info, warn};
 use rand::Rng;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::copy_bidirectional;
+use tokio::net::TcpListener;
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
-use url::form_urlencoded;
+use tokio_util::sync::CancellationToken;
 use url::Url;
+use url::form_urlencoded;
 
 // Custom header names for X-Forwarded-* headers
 static X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -263,7 +265,11 @@ impl RouteMatcher {
                 // forwarding client can handle them; wss:// implies TLS.
                 let url = match url.scheme() {
                     "ws" | "wss" => {
-                        let normalized = if url.scheme() == "wss" { "https" } else { "http" };
+                        let normalized = if url.scheme() == "wss" {
+                            "https"
+                        } else {
+                            "http"
+                        };
                         let mut url = url;
                         url.set_scheme(normalized).map_err(|_| {
                             ProxyError::Config(format!(
@@ -335,7 +341,12 @@ impl RouteMatcher {
             if let Some(sticky) = cfg.sticky.as_ref() {
                 match sticky.mode {
                     StickyMode::Cookie => {
-                        if sticky.cookie_name.as_ref().map(|n| n.is_empty()).unwrap_or(true) {
+                        if sticky
+                            .cookie_name
+                            .as_ref()
+                            .map(|n| n.is_empty())
+                            .unwrap_or(true)
+                        {
                             return Err(ProxyError::Config(format!(
                                 "Route {} sticky cookie mode requires cookie_name",
                                 cfg.id
@@ -400,11 +411,7 @@ impl RouteMatcher {
                 None
             };
 
-            let load_balancing = cfg
-                .load_balancing
-                .clone()
-                .unwrap_or_default()
-                .policy;
+            let load_balancing = cfg.load_balancing.clone().unwrap_or_default().policy;
 
             routes.push(CompiledRoute {
                 id: cfg.id,
@@ -456,7 +463,13 @@ impl RouteMatcher {
 
     fn routes_with_health_checks(
         &self,
-    ) -> Vec<(String, Url, Arc<Client<BackendConnector, BoxedBody>>, HealthCheckConfig, Arc<AtomicBool>)> {
+    ) -> Vec<(
+        String,
+        Url,
+        Arc<Client<BackendConnector, BoxedBody>>,
+        HealthCheckConfig,
+        Arc<AtomicBool>,
+    )> {
         let mut entries = Vec::new();
         for route in &self.routes {
             if let Some(cfg) = route.health_check_config.clone() {
@@ -476,7 +489,11 @@ impl RouteMatcher {
         entries
     }
 
-    fn select_route<'a, B>(&'a self, req: &Request<B>, context: &RequestContext) -> Option<&'a CompiledRoute> {
+    fn select_route<'a, B>(
+        &'a self,
+        req: &Request<B>,
+        context: &RequestContext,
+    ) -> Option<&'a CompiledRoute> {
         let mut matches: Vec<(&CompiledRoute, i32)> = Vec::new();
         for route in &self.routes {
             if route.matches(req, context) {
@@ -561,9 +578,7 @@ impl CompiledRoute {
         let eligible_targets: Vec<&CompiledTarget> = self
             .targets
             .iter()
-            .filter(|t| {
-                t.enabled && t.healthy.load(Ordering::Relaxed) && !excluded.contains(&t.id)
-            })
+            .filter(|t| t.enabled && t.healthy.load(Ordering::Relaxed) && !excluded.contains(&t.id))
             .collect();
 
         if eligible_targets.is_empty() {
@@ -614,10 +629,8 @@ impl CompiledRoute {
                 StickyMode::Cookie => {
                     let cookie_name = sticky.cookie_name.as_ref().unwrap();
                     if let Some(value) = extract_cookie_value(req.headers(), cookie_name) {
-                        if let Some(target) = eligible_targets
-                            .iter()
-                            .find(|t| t.id == value)
-                            .copied()
+                        if let Some(target) =
+                            eligible_targets.iter().find(|t| t.id == value).copied()
                         {
                             return Ok(TargetSelection {
                                 target,
@@ -658,10 +671,7 @@ impl CompiledRoute {
         }
 
         let target = self.select_by_policy(&eligible_targets).ok_or_else(|| {
-            ProxyError::Connection(format!(
-                "No available targets for route {}",
-                self.id
-            ))
+            ProxyError::Connection(format!("No available targets for route {}", self.id))
         })?;
 
         let set_cookie = match &self.sticky {
@@ -679,15 +689,18 @@ impl CompiledRoute {
         Ok(TargetSelection { target, set_cookie })
     }
 
-    fn select_by_policy<'a>(&'a self, targets: &[&'a CompiledTarget]) -> Option<&'a CompiledTarget> {
+    fn select_by_policy<'a>(
+        &'a self,
+        targets: &[&'a CompiledTarget],
+    ) -> Option<&'a CompiledTarget> {
         if targets.is_empty() {
             return None;
         }
 
         match self.load_balancing {
             LoadBalancingPolicy::RoundRobin => {
-                let idx = (self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize)
-                    % targets.len();
+                let idx =
+                    (self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize) % targets.len();
                 Some(targets[idx])
             }
             LoadBalancingPolicy::WeightedRoundRobin => {
@@ -705,12 +718,10 @@ impl CompiledRoute {
                 }
                 Some(targets[0])
             }
-            LoadBalancingPolicy::LeastConnections => {
-                targets
-                    .iter()
-                    .min_by_key(|t| t.inflight.load(Ordering::Relaxed))
-                    .copied()
-            }
+            LoadBalancingPolicy::LeastConnections => targets
+                .iter()
+                .min_by_key(|t| t.inflight.load(Ordering::Relaxed))
+                .copied(),
             LoadBalancingPolicy::Random => {
                 let idx = rand::thread_rng().gen_range(0..targets.len());
                 Some(targets[idx])
@@ -748,7 +759,10 @@ enum Predicate {
 }
 
 impl Predicate {
-    fn try_from(config: RoutePredicateConfig, weight_meta: &mut Option<WeightMeta>) -> Result<Self, ProxyError> {
+    fn try_from(
+        config: RoutePredicateConfig,
+        weight_meta: &mut Option<WeightMeta>,
+    ) -> Result<Self, ProxyError> {
         match config {
             RoutePredicateConfig::Path {
                 patterns,
@@ -890,7 +904,10 @@ struct PathMatcher {
 }
 
 impl PathMatcher {
-    fn from_patterns(patterns: Vec<String>, match_trailing_slash: bool) -> Result<Self, ProxyError> {
+    fn from_patterns(
+        patterns: Vec<String>,
+        match_trailing_slash: bool,
+    ) -> Result<Self, ProxyError> {
         let regexes = patterns
             .iter()
             .map(|p| {
@@ -940,7 +957,10 @@ impl HeaderMatcher {
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|e| ProxyError::Config(format!("Invalid header name: {}", e)))?;
         let regex = if let Some(r) = regex {
-            Some(Regex::new(&r).map_err(|e| ProxyError::Config(format!("Invalid header regex: {}", e)))?)
+            Some(
+                Regex::new(&r)
+                    .map_err(|e| ProxyError::Config(format!("Invalid header regex: {}", e)))?,
+            )
         } else {
             None
         };
@@ -974,7 +994,10 @@ impl QueryMatcher {
             ));
         }
         let regex = if let Some(r) = regex {
-            Some(Regex::new(&r).map_err(|e| ProxyError::Config(format!("Invalid query regex: {}", e)))?)
+            Some(
+                Regex::new(&r)
+                    .map_err(|e| ProxyError::Config(format!("Invalid query regex: {}", e)))?,
+            )
         } else {
             None
         };
@@ -1018,7 +1041,10 @@ impl CookieMatcher {
             ));
         }
         let regex = if let Some(r) = regex {
-            Some(Regex::new(&r).map_err(|e| ProxyError::Config(format!("Invalid cookie regex: {}", e)))?)
+            Some(
+                Regex::new(&r)
+                    .map_err(|e| ProxyError::Config(format!("Invalid cookie regex: {}", e)))?,
+            )
         } else {
             None
         };
@@ -1226,7 +1252,10 @@ impl ReverseProxy {
             reverse_proxy_config,
         )?);
 
-        info!("Reverse proxy configuration: {} routes", router.route_count());
+        info!(
+            "Reverse proxy configuration: {} routes",
+            router.route_count()
+        );
 
         Ok(Self {
             routes: router,
@@ -1339,9 +1368,18 @@ impl ReverseProxy {
             info!("Reverse proxy listening on: http://{}", addr);
         }
 
-        for (target_id, target_url, client, cfg, healthy) in self.routes.routes_with_health_checks() {
+        for (target_id, target_url, client, cfg, healthy) in self.routes.routes_with_health_checks()
+        {
             tokio::spawn(async move {
-                Self::health_check_loop(target_id, client, target_url, cfg, healthy).await;
+                Self::health_check_loop(
+                    target_id,
+                    client,
+                    target_url,
+                    cfg,
+                    healthy,
+                    CancellationToken::new(),
+                )
+                .await;
             });
         }
 
@@ -1382,6 +1420,92 @@ impl ReverseProxy {
                             Err(e) => {
                                 warn!("TLS handshake failed from {}: {}", remote_addr, e);
                             }
+                        }
+                    });
+                }
+                None => {
+                    tokio::spawn(async move {
+                        Self::serve_stream(
+                            stream,
+                            remote_addr,
+                            routes,
+                            preserve_host,
+                            websocket_cfg,
+                            metrics,
+                            rate_limiter,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Run a proxy generation on a listener owned by the supervisor.
+    pub async fn run_with_listener(
+        self,
+        listener: Arc<TcpListener>,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ProxyError> {
+        let tls_acceptor = tls_config.map(TlsAcceptor::from);
+
+        if tls_acceptor.is_some() {
+            info!(
+                "Reverse proxy listening on: https://{} (wss capable)",
+                listener.local_addr().map_err(ProxyError::Io)?
+            );
+        } else {
+            info!(
+                "Reverse proxy listening on: http://{}",
+                listener.local_addr().map_err(ProxyError::Io)?
+            );
+        }
+
+        for (target_id, target_url, client, cfg, healthy) in self.routes.routes_with_health_checks()
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                Self::health_check_loop(target_id, client, target_url, cfg, healthy, shutdown)
+                    .await;
+            });
+        }
+
+        let routes = self.routes.clone();
+        let preserve_host = self.preserve_host;
+        let websocket_config = Arc::new(self.websocket_config.clone());
+        let metrics = self.metrics.clone();
+        let rate_limiter = self.rate_limiter.clone();
+
+        loop {
+            let (stream, remote_addr) = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
+            };
+
+            let routes = routes.clone();
+            let metrics = metrics.clone();
+            let websocket_cfg = websocket_config.clone();
+            let rate_limiter = rate_limiter.clone();
+
+            match &tls_acceptor {
+                Some(acceptor) => {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                Self::serve_stream(
+                                    tls_stream,
+                                    remote_addr,
+                                    routes,
+                                    preserve_host,
+                                    websocket_cfg,
+                                    metrics,
+                                    rate_limiter,
+                                )
+                                .await;
+                            }
+                            Err(e) => warn!("TLS handshake failed from {}: {}", remote_addr, e),
                         }
                     });
                 }
@@ -1503,7 +1627,12 @@ impl ReverseProxy {
 
         let selected_route = match routes.select_route(&req, &context) {
             Some(route) => route,
-            None => return Ok(Self::boxed_response(ResponseBuilder::error(StatusCode::NOT_FOUND, "No matching route"))),
+            None => {
+                return Ok(Self::boxed_response(ResponseBuilder::error(
+                    StatusCode::NOT_FOUND,
+                    "No matching route",
+                )));
+            }
         };
 
         if is_websocket_upgrade(req.headers()) {
@@ -1529,7 +1658,8 @@ impl ReverseProxy {
                 preserve_host,
                 websocket_config,
             )
-            .await {
+            .await
+            {
                 Ok(response) => response,
                 Err(e) => match e {},
             };
@@ -1541,7 +1671,8 @@ impl ReverseProxy {
             return Ok(Self::boxed_response(response));
         }
 
-        match Self::process_request_with_retries(req, context, selected_route, preserve_host).await {
+        match Self::process_request_with_retries(req, context, selected_route, preserve_host).await
+        {
             Ok((response, set_cookie)) => {
                 let mut response = response;
                 if let Some(cookie) = set_cookie {
@@ -1552,7 +1683,10 @@ impl ReverseProxy {
                 Ok(response)
             }
             Err(RequestFailure::Selection(e)) => {
-                warn!("Target selection failed for route {}: {}", selected_route.id, e);
+                warn!(
+                    "Target selection failed for route {}: {}",
+                    selected_route.id, e
+                );
                 Ok(Self::boxed_response(ResponseBuilder::error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &e.to_string(),
@@ -1570,7 +1704,7 @@ impl ReverseProxy {
             }
         }
     }
-    
+
     /// Helper to convert Full<Bytes> response to BoxedBody response
     fn boxed_response(response: Response<Full<Bytes>>) -> Response<BoxedBody> {
         let (parts, body) = response.into_parts();
@@ -1605,7 +1739,7 @@ impl ReverseProxy {
 
         // Check if this is an SSE response
         let is_sse = Self::is_sse_response(response.headers());
-        
+
         if is_sse {
             // Use streaming handler for SSE
             Self::finalize_backend_response_streaming(response, false)
@@ -1643,7 +1777,7 @@ impl ReverseProxy {
 
         // Check if this is an SSE response
         let is_sse = Self::is_sse_response(response.headers());
-        
+
         if is_sse {
             // Use streaming handler for SSE
             Self::finalize_backend_response_streaming(response, false)
@@ -1667,8 +1801,9 @@ impl ReverseProxy {
             .map(|policy| policy.max_attempts <= 1 || !policy.allows_method(req.method()))
             .unwrap_or(true)
         {
-            let TargetSelection { target, set_cookie } =
-                selected_route.select_target(&req, &context).map_err(RequestFailure::Selection)?;
+            let TargetSelection { target, set_cookie } = selected_route
+                .select_target(&req, &context)
+                .map_err(RequestFailure::Selection)?;
             let response =
                 Self::process_request_static(req, context, selected_route, target, preserve_host)
                     .await
@@ -1691,8 +1826,7 @@ impl ReverseProxy {
         let mut last_response: Option<(Response<BoxedBody>, Option<String>)> = None;
 
         for attempt in 0..retry_policy.max_attempts {
-            let attempt_request =
-                Request::from_parts(parts.clone(), Full::new(body_bytes.clone()));
+            let attempt_request = Request::from_parts(parts.clone(), Full::new(body_bytes.clone()));
             let selection = match selected_route.select_target_with_exclusions(
                 &attempt_request,
                 &context,
@@ -1748,11 +1882,9 @@ impl ReverseProxy {
             return Ok(response);
         }
 
-        Err(RequestFailure::Forward(
-            last_error.unwrap_or_else(|| {
-                ProxyError::Connection("Retry attempts exhausted".to_string())
-            }),
-        ))
+        Err(RequestFailure::Forward(last_error.unwrap_or_else(|| {
+            ProxyError::Connection("Retry attempts exhausted".to_string())
+        })))
     }
 
     async fn handle_websocket_request(
@@ -1771,24 +1903,23 @@ impl ReverseProxy {
         let http_client = selected_route.http_client.clone();
 
         let client_upgrade = hyper::upgrade::on(&mut req);
-        let prepared_request =
-            match Self::rewrite_backend_request(
-                req,
-                &context,
-                &target_url,
-                preserve_host,
-                true,
-                selected_route.strip_path_prefix.as_deref(),
-            ) {
-                Ok(request) => request,
-                Err(e) => {
-                    error!("WebSocket request rewrite failed: {}", e);
-                    return Ok(ResponseBuilder::error(
-                        StatusCode::BAD_GATEWAY,
-                        "Invalid WebSocket request",
-                    ));
-                }
-            };
+        let prepared_request = match Self::rewrite_backend_request(
+            req,
+            &context,
+            &target_url,
+            preserve_host,
+            true,
+            selected_route.strip_path_prefix.as_deref(),
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                error!("WebSocket request rewrite failed: {}", e);
+                return Ok(ResponseBuilder::error(
+                    StatusCode::BAD_GATEWAY,
+                    "Invalid WebSocket request",
+                ));
+            }
+        };
         let prepared_request = Self::box_incoming_request(prepared_request);
 
         let mut backend_response = match http_client.request(prepared_request).await {
@@ -1838,7 +1969,10 @@ impl ReverseProxy {
         Ok(switch_response)
     }
 
-    fn validate_websocket_headers(headers: &hyper::HeaderMap, config: &WebSocketConfig) -> Result<(), String> {
+    fn validate_websocket_headers(
+        headers: &hyper::HeaderMap,
+        config: &WebSocketConfig,
+    ) -> Result<(), String> {
         if !config.enabled {
             return Err("WebSocket support is disabled".to_string());
         }
@@ -1862,7 +1996,11 @@ impl ReverseProxy {
             let offered = headers
                 .get("Sec-WebSocket-Protocol")
                 .and_then(|v| v.to_str().ok())
-                .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_else(|| Vec::new());
 
             if offered.is_empty() {
@@ -1874,10 +2012,11 @@ impl ReverseProxy {
                 .iter()
                 .map(|p| p.to_ascii_lowercase())
                 .collect::<Vec<_>>();
-            if !offered
-                .iter()
-                .any(|offer| supported.iter().any(|allowed| allowed == &offer.to_ascii_lowercase()))
-            {
+            if !offered.iter().any(|offer| {
+                supported
+                    .iter()
+                    .any(|allowed| allowed == &offer.to_ascii_lowercase())
+            }) {
                 return Err("Unsupported WebSocket subprotocol".to_string());
             }
         }
@@ -1997,18 +2136,18 @@ impl ReverseProxy {
         keep_upgrade: bool,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let (mut parts, body) = response.into_parts();
-        
+
         // Check if this is an SSE response before collecting the body
         let is_sse = Self::is_sse_response(&parts.headers);
-        
+
         if is_sse {
             // For SSE, we cannot buffer the response - return an error
             // The caller should use finalize_backend_response_streaming instead
             return Err(ProxyError::Http(
-                "SSE responses must use streaming handler".to_string()
+                "SSE responses must use streaming handler".to_string(),
             ));
         }
-        
+
         let body_bytes = body
             .collect()
             .await
@@ -2019,9 +2158,12 @@ impl ReverseProxy {
             .headers
             .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
 
-        Ok(Response::from_parts(parts, Full::new(body_bytes.to_bytes())))
+        Ok(Response::from_parts(
+            parts,
+            Full::new(body_bytes.to_bytes()),
+        ))
     }
-    
+
     /// Finalize backend response for streaming (SSE, chunked responses)
     fn finalize_backend_response_streaming(
         response: Response<Incoming>,
@@ -2029,12 +2171,12 @@ impl ReverseProxy {
     ) -> Result<Response<BoxedBody>, ProxyError> {
         let (mut parts, body) = response.into_parts();
         let is_sse = Self::is_sse_response(&parts.headers);
-        
+
         Self::strip_response_headers(&mut parts.headers, keep_upgrade, is_sse);
         parts
             .headers
             .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
-        
+
         // Convert Incoming body to BoxedBody for streaming
         let boxed_body = body.map_err(|err| Box::new(err) as BoxError).boxed();
         Ok(Response::from_parts(parts, boxed_body))
@@ -2048,7 +2190,7 @@ impl ReverseProxy {
             headers.remove("Proxy-Authorization");
             return;
         }
-        
+
         if !keep_upgrade {
             headers.remove("Connection");
             headers.remove("Upgrade");
@@ -2064,10 +2206,11 @@ impl ReverseProxy {
     /// Health check loop (runs in background)
     async fn health_check_loop(
         target_id: String,
-    http_client: Arc<Client<BackendConnector, BoxedBody>>,
+        http_client: Arc<Client<BackendConnector, BoxedBody>>,
         target_url: Url,
         config: HealthCheckConfig,
         healthy: Arc<AtomicBool>,
+        shutdown: CancellationToken,
     ) {
         let interval = Duration::from_secs(config.interval_secs);
         let timeout = Duration::from_secs(config.timeout_secs);
@@ -2088,7 +2231,10 @@ impl ReverseProxy {
 
         let mut interval_timer = tokio::time::interval(interval);
         loop {
-            interval_timer.tick().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = interval_timer.tick() => {}
+            }
 
             let is_healthy = if let Some(ref endpoint) = endpoint {
                 Self::http_health_check(&http_client, &target_url, endpoint, timeout).await
@@ -2192,19 +2338,14 @@ impl ReverseProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RetryPolicyConfig;
     use bytes::Bytes;
     use http_body_util::Empty;
     use std::collections::{HashMap, HashSet};
-    use crate::config::RetryPolicyConfig;
 
     #[test]
     fn test_reverse_proxy_creation() {
-        let result = ReverseProxy::new(
-            "http://backend.example.com".to_string(),
-            10,
-            90,
-            300,
-        );
+        let result = ReverseProxy::new("http://backend.example.com".to_string(), 10, 90, 300);
         assert!(result.is_ok());
 
         let invalid_url = ReverseProxy::new("not-a-url".to_string(), 10, 90, 300);
@@ -2276,7 +2417,7 @@ mod tests {
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(0),
-            order: None,
+                order: None,
                 predicates: vec![
                     RoutePredicateConfig::Path {
                         patterns: vec!["/**".to_string()],
@@ -2299,7 +2440,7 @@ mod tests {
                 reverse_proxy_config: None,
                 strip_path_prefix: None,
                 priority: Some(0),
-            order: None,
+                order: None,
                 predicates: vec![
                     RoutePredicateConfig::Path {
                         patterns: vec!["/**".to_string()],
@@ -2327,10 +2468,7 @@ mod tests {
     #[test]
     fn test_header_override_group_selection_stays_in_group() {
         let mut allowed_groups = HashMap::new();
-        allowed_groups.insert(
-            "blue".to_string(),
-            vec!["a".to_string(), "b".to_string()],
-        );
+        allowed_groups.insert("blue".to_string(), vec!["a".to_string(), "b".to_string()]);
 
         let routes = vec![ReverseProxyRouteConfig {
             id: "api".to_string(),
@@ -2548,18 +2686,21 @@ mod tests {
     #[test]
     fn test_sse_detection() {
         let mut headers = hyper::HeaderMap::new();
-        
+
         // Test without SSE header
         assert!(!ReverseProxy::is_sse_response(&headers));
-        
+
         // Test with SSE content-type
         headers.insert("content-type", "text/event-stream".parse().unwrap());
         assert!(ReverseProxy::is_sse_response(&headers));
-        
+
         // Test with SSE content-type and charset
-        headers.insert("content-type", "text/event-stream; charset=utf-8".parse().unwrap());
+        headers.insert(
+            "content-type",
+            "text/event-stream; charset=utf-8".parse().unwrap(),
+        );
         assert!(ReverseProxy::is_sse_response(&headers));
-        
+
         // Test with non-SSE content-type
         headers.insert("content-type", "application/json".parse().unwrap());
         assert!(!ReverseProxy::is_sse_response(&headers));
@@ -2572,23 +2713,41 @@ mod tests {
         headers.insert("transfer-encoding", "chunked".parse().unwrap());
         headers.insert("cache-control", "no-cache".parse().unwrap());
         headers.insert("content-type", "text/event-stream".parse().unwrap());
-        
+
         // For SSE responses, critical headers should be preserved
         ReverseProxy::strip_response_headers(&mut headers, false, true);
-        
-        assert!(headers.contains_key("connection"), "Connection header should be preserved for SSE");
-        assert!(headers.contains_key("transfer-encoding"), "Transfer-Encoding should be preserved for SSE");
-        assert!(headers.contains_key("cache-control"), "Cache-Control should be preserved for SSE");
-        assert!(headers.contains_key("content-type"), "Content-Type should be preserved for SSE");
-        
+
+        assert!(
+            headers.contains_key("connection"),
+            "Connection header should be preserved for SSE"
+        );
+        assert!(
+            headers.contains_key("transfer-encoding"),
+            "Transfer-Encoding should be preserved for SSE"
+        );
+        assert!(
+            headers.contains_key("cache-control"),
+            "Cache-Control should be preserved for SSE"
+        );
+        assert!(
+            headers.contains_key("content-type"),
+            "Content-Type should be preserved for SSE"
+        );
+
         // For non-SSE responses, headers should be stripped
         let mut headers2 = hyper::HeaderMap::new();
         headers2.insert("connection", "keep-alive".parse().unwrap());
         headers2.insert("transfer-encoding", "chunked".parse().unwrap());
-        
+
         ReverseProxy::strip_response_headers(&mut headers2, false, false);
-        
-        assert!(!headers2.contains_key("connection"), "Connection header should be stripped for non-SSE");
-        assert!(!headers2.contains_key("transfer-encoding"), "Transfer-Encoding should be stripped for non-SSE");
+
+        assert!(
+            !headers2.contains_key("connection"),
+            "Connection header should be stripped for non-SSE"
+        );
+        assert!(
+            !headers2.contains_key("transfer-encoding"),
+            "Transfer-Encoding should be stripped for non-SSE"
+        );
     }
 }

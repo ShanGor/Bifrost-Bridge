@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Zero-downtime configuration reloads**
+  - Added a supervisor-owned listener and replaceable worker generations
+  - Added `--reload`/`--pid-file` using Unix `SIGHUP`
+  - Reloads validate config, encrypted secrets, routes, and renewed TLS material before activation
+  - Existing connections drain while new connections use the new configuration
 - Comprehensive documentation system in `docs/` folder
 - Requirements tracking system in `requirements/` folder
 - Development guidelines and contribution standards

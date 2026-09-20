@@ -35,6 +35,8 @@ cargo run -- --help
 | `--mode` | `-m` | Proxy mode: `forward` or `reverse` | `--mode reverse` |
 | `--listen` | `-l` | Listen address for the server | `--listen 127.0.0.1:8080` |
 | `--config` | `-c` | Path to JSON configuration file | `--config config.json` |
+| `--reload` | | Reload the running server from its config file | `--reload` |
+| `--pid-file` | | PID file path used by the server and `--reload` | `--pid-file /run/bifrost-bridge.pid` |
 | `--target` | `-t` | Target URL for reverse proxy | `--target http://backend:3000` |
 | `--generate-config` | | Generate sample configuration file | `--generate-config config.json` |
 
@@ -71,6 +73,24 @@ cargo run -- --help
 |----------|-------------|---------|
 | `--private-key` | Path to PKCS#8 PEM format private key file | `--private-key ./certs/private-key.pem` |
 | `--certificate` | Path to PEM format certificate file | `--certificate ./certs/certificate.pem` |
+
+### Configuration Reloads
+
+Start the server with a JSON config, then reload it without closing the listening socket:
+
+```bash
+bifrost-bridge --config /etc/bifrost-bridge/config.json --pid-file /run/bifrost-bridge.pid
+bifrost-bridge --reload --pid-file /run/bifrost-bridge.pid
+```
+
+The reload transaction reads the config, resolves environment variables, decrypts encrypted
+secrets, validates proxy routes, and validates the TLS key/certificate pair before the active
+worker is replaced. Existing connections drain on the old worker; new connections are accepted by
+the new worker. If validation fails, the old worker remains active.
+
+The listening address and effective `worker_threads` count are process-lifetime settings and cannot
+be changed by reload. Logging configuration is initialized at process startup; change it with a
+restart. The command is currently Unix-only because it uses `SIGHUP` and a PID file.
 
 ### Connection Pool Options
 

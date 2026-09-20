@@ -6,30 +6,31 @@
 //! - Basic proxy authentication
 //! - Connection pooling and timeout configuration
 
-use crate::error::ProxyError;
-use crate::config::{RelayProxyConfig, WebSocketConfig};
 use crate::common::{ResponseBuilder, TlsConfig, is_websocket_upgrade};
+use crate::config::{RelayProxyConfig, WebSocketConfig};
+use crate::error::ProxyError;
 use crate::rate_limit::RateLimiter;
-use rustls::ServerConfig;
-use hyper::{Request, Response, StatusCode, Uri, Method};
-use hyper::body::{Bytes, Incoming};
+use base64::{Engine as _, engine::general_purpose};
 use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::header::{HOST, HeaderValue, ORIGIN, PROXY_AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
-use log::{info, error, debug, warn};
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioIo;
-use hyper::header::{HOST, ORIGIN, PROXY_AUTHORIZATION, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use hyper_util::rt::{TokioExecutor, TokioTimer};
+use log::{debug, error, info, warn};
+use rustls::ServerConfig;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
-use url::Url;
 use tokio_rustls::TlsAcceptor;
-use base64::{Engine as _, engine::general_purpose};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use tokio_util::sync::CancellationToken;
+use url::Url;
 
 /// Forward proxy server implementation.
 ///
@@ -64,12 +65,12 @@ impl ForwardProxy {
     /// * `connect_timeout_secs` - Timeout for establishing connections
     /// * `idle_timeout_secs` - Idle timeout for pooled connections
     /// * `max_connection_lifetime_secs` - Maximum lifetime for any connection (enforced on CONNECT tunnels)
-    pub fn new(connect_timeout_secs: u64, idle_timeout_secs: u64, max_connection_lifetime_secs: u64) -> Self {
-        let http_client = Self::build_http_client(
-            connect_timeout_secs,
-            idle_timeout_secs,
-            true,
-        );
+    pub fn new(
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        max_connection_lifetime_secs: u64,
+    ) -> Self {
+        let http_client = Self::build_http_client(connect_timeout_secs, idle_timeout_secs, true);
 
         Self {
             connection_pool_enabled: true,
@@ -254,8 +255,10 @@ impl ForwardProxy {
             // Enable connection reuse with automatic timeout-based cleanup
             // idle_timeout controls when idle connections are closed
             // No need to set pool_max_idle_per_host - timeout handles cleanup
-            info!("Forward proxy: connection reuse enabled, idle timeout={}s (auto-cleanup)",
-                  idle_timeout_secs);
+            info!(
+                "Forward proxy: connection reuse enabled, idle timeout={}s (auto-cleanup)",
+                idle_timeout_secs
+            );
             builder.pool_idle_timeout(Duration::from_secs(idle_timeout_secs));
             builder.pool_timer(TokioTimer::new());
             // NOTE: We do NOT set pool_max_idle_per_host(0) as that disables pooling entirely!
@@ -265,20 +268,27 @@ impl ForwardProxy {
             builder.pool_max_idle_per_host(0); // Only disable when explicitly requested
         }
 
-        builder
-            .http2_only(false)
-            .build(connector)
+        builder.http2_only(false).build(connector)
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<(), ProxyError> {
         self.run_http(addr).await
     }
 
-    pub async fn run_with_tls(self, addr: SocketAddr, tls_config: ServerConfig) -> Result<(), ProxyError> {
+    pub async fn run_with_tls(
+        self,
+        addr: SocketAddr,
+        tls_config: ServerConfig,
+    ) -> Result<(), ProxyError> {
         self.run_https(addr, Some(Arc::new(tls_config))).await
     }
 
-    pub async fn run_with_config(self, addr: SocketAddr, private_key: Option<String>, certificate: Option<String>) -> Result<(), ProxyError> {
+    pub async fn run_with_config(
+        self,
+        addr: SocketAddr,
+        private_key: Option<String>,
+        certificate: Option<String>,
+    ) -> Result<(), ProxyError> {
         match (private_key, certificate) {
             (Some(private_key_path), Some(cert_path)) => {
                 // HTTPS mode
@@ -292,7 +302,40 @@ impl ForwardProxy {
         }
     }
 
+    /// Run a proxy generation on a listener owned by the supervisor.
+    ///
+    /// Keeping the listener outside the generation is what allows a reload to
+    /// replace configuration and TLS state without closing the listening port.
+    pub async fn run_with_listener(
+        self,
+        listener: Arc<TcpListener>,
+        tls_config: Option<Arc<ServerConfig>>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ProxyError> {
+        match tls_config {
+            Some(tls_config) => {
+                self.run_https_on_listener(listener, Some(tls_config), shutdown)
+                    .await
+            }
+            None => self.run_http_on_listener(listener, shutdown).await,
+        }
+    }
+
     async fn run_http(self, addr: SocketAddr) -> Result<(), ProxyError> {
+        let listener = Arc::new(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| ProxyError::Hyper(e.to_string()))?,
+        );
+        self.run_http_on_listener(listener, CancellationToken::new())
+            .await
+    }
+
+    async fn run_http_on_listener(
+        self,
+        listener: Arc<TcpListener>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ProxyError> {
         let relay_proxies = self.relay_proxies.clone();
         let proxy_username = self.proxy_username;
         let proxy_password = self.proxy_password;
@@ -300,14 +343,16 @@ impl ForwardProxy {
         let websocket_config = self.websocket_config.clone();
         let rate_limiter = self.rate_limiter.clone();
 
-        let listener = tokio::net::TcpListener::bind(addr).await
-            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
-
-        info!("HTTP forward proxy listening on: http://{}", addr);
+        info!(
+            "HTTP forward proxy listening on: http://{}",
+            listener.local_addr().map_err(|e| ProxyError::Io(e))?
+        );
 
         loop {
-            let (stream, remote_addr) = listener.accept().await
-                .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+            let (stream, remote_addr) = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
+            };
 
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
@@ -335,7 +380,8 @@ impl ForwardProxy {
                                 proxy_username,
                                 proxy_password,
                                 rate_limiter.clone(),
-                            ).await;
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -367,7 +413,8 @@ impl ForwardProxy {
                                         websocket_config.clone(),
                                         rate_limiter.clone(),
                                         Some(client_ip.clone()),
-                                    ).await
+                                    )
+                                    .await
                                 } else {
                                     Self::handle_request_static(
                                         req,
@@ -378,10 +425,11 @@ impl ForwardProxy {
                                         websocket_config,
                                         rate_limiter,
                                         Some(client_ip.clone()),
-                                    ).await
+                                    )
+                                    .await
                                 }
                             }
-                        })
+                        }),
                     )
                     .with_upgrades()
                     .await
@@ -456,10 +504,7 @@ impl ForwardProxy {
                     "Forward proxy CONNECT rate limit hit for {} via rule {}",
                     client_ip, hit.rule_id
                 );
-                let body = format!(
-                    "Rate limit '{}' exceeded. Please retry later.",
-                    hit.rule_id
-                );
+                let body = format!("Rate limit '{}' exceeded. Please retry later.", hit.rule_id);
                 let response = format!(
                     "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
                     hit.retry_after_secs,
@@ -482,12 +527,8 @@ impl ForwardProxy {
         // Connect to target
         let target_result = if let Some(relay) = relay_proxy {
             debug!("Connecting to {} via relay proxy", target_desc);
-            ForwardProxy::connect_via_relay(
-                &relay.url,
-                &relay.auth,
-                &target_host,
-                target_port,
-            ).await
+            ForwardProxy::connect_via_relay(&relay.url, &relay.auth, &target_host, target_port)
+                .await
         } else {
             debug!("Direct connection to {}", target_desc);
             TcpStream::connect(format!("{}:{}", target_host, target_port)).await
@@ -512,8 +553,11 @@ impl ForwardProxy {
         debug!("Successfully connected to target, setting up tunnel");
 
         // Send 200 OK to client
-        let ok_response = "HTTP/1.1 200 Connection established\r\nProxy-agent: Rust-Proxy/1.0\r\n\r\n";
-        stream.write_all(ok_response.as_bytes()).await
+        let ok_response =
+            "HTTP/1.1 200 Connection established\r\nProxy-agent: Rust-Proxy/1.0\r\n\r\n";
+        stream
+            .write_all(ok_response.as_bytes())
+            .await
             .map_err(|e| {
                 error!("Failed to send 200 OK response: {}", e);
                 e
@@ -526,12 +570,28 @@ impl ForwardProxy {
             remote_addr,
             target_desc,
             Duration::from_secs(300), // Static method uses default 300s
-        ).await;
+        )
+        .await;
 
         Ok(())
     }
 
-    async fn run_https(self, addr: SocketAddr, tls_config: Option<Arc<ServerConfig>>) -> Result<(), ProxyError> {
+    async fn run_https(
+        self,
+        addr: SocketAddr,
+        tls_config: Option<Arc<ServerConfig>>,
+    ) -> Result<(), ProxyError> {
+        let listener = Arc::new(TcpListener::bind(addr).await.map_err(ProxyError::Io)?);
+        self.run_https_on_listener(listener, tls_config, CancellationToken::new())
+            .await
+    }
+
+    async fn run_https_on_listener(
+        self,
+        listener: Arc<TcpListener>,
+        tls_config: Option<Arc<ServerConfig>>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ProxyError> {
         let relay_proxies = self.relay_proxies.clone();
         let proxy_username = self.proxy_username;
         let proxy_password = self.proxy_password;
@@ -545,10 +605,10 @@ impl ForwardProxy {
             None
         };
 
-        let tcp_listener = TcpListener::bind(&addr).await
-            .map_err(|e| ProxyError::Io(e))?;
-
-        info!("HTTPS forward proxy listening on: https://{}", addr);
+        info!(
+            "HTTPS forward proxy listening on: https://{}",
+            listener.local_addr().map_err(ProxyError::Io)?
+        );
         if connection_pool_enabled {
             info!("Connection pooling enabled");
         } else {
@@ -556,8 +616,10 @@ impl ForwardProxy {
         }
 
         loop {
-            let (tcp_stream, remote_addr) = tcp_listener.accept().await
-                .map_err(|e| ProxyError::Io(e))?;
+            let (tcp_stream, remote_addr) = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                result = listener.accept() => result.map_err(ProxyError::Io)?,
+            };
 
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
@@ -591,7 +653,8 @@ impl ForwardProxy {
                                             websocket_config.clone(),
                                             rate_limiter.clone(),
                                             Some(client_ip.clone()),
-                                        ).await
+                                        )
+                                        .await
                                     } else {
                                         ForwardProxy::handle_request_static(
                                             req,
@@ -602,7 +665,8 @@ impl ForwardProxy {
                                             websocket_config,
                                             rate_limiter,
                                             Some(client_ip.clone()),
-                                        ).await
+                                        )
+                                        .await
                                     }
                                 }
                             });
@@ -625,7 +689,11 @@ impl ForwardProxy {
         }
     }
 
-    async fn handle_request(&self, req: Request<Incoming>, client_ip: Option<String>) -> Result<Response<Full<Bytes>>, Infallible> {
+    async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+        client_ip: Option<String>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
         match self.process_request(req, client_ip).await {
             Ok(response) => Ok(response),
             Err(e) => {
@@ -644,8 +712,10 @@ impl ForwardProxy {
 
                 // Add Proxy-Authenticate header for 401 responses
                 if status == StatusCode::UNAUTHORIZED {
-                    response_builder.headers_mut()
-                        .insert("Proxy-Authenticate", HeaderValue::from_static("Basic realm=\"Proxy Server\""));
+                    response_builder.headers_mut().insert(
+                        "Proxy-Authenticate",
+                        HeaderValue::from_static("Basic realm=\"Proxy Server\""),
+                    );
                 }
 
                 Ok(response_builder)
@@ -653,7 +723,11 @@ impl ForwardProxy {
         }
     }
 
-    async fn process_request(&self, req: Request<Incoming>, client_ip: Option<String>) -> Result<Response<Full<Bytes>>, ProxyError> {
+    async fn process_request(
+        &self,
+        req: Request<Incoming>,
+        client_ip: Option<String>,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
         self.verify_authentication(&req)?;
 
         if let Some(ip) = client_ip.as_deref() {
@@ -669,8 +743,14 @@ impl ForwardProxy {
                 )
                 .await
             {
-                warn!("Forward proxy rate limit hit for {} via rule {}", ip, hit.rule_id);
-                return Ok(ResponseBuilder::too_many_requests(&hit.rule_id, hit.retry_after_secs));
+                warn!(
+                    "Forward proxy rate limit hit for {} via rule {}",
+                    ip, hit.rule_id
+                );
+                return Ok(ResponseBuilder::too_many_requests(
+                    &hit.rule_id,
+                    hit.retry_after_secs,
+                ));
             }
         }
 
@@ -689,14 +769,28 @@ impl ForwardProxy {
         let relay_proxy = self.find_relay_proxy_for_domain(host);
 
         if let Some(relay) = &relay_proxy {
-            debug!("HTTP request to {}://{}:{}{} via relay proxy {} (matched domain rule)",
-                scheme, host, port,
-                target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""),
-                relay.url);
+            debug!(
+                "HTTP request to {}://{}:{}{} via relay proxy {} (matched domain rule)",
+                scheme,
+                host,
+                port,
+                target_uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or(""),
+                relay.url
+            );
         } else {
-            debug!("HTTP request to {}://{}:{}{} (direct connection)",
-                scheme, host, port,
-                target_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(""));
+            debug!(
+                "HTTP request to {}://{}:{}{} (direct connection)",
+                scheme,
+                host,
+                port,
+                target_uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("")
+            );
         }
 
         let is_websocket = is_websocket_upgrade(req.headers());
@@ -709,11 +803,16 @@ impl ForwardProxy {
 
         if let Some(relay) = relay_proxy {
             if is_websocket {
-                return match self.forward_websocket_via_relay(req, relay, &target_uri).await {
+                return match self
+                    .forward_websocket_via_relay(req, relay, &target_uri)
+                    .await
+                {
                     Ok(resp) => Ok(resp),
                     Err(e) => {
                         error!("Proxy error (relay websocket): {}", e);
-                        Ok(ResponseBuilder::proxy_error("Failed to forward WebSocket request"))
+                        Ok(ResponseBuilder::proxy_error(
+                            "Failed to forward WebSocket request",
+                        ))
                     }
                 };
             }
@@ -732,7 +831,9 @@ impl ForwardProxy {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     error!("Proxy error (websocket): {}", e);
-                    Ok(ResponseBuilder::proxy_error("Failed to forward WebSocket request"))
+                    Ok(ResponseBuilder::proxy_error(
+                        "Failed to forward WebSocket request",
+                    ))
                 }
             };
         }
@@ -756,30 +857,42 @@ impl ForwardProxy {
         let uri_to_use = if target_uri.scheme().is_some() && target_uri.authority().is_some() {
             target_uri.clone()
         } else {
-            return Err(ProxyError::Config("Target URI missing scheme or authority".to_string()));
+            return Err(ProxyError::Config(
+                "Target URI missing scheme or authority".to_string(),
+            ));
         };
 
         *req.uri_mut() = uri_to_use.clone();
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         req.headers_mut().remove("Proxy-Connection");
 
-        let response = client.request(req).await
-            .map_err(|e| {
-                error!("HTTP client error: {}", e);
-                error!("  Target was: {}", uri_to_use);
-                if e.is_connect() {
-                    error!("  Error type: connection error (DNS failure, network unreachable, or timeout)");
-                }
-                ProxyError::Connection(format!("Failed to forward request: {}", e))
-            })?;
+        let response = client.request(req).await.map_err(|e| {
+            error!("HTTP client error: {}", e);
+            error!("  Target was: {}", uri_to_use);
+            if e.is_connect() {
+                error!(
+                    "  Error type: connection error (DNS failure, network unreachable, or timeout)"
+                );
+            }
+            ProxyError::Connection(format!("Failed to forward request: {}", e))
+        })?;
 
         Self::finalize_standard_response(response).await
     }
 
-    async fn handle_connect_tunnel(&self, req: Request<Incoming>, _client_ip: Option<String>) -> Result<Response<Full<Bytes>>, Infallible> {
+    async fn handle_connect_tunnel(
+        &self,
+        req: Request<Incoming>,
+        _client_ip: Option<String>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
         let authority = match req.uri().authority() {
             Some(auth) => auth,
-            None => return Ok(ResponseBuilder::error(StatusCode::BAD_REQUEST, "Invalid CONNECT target")),
+            None => {
+                return Ok(ResponseBuilder::error(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid CONNECT target",
+                ));
+            }
         };
 
         let host = authority.host().to_string();
@@ -791,7 +904,10 @@ impl ForwardProxy {
         let max_lifetime = self.max_connection_lifetime;
 
         if let Some(relay) = &relay_proxy {
-            debug!("Connecting to {}:{} via relay proxy {}", host, port, relay.url);
+            debug!(
+                "Connecting to {}:{} via relay proxy {}",
+                host, port, relay.url
+            );
         } else {
             debug!("Direct connection to {}:{}", host, port);
         }
@@ -804,12 +920,9 @@ impl ForwardProxy {
                     let upgraded_io = TokioIo::new(upgraded);
 
                     let target_stream = if let Some(relay) = relay_proxy {
-                        match ForwardProxy::connect_via_relay(
-                            &relay.url,
-                            &relay.auth,
-                            &host,
-                            port,
-                        ).await {
+                        match ForwardProxy::connect_via_relay(&relay.url, &relay.auth, &host, port)
+                            .await
+                        {
                             Ok(stream) => stream,
                             Err(e) => {
                                 error!("Failed to connect via relay to {}:{}: {}", host, port, e);
@@ -833,15 +946,25 @@ impl ForwardProxy {
 
                     let client_to_target = async {
                         match tokio::io::copy(&mut client_read, &mut target_write).await {
-                            Ok(bytes) => debug!("Client -> Target: {} bytes for {}:{}", bytes, host, port),
-                            Err(e) => error!("Error in client->target tunnel for {}:{}: {}", host, port, e),
+                            Ok(bytes) => {
+                                debug!("Client -> Target: {} bytes for {}:{}", bytes, host, port)
+                            }
+                            Err(e) => error!(
+                                "Error in client->target tunnel for {}:{}: {}",
+                                host, port, e
+                            ),
                         }
                     };
 
                     let target_to_client = async {
                         match tokio::io::copy(&mut target_read, &mut client_write).await {
-                            Ok(bytes) => debug!("Target -> Client: {} bytes for {}:{}", bytes, host, port),
-                            Err(e) => error!("Error in target->client tunnel for {}:{}: {}", host, port, e),
+                            Ok(bytes) => {
+                                debug!("Target -> Client: {} bytes for {}:{}", bytes, host, port)
+                            }
+                            Err(e) => error!(
+                                "Error in target->client tunnel for {}:{}: {}",
+                                host, port, e
+                            ),
                         }
                     };
 
@@ -886,8 +1009,9 @@ impl ForwardProxy {
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         req.headers_mut().remove("Proxy-Connection");
 
-        let mut response = self.http_client.request(req).await
-            .map_err(|e| ProxyError::Connection(format!("Failed to forward WebSocket request: {}", e)))?;
+        let mut response = self.http_client.request(req).await.map_err(|e| {
+            ProxyError::Connection(format!("Failed to forward WebSocket request: {}", e))
+        })?;
 
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Self::finalize_standard_response(response).await;
@@ -946,7 +1070,10 @@ impl ForwardProxy {
         relay: RelayProxyWithAuth,
         target_uri: &Uri,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        debug!("WebSocket upgrade via relay {} for {}", relay.url, target_uri);
+        debug!(
+            "WebSocket upgrade via relay {} for {}",
+            relay.url, target_uri
+        );
         let client_upgrade = hyper::upgrade::on(&mut req);
         let tunnel_timeout = Duration::from_secs(self.websocket_config.timeout_seconds);
         let target_desc = target_uri.to_string();
@@ -970,8 +1097,7 @@ impl ForwardProxy {
         response_headers.remove("proxy-connection");
         response_headers.remove("proxy-authenticate");
 
-        let mut response = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS);
+        let mut response = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
         if let Some(headers) = response.headers_mut() {
             *headers = response_headers;
         }
@@ -983,7 +1109,9 @@ impl ForwardProxy {
                     let mut client_io = TokioIo::new(client_stream);
                     let mut backend_stream = backend_stream;
                     let tunnel = async {
-                        if let Err(e) = copy_bidirectional(&mut client_io, &mut backend_stream).await {
+                        if let Err(e) =
+                            copy_bidirectional(&mut client_io, &mut backend_stream).await
+                        {
                             error!("WebSocket relay tunnel error: {}", e);
                         }
                     };
@@ -1011,40 +1139,57 @@ impl ForwardProxy {
             req.headers_mut().insert(PROXY_AUTHORIZATION, auth_value);
         }
 
-        let relay_uri = relay.url.parse::<Uri>()
+        let relay_uri = relay
+            .url
+            .parse::<Uri>()
             .map_err(|e| ProxyError::Config(format!("Invalid relay proxy URL: {}", e)))?;
 
-        let relay_host = relay_uri.host()
+        let relay_host = relay_uri
+            .host()
             .ok_or_else(|| ProxyError::Config("Relay proxy URL missing host".to_string()))?;
         let relay_port = relay_uri.port_u16().unwrap_or(8080);
         let relay_addr = format!("{}:{}", relay_host, relay_port);
 
-        let mut stream = TcpStream::connect(&relay_addr).await
-            .map_err(|e| ProxyError::Connection(format!("Failed to connect to relay proxy: {}", e)))?;
+        let mut stream = TcpStream::connect(&relay_addr).await.map_err(|e| {
+            ProxyError::Connection(format!("Failed to connect to relay proxy: {}", e))
+        })?;
 
         let request_line = format!("{} {} HTTP/1.1\r\n", req.method(), req.uri());
-        stream.write_all(request_line.as_bytes()).await
+        stream
+            .write_all(request_line.as_bytes())
+            .await
             .map_err(|e| ProxyError::Connection(format!("Failed to send request line: {}", e)))?;
 
         for (name, value) in req.headers() {
             let header_line = format!("{}: {}\r\n", name.as_str(), value.to_str().unwrap_or(""));
-            stream.write_all(header_line.as_bytes()).await
+            stream
+                .write_all(header_line.as_bytes())
+                .await
                 .map_err(|e| ProxyError::Connection(format!("Failed to send header: {}", e)))?;
         }
 
-        stream.write_all(b"\r\n").await
+        stream
+            .write_all(b"\r\n")
+            .await
             .map_err(|e| ProxyError::Connection(format!("Failed to terminate headers: {}", e)))?;
 
-        let body_bytes = req.into_body().collect().await
+        let body_bytes = req
+            .into_body()
+            .collect()
+            .await
             .map_err(|e| ProxyError::Http(format!("Failed to read request body: {}", e)))?
             .to_bytes();
 
         if !body_bytes.is_empty() {
-            stream.write_all(&body_bytes).await
+            stream
+                .write_all(&body_bytes)
+                .await
                 .map_err(|e| ProxyError::Connection(format!("Failed to send body: {}", e)))?;
         }
 
-        stream.flush().await
+        stream
+            .flush()
+            .await
             .map_err(|e| ProxyError::Connection(format!("Failed to flush relay request: {}", e)))?;
 
         Ok(BufReader::new(stream))
@@ -1054,7 +1199,9 @@ impl ForwardProxy {
         reader: &mut BufReader<TcpStream>,
     ) -> Result<(u16, hyper::HeaderMap, Option<usize>, bool), ProxyError> {
         let mut status_line = String::new();
-        reader.read_line(&mut status_line).await
+        reader
+            .read_line(&mut status_line)
+            .await
             .map_err(|e| ProxyError::Connection(format!("Failed to read status line: {}", e)))?;
 
         let parts: Vec<&str> = status_line.trim().split(' ').collect();
@@ -1070,7 +1217,9 @@ impl ForwardProxy {
 
         loop {
             let mut header_line = String::new();
-            reader.read_line(&mut header_line).await
+            reader
+                .read_line(&mut header_line)
+                .await
                 .map_err(|e| ProxyError::Connection(format!("Failed to read header: {}", e)))?;
 
             if header_line.trim().is_empty() {
@@ -1083,7 +1232,9 @@ impl ForwardProxy {
 
                 if name.eq_ignore_ascii_case("content-length") {
                     content_length = value.parse().ok();
-                } else if name.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked") {
+                } else if name.eq_ignore_ascii_case("transfer-encoding")
+                    && value.contains("chunked")
+                {
                     chunked = true;
                 }
 
@@ -1107,8 +1258,9 @@ impl ForwardProxy {
             let mut body = Vec::new();
             loop {
                 let mut chunk_size_line = String::new();
-                reader.read_line(&mut chunk_size_line).await
-                    .map_err(|e| ProxyError::Connection(format!("Failed to read chunk size: {}", e)))?;
+                reader.read_line(&mut chunk_size_line).await.map_err(|e| {
+                    ProxyError::Connection(format!("Failed to read chunk size: {}", e))
+                })?;
 
                 let chunk_size = usize::from_str_radix(chunk_size_line.trim(), 16)
                     .map_err(|e| ProxyError::Http(format!("Invalid chunk size: {}", e)))?;
@@ -1118,23 +1270,30 @@ impl ForwardProxy {
                 }
 
                 let mut chunk = vec![0u8; chunk_size];
-                reader.read_exact(&mut chunk).await
+                reader
+                    .read_exact(&mut chunk)
+                    .await
                     .map_err(|e| ProxyError::Connection(format!("Failed to read chunk: {}", e)))?;
                 body.extend_from_slice(&chunk);
 
                 let mut trailing = [0u8; 2];
-                reader.read_exact(&mut trailing).await
-                    .map_err(|e| ProxyError::Connection(format!("Failed to read chunk trailer: {}", e)))?;
+                reader.read_exact(&mut trailing).await.map_err(|e| {
+                    ProxyError::Connection(format!("Failed to read chunk trailer: {}", e))
+                })?;
             }
             Ok(body)
         } else if let Some(len) = content_length {
             let mut body = vec![0u8; len];
-            reader.read_exact(&mut body).await
+            reader
+                .read_exact(&mut body)
+                .await
                 .map_err(|e| ProxyError::Connection(format!("Failed to read body: {}", e)))?;
             Ok(body)
         } else {
             let mut body = Vec::new();
-            reader.read_to_end(&mut body).await
+            reader
+                .read_to_end(&mut body)
+                .await
                 .map_err(|e| ProxyError::Connection(format!("Failed to read body: {}", e)))?;
             Ok(body)
         }
@@ -1144,10 +1303,15 @@ impl ForwardProxy {
         response: Response<Incoming>,
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let (parts, body) = response.into_parts();
-        let body_bytes = body.collect().await
+        let body_bytes = body
+            .collect()
+            .await
             .map_err(|e| ProxyError::Http(format!("Failed to read response body: {}", e)))?;
 
-        Ok(Response::from_parts(parts, Full::new(body_bytes.to_bytes())))
+        Ok(Response::from_parts(
+            parts,
+            Full::new(body_bytes.to_bytes()),
+        ))
     }
 
     async fn setup_tunnel_with_lifetime(
@@ -1171,7 +1335,10 @@ impl ForwardProxy {
 
         match tokio::time::timeout(max_lifetime, tunnel_future).await {
             Ok(result) => {
-                debug!("Tunnel closed normally between {} and {}", client_addr, target_desc);
+                debug!(
+                    "Tunnel closed normally between {} and {}",
+                    client_addr, target_desc
+                );
                 result
             }
             Err(_) => {
@@ -1338,7 +1505,9 @@ impl ForwardProxy {
             return Ok(uri);
         }
 
-        Err(ProxyError::Config("Cannot determine target URI".to_string()))
+        Err(ProxyError::Config(
+            "Cannot determine target URI".to_string(),
+        ))
     }
 
     fn validate_websocket_headers(&self, headers: &hyper::HeaderMap) -> Result<(), String> {
@@ -1346,20 +1515,36 @@ impl ForwardProxy {
             return Err("WebSocket support is disabled".to_string());
         }
 
-        if self.websocket_config.allowed_origins.iter().all(|origin| origin != "*") {
-            let origin = headers.get(ORIGIN)
+        if self
+            .websocket_config
+            .allowed_origins
+            .iter()
+            .all(|origin| origin != "*")
+        {
+            let origin = headers
+                .get(ORIGIN)
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| "Origin header is required for WebSocket requests".to_string())?;
 
-            if !self.websocket_config.allowed_origins.iter().any(|allowed| allowed.eq_ignore_ascii_case(origin)) {
+            if !self
+                .websocket_config
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+            {
                 return Err("Origin not allowed".to_string());
             }
         }
 
         if !self.websocket_config.supported_protocols.is_empty() {
-            let offered = headers.get(SEC_WEBSOCKET_PROTOCOL)
+            let offered = headers
+                .get(SEC_WEBSOCKET_PROTOCOL)
                 .and_then(|v| v.to_str().ok())
-                .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_else(Vec::new);
 
             if offered.is_empty() {
@@ -1367,7 +1552,10 @@ impl ForwardProxy {
             }
 
             if !offered.iter().any(|offer| {
-                self.websocket_config.supported_protocols.iter().any(|allowed| allowed.eq_ignore_ascii_case(offer))
+                self.websocket_config
+                    .supported_protocols
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(offer))
             }) {
                 return Err("Unsupported WebSocket subprotocol".to_string());
             }
@@ -1384,22 +1572,27 @@ impl ForwardProxy {
         }
 
         // Check for Proxy-Authorization header
-        let auth_header = req.headers()
+        let auth_header = req
+            .headers()
             .get("Proxy-Authorization")
             .ok_or_else(|| ProxyError::Auth("Missing Proxy-Authorization header".to_string()))?;
 
         // Parse the header value
-        let auth_str = auth_header.to_str()
+        let auth_str = auth_header
+            .to_str()
             .map_err(|_| ProxyError::Auth("Invalid Proxy-Authorization header".to_string()))?;
 
         // Check if it starts with "Basic "
         if !auth_str.starts_with("Basic ") {
-            return Err(ProxyError::Auth("Unsupported authentication method".to_string()));
+            return Err(ProxyError::Auth(
+                "Unsupported authentication method".to_string(),
+            ));
         }
 
         // Decode the base64 credentials
         let encoded = &auth_str[6..]; // Remove "Basic " prefix
-        let decoded = general_purpose::STANDARD.decode(encoded)
+        let decoded = general_purpose::STANDARD
+            .decode(encoded)
             .map_err(|_| ProxyError::Auth("Invalid base64 encoding".to_string()))?;
         let credentials = String::from_utf8(decoded)
             .map_err(|_| ProxyError::Auth("Invalid UTF-8 in credentials".to_string()))?;
@@ -1413,7 +1606,9 @@ impl ForwardProxy {
         let (username, password) = (parts[0], parts[1]);
 
         // Verify credentials
-        if Some(username) == self.proxy_username.as_deref() && Some(password) == self.proxy_password.as_deref() {
+        if Some(username) == self.proxy_username.as_deref()
+            && Some(password) == self.proxy_password.as_deref()
+        {
             Ok(())
         } else {
             Err(ProxyError::Auth("Invalid username or password".to_string()))
@@ -1421,7 +1616,10 @@ impl ForwardProxy {
     }
 
     /// Static helper method to find relay proxy for a domain
-    fn find_relay_proxy_for_domain_static(relay_proxies: &[RelayProxyWithAuth], host: &str) -> Option<RelayProxyWithAuth> {
+    fn find_relay_proxy_for_domain_static(
+        relay_proxies: &[RelayProxyWithAuth],
+        host: &str,
+    ) -> Option<RelayProxyWithAuth> {
         for relay in relay_proxies {
             if relay.domains.is_empty() {
                 return Some(relay.clone());
@@ -1480,7 +1678,6 @@ impl ForwardProxy {
         };
         proxy.handle_connect_tunnel(req, client_ip).await
     }
-
 }
 
 // TLS configuration is now handled by TlsConfig::create_config in common.rs
@@ -1488,8 +1685,8 @@ impl ForwardProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::{Method, Uri};
     use http_body_util::Empty;
+    use hyper::{Method, Uri};
 
     #[test]
     fn test_target_uri_extraction() {
@@ -1510,23 +1707,47 @@ mod tests {
     #[test]
     fn test_no_proxy_pattern_matching() {
         // Test exact domain match
-        assert!(ForwardProxy::matches_no_proxy_pattern("example.com", &["example.com".to_string()]));
+        assert!(ForwardProxy::matches_no_proxy_pattern(
+            "example.com",
+            &["example.com".to_string()]
+        ));
 
         // Test subdomain match with plain domain
-        assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &["example.com".to_string()]));
+        assert!(ForwardProxy::matches_no_proxy_pattern(
+            "sub.example.com",
+            &["example.com".to_string()]
+        ));
 
         // Test wildcard pattern
-        assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &["*.example.com".to_string()]));
-        assert!(!ForwardProxy::matches_no_proxy_pattern("example.com", &["*.example.com".to_string()]));
+        assert!(ForwardProxy::matches_no_proxy_pattern(
+            "sub.example.com",
+            &["*.example.com".to_string()]
+        ));
+        assert!(!ForwardProxy::matches_no_proxy_pattern(
+            "example.com",
+            &["*.example.com".to_string()]
+        ));
 
         // Test dot prefix pattern
-        assert!(ForwardProxy::matches_no_proxy_pattern("sub.example.com", &[".example.com".to_string()]));
-        assert!(!ForwardProxy::matches_no_proxy_pattern("example.com", &[".example.com".to_string()]));
+        assert!(ForwardProxy::matches_no_proxy_pattern(
+            "sub.example.com",
+            &[".example.com".to_string()]
+        ));
+        assert!(!ForwardProxy::matches_no_proxy_pattern(
+            "example.com",
+            &[".example.com".to_string()]
+        ));
 
         // Test no match
-        assert!(!ForwardProxy::matches_no_proxy_pattern("other.com", &["example.com".to_string()]));
+        assert!(!ForwardProxy::matches_no_proxy_pattern(
+            "other.com",
+            &["example.com".to_string()]
+        ));
 
         // Test case insensitivity
-        assert!(ForwardProxy::matches_no_proxy_pattern("EXAMPLE.COM", &["example.com".to_string()]));
+        assert!(ForwardProxy::matches_no_proxy_pattern(
+            "EXAMPLE.COM",
+            &["example.com".to_string()]
+        ));
     }
 }

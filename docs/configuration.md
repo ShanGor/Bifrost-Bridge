@@ -128,7 +128,10 @@ restart. The command is currently Unix-only because it uses `SIGHUP` and a PID f
   "private_key": null,
   "certificate": null,
   "connection_pool_enabled": true,
-  "pool_max_idle_per_host": 10
+  "reverse_proxy_config": {
+    "pool_max_idle_per_host": 10,
+    "pool_idle_timeout_secs": 90
+  }
 }
 ```
 
@@ -136,17 +139,21 @@ restart. The command is currently Unix-only because it uses `SIGHUP` and a PID f
 
 | Field | Type | Description | Default |
 |-------|------|-------------|---------|
-| `mode` | String | Proxy mode: `"Forward"`, `"Reverse"`, or `"Combined"` | `"Forward"` |
-| `listen_addr` | String | Server listen address | `"127.0.0.1:8080"` |
-| `max_connections` | Number | Maximum concurrent connections | `1000` |
-| `timeout_secs` | Number | Connection timeout in seconds | `30` |
+| `mode` | String | Proxy mode: `"Forward"` or `"Reverse"` | Required in JSON; CLI default is `"Forward"` |
+| `listen_addr` | String | Server listen address | Required in JSON; CLI default is `"127.0.0.1:8080"` |
+| `max_connections` | Number | Maximum simultaneous accepted client connections | `1000` |
+| `max_header_size` | Number | Maximum HTTP/1 request-header buffer in bytes; must be at least 8192 | `16384` |
+| `connect_timeout_secs` | Number | Timeout for establishing upstream connections | `10` |
+| `idle_timeout_secs` | Number | Forward pool idle timeout; also the reverse pool default unless `reverse_proxy_config` overrides it | `90` |
+| `max_connection_lifetime_secs` | Number | Maximum lifetime of accepted HTTP, CONNECT, and upgraded connections | `300` |
+| `timeout_secs` | Number | Legacy connect timeout in seconds | unset |
 | `reverse_proxy_target` | String | Legacy single target for reverse proxy (use `reverse_proxy_routes` instead) | `null` |
 | `reverse_proxy_routes` | Array | Route list for reverse proxy (id, target, predicates, optional strip/pooling) | `[]` |
 | `static_files` | Object | Static file serving configuration | `null` |
 | `private_key` | String | Path to PKCS#8 PEM format private key file for HTTPS | `null` |
 | `certificate` | String | Path to PEM format certificate file for HTTPS | `null` |
 | `connection_pool_enabled` | Boolean | Enable HTTP connection pooling for forward proxy | `true` |
-| `pool_max_idle_per_host` | Number | Maximum idle connections per host for connection pooling | `10` |
+| `reverse_proxy_config` | Object | Reverse-proxy pool configuration (`pool_max_idle_per_host`, `pool_idle_timeout_secs`, optional health check) | pool size `10`, idle timeout `90` |
 | `logging` | Object | Logging configuration (see below) | Default console logging |
 | `monitoring` | Object | Monitoring endpoints configuration (see below) | Enabled with default endpoints |
 
@@ -448,7 +455,7 @@ Once enabled, the monitoring server exposes all three endpoints on the configure
 | `enabled` | Boolean | Toggle WebSocket proxying | `true` |
 | `allowed_origins` | Array | Allowed `Origin` values (`"*"` permits all) | `["*"]` |
 | `supported_protocols` | Array | Allowed `Sec-WebSocket-Protocol` values (empty = any) | `[]` |
-| `timeout_seconds` | Number | Idle timeout for upgraded tunnels | `300` |
+| `timeout_seconds` | Number | Maximum duration for upgraded tunnels | `300` |
 
 The forward proxy supports direct WebSocket upgrades (and WSS via the existing CONNECT tunnel). Reverse proxy upgrades are automatically bridged to the backend using the same configuration. Relay proxies do not yet support WebSocket upgrades.
 
@@ -592,13 +599,11 @@ Mount configurations inherit values from the parent `static_files` configuration
       {
         "path": "/",
         "root_dir": "./frontend/dist"
-        // Inherits: spa_mode=true, enable_directory_listing=false, etc.
       },
       {
         "path": "/docs",
         "root_dir": "./api-docs",
         "enable_directory_listing": true
-        // Inherits: spa_mode=true, but overrides directory listing
       }
     ]
   }
@@ -700,17 +705,18 @@ When running in reverse proxy mode, the server automatically adds several HTTP h
 
 | Header | Description | Example |
 |--------|-------------|---------|
-| `X-Forwarded-For` | Client IP address (extracted from connection) | `X-Forwarded-For: 192.168.1.100` |
-| `X-Forwarded-Proto` | Protocol used by client | `X-Forwarded-Proto: https` |
+| `X-Forwarded-For` | Client IP address appended to any received forwarding chain | `X-Forwarded-For: 192.0.2.1, 192.168.1.100` |
+| `X-Forwarded-Proto` | Protocol used by the client connection | `X-Forwarded-Proto: https` |
 | `X-Forwarded-Host` | Original Host header | `X-Forwarded-Host: example.com` |
-| `X-Proxy-Server` | Proxy server identification | `X-Proxy-Server: rust-reverse-proxy` |
+
+Responses from the reverse proxy include `X-Proxy-Server: rust-reverse-proxy`.
 
 ### Important Notes
 
-- **Client IP Extraction:** The `X-Forwarded-For` header contains the actual client IP address extracted from the TCP connection, not a hardcoded value
+- **Client IP Extraction:** The final `X-Forwarded-For` entry is the client IP extracted from the TCP connection, not a hardcoded value
 - **Backend Access:** Backend servers can use the `X-Forwarded-For` header to log the real client IP addresses
 - **Security:** The actual client IP is critical for access control, rate limiting, and security auditing
-- **Multiple Proxies:** If requests pass through multiple proxies, this header preserves the entire chain
+- **Multiple Proxies:** If requests pass through multiple proxies, the existing forwarding chain is preserved and the direct client is appended
 
 ### Example Backend Usage
 
@@ -887,5 +893,5 @@ This example shows a development setup with custom logging configuration:
 
 ---
 
-**Last Updated:** 2026-03-01
+**Last Updated:** 2026-09-20
 **See Also:** [Examples](../examples/), [CLI Reference](../README.md)

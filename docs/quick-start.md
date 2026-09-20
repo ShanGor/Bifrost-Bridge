@@ -27,7 +27,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```bash
 git clone <repository-url>
-cd proxy-server
+cd Bifrost-Bridge
 cargo build --release
 ```
 
@@ -196,8 +196,8 @@ cargo run -- --config examples/config_development.json
 # Production
 cargo run -- --config examples/config_production.json
 
-# Testing
-cargo run -- --config examples/config_test.json
+# Forward-proxy test configuration
+cargo run -- --config examples/config_forward.json
 ```
 
 ## 🔍 Troubleshooting
@@ -248,4 +248,4 @@ curl -I http://127.0.0.1:8080/
 
 **Need help?** Check the [troubleshooting section](#troubleshooting) or open an issue.
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2026-09-20

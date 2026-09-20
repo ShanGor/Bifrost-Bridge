@@ -1,5 +1,6 @@
 use crate::common::{
-    FileBody, IsolatedWorker, MonitoringHandles, ProxyType, ResponseBuilder, TlsConfig,
+    FileBody, IsolatedWorker, MIN_HTTP1_HEADER_BUFFER_SIZE, MonitoringHandles, ProxyType,
+    ResponseBuilder, ServerLimits, TlsConfig,
 };
 use crate::config::{Config, ProxyMode, RelayProxyConfig};
 use crate::error::{ContextualError, ErrorContext, ProxyError};
@@ -62,6 +63,20 @@ impl ProxyFactory {
         let monitoring_handles = MonitoringHandles::new();
         let monitoring_config = config.monitoring.clone();
         let rate_limiter = Arc::new(RateLimiter::new(config.rate_limiting.clone()));
+        let max_connections = config.max_connections.unwrap_or(1000);
+        let max_header_size = config.max_header_size.unwrap_or(16 * 1024);
+        if max_connections == 0 {
+            return Err(ProxyError::Config(
+                "max_connections must be greater than 0".to_string(),
+            ));
+        }
+        if max_header_size < MIN_HTTP1_HEADER_BUFFER_SIZE {
+            return Err(ProxyError::Config(format!(
+                "max_header_size must be at least {} bytes",
+                MIN_HTTP1_HEADER_BUFFER_SIZE
+            )));
+        }
+        let server_limits = ServerLimits::new(max_connections, max_header_size);
 
         let proxy: Box<dyn Proxy + Send> = match config.mode {
             ProxyMode::Forward => {
@@ -106,7 +121,8 @@ impl ProxyFactory {
                     config.proxy_password,
                     config.websocket.clone(),
                     rate_limiter.clone(),
-                );
+                )
+                .with_server_limits(server_limits.clone());
 
                 Box::new(ForwardProxyAdapter {
                     proxy,
@@ -129,10 +145,11 @@ impl ProxyFactory {
                     );
                     let handler = StaticFileHandler::new(static_config)?
                         .with_metrics(monitoring_handles.static_metrics());
-                    Box::new(StaticFileProxyAdapter {
-                        handler,
-                        tls_config: tls_config.clone(),
-                        rate_limiter: rate_limiter.clone(),
+                Box::new(StaticFileProxyAdapter {
+                    handler,
+                    tls_config: tls_config.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                    server_limits: server_limits.clone(),
                     })
                 } else if config.static_files.is_some()
                     && (config.reverse_proxy_target.is_some() || !reverse_routes.is_empty())
@@ -179,17 +196,17 @@ impl ProxyFactory {
                         )?
                     }
                     .with_metrics(monitoring_handles.reverse_metrics())
-                    .with_rate_limiter(rate_limiter.clone());
+                    .with_rate_limiter(rate_limiter.clone())
+                    .with_server_limits(server_limits.clone());
 
                     // Build unified route table
                     let mut route_table = Vec::new();
 
                     // Add static mounts to route table
-                    for (idx, mount) in static_config.mounts.iter().enumerate() {
+                    for mount in &static_config.mounts {
                         let resolved = mount.resolve_inheritance(&static_config);
                         route_table.push(RouteEntry::StaticMount {
                             order: resolved.order,
-                            mount_index: idx,
                             path: resolved.path.clone(),
                         });
                     }
@@ -230,6 +247,7 @@ impl ProxyFactory {
                         tls_config: tls_config.clone(),
                         rate_limiter: rate_limiter.clone(),
                         route_table,
+                        server_limits: server_limits.clone(),
                     })
                 } else {
                     // Reverse proxy only mode
@@ -271,7 +289,8 @@ impl ProxyFactory {
                         )?
                     }
                     .with_metrics(monitoring_handles.reverse_metrics())
-                    .with_rate_limiter(rate_limiter.clone());
+                    .with_rate_limiter(rate_limiter.clone())
+                    .with_server_limits(server_limits.clone());
                     Box::new(ReverseProxyAdapter {
                         proxy,
                         tls_config: tls_config.clone(),
@@ -372,6 +391,7 @@ struct StaticFileProxyAdapter {
     handler: StaticFileHandler,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     rate_limiter: Arc<RateLimiter>,
+    server_limits: ServerLimits,
 }
 
 impl StaticFileProxyAdapter {
@@ -403,6 +423,7 @@ impl Proxy for StaticFileProxyAdapter {
             let handler = Arc::new(self.handler);
             let tls_config = self.tls_config;
             let rate_limiter = self.rate_limiter.clone();
+            let server_limits = self.server_limits.clone();
 
             match tls_config {
                 Some(tls_config) => {
@@ -420,12 +441,18 @@ impl Proxy for StaticFileProxyAdapter {
                             _ = shutdown.cancelled() => return Ok(()),
                             result = listener.accept() => result.map_err(ProxyError::Io)?,
                         };
+                        let Some(connection_permit) = server_limits.try_acquire() else {
+                            warn!("Static server connection limit reached; rejecting {}", remote_addr);
+                            continue;
+                        };
+                        let max_header_size = server_limits.max_header_size();
                         let acceptor = acceptor.clone();
                         let handler_ref = handler.clone();
                         let rate_limiter = rate_limiter.clone();
                         let client_ip = remote_addr.ip().to_string();
 
                         tokio::spawn(async move {
+                            let _connection_permit = connection_permit;
                             match acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
                                     let service = service_fn(move |req| {
@@ -464,6 +491,7 @@ impl Proxy for StaticFileProxyAdapter {
                                     });
 
                                     if let Err(e) = ServerBuilder::new()
+                                        .max_buf_size(max_header_size)
                                         .keep_alive(true)
                                         .serve_connection(TokioIo::new(tls_stream), service)
                                         .await
@@ -496,14 +524,21 @@ impl Proxy for StaticFileProxyAdapter {
                             _ = shutdown.cancelled() => return Ok(()),
                             result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
                         };
+                        let Some(connection_permit) = server_limits.try_acquire() else {
+                            warn!("Static server connection limit reached; rejecting {}", remote_addr);
+                            continue;
+                        };
+                        let max_header_size = server_limits.max_header_size();
 
                         let handler = handler.clone();
                         let rate_limiter = rate_limiter.clone();
                         let client_ip = remote_addr.ip().to_string();
                         tokio::spawn(async move {
+                            let _connection_permit = connection_permit;
                             let io = TokioIo::new(stream);
 
                             if let Err(err) = ServerBuilder::new()
+                                .max_buf_size(max_header_size)
                                 .serve_connection(
                                     io,
                                     service_fn(move |req| {
@@ -556,7 +591,6 @@ impl Proxy for StaticFileProxyAdapter {
 enum RouteEntry {
     StaticMount {
         order: u32,
-        mount_index: usize,
         path: String,
     },
     ReverseProxy {
@@ -580,6 +614,7 @@ struct CombinedProxyAdapter {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     rate_limiter: Arc<RateLimiter>,
     route_table: Vec<RouteEntry>,
+    server_limits: ServerLimits,
 }
 
 impl CombinedProxyAdapter {
@@ -590,10 +625,12 @@ impl CombinedProxyAdapter {
         route_table: &[RouteEntry],
         req: hyper::Request<Incoming>,
         remote_addr: SocketAddr,
+        is_tls: bool,
     ) -> Result<Response<FileBody>, Infallible> {
         let request_path = req.uri().path().to_string();
         let context = crate::reverse_proxy::RequestContext {
             client_ip: Some(remote_addr.ip().to_string()),
+            is_tls,
         };
 
         // Iterate through route table in order
@@ -601,42 +638,39 @@ impl CombinedProxyAdapter {
             match entry {
                 RouteEntry::StaticMount { path, .. } => {
                     // Check if request path matches this static mount
-                    if path == "/" || request_path.starts_with(path) {
-                        if let Some((_mount_info, _relative_path)) =
-                            static_handler.find_mount_for_path(&request_path)
-                        {
-                            match static_handler.handle_request(&req).await {
-                                Ok(response) => {
-                                    // Static file found and served successfully
-                                    return Ok::<_, Infallible>(response);
-                                }
-                                Err(ProxyError::NotFound(_)) => {
-                                    // Static file not found, continue to next route
-                                    debug!(
-                                        "Static file not found for path {}, continuing to next route",
-                                        request_path
-                                    );
-                                    continue;
-                                }
-                                Err(_) => {
-                                    // Other error, return 500
-                                    return Ok::<_, Infallible>(
-                                        Response::builder()
-                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                            .body(FileBody::InMemory(Full::new(Bytes::from(
-                                                "Internal Server Error",
-                                            ))))
-                                            .unwrap(),
-                                    );
-                                }
+                    if StaticFileHandler::path_matches_mount(&request_path, path) {
+                        match static_handler.handle_request_for_mount(&req, path).await {
+                            Ok(response) if response.status() != StatusCode::NOT_FOUND => {
+                                return Ok::<_, Infallible>(response);
+                            }
+                            Ok(_) | Err(ProxyError::NotFound(_)) => {
+                                debug!(
+                                    "Static file not found for path {}, continuing to next route",
+                                    request_path
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                return Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(FileBody::InMemory(Full::new(Bytes::from(
+                                            "Internal Server Error",
+                                        ))))
+                                        .unwrap(),
+                                );
                             }
                         }
                     }
                 }
-                RouteEntry::ReverseProxy { .. } => {
-                    // Try reverse proxy - this consumes req, so we must return here
+                RouteEntry::ReverseProxy { route_id, .. } => {
+                    if !reverse_proxy.route_matches(route_id, &req, &context) {
+                        continue;
+                    }
+                    // A matching reverse route consumes the request, so the
+                    // selected upstream response is final for this route.
                     match reverse_proxy
-                        .handle_request_with_context(req, context)
+                        .handle_request_for_route(route_id, req, context)
                         .await
                     {
                         Ok(response) => {
@@ -684,6 +718,7 @@ impl Proxy for CombinedProxyAdapter {
             let static_handler = Arc::new(self.static_handler);
             let rate_limiter = self.rate_limiter.clone();
             let route_table = Arc::new(self.route_table);
+            let server_limits = self.server_limits.clone();
 
             match tls_config {
                 Some(tls_config) => {
@@ -701,6 +736,11 @@ impl Proxy for CombinedProxyAdapter {
                             _ = shutdown.cancelled() => return Ok(()),
                             result = listener.accept() => result.map_err(ProxyError::Io)?,
                         };
+                        let Some(connection_permit) = server_limits.try_acquire() else {
+                            warn!("Combined proxy connection limit reached; rejecting {}", remote_addr);
+                            continue;
+                        };
+                        let max_header_size = server_limits.max_header_size();
                         let acceptor = acceptor.clone();
                         let reverse_proxy_ref = reverse_proxy.clone();
                         let static_handler_ref = static_handler.clone();
@@ -709,6 +749,7 @@ impl Proxy for CombinedProxyAdapter {
                         let client_ip = remote_addr.ip().to_string();
 
                         tokio::spawn(async move {
+                            let _connection_permit = connection_permit;
                             match acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
                                     let service = service_fn(move |req| {
@@ -748,12 +789,14 @@ impl Proxy for CombinedProxyAdapter {
                                                 &route_table,
                                                 req,
                                                 remote_addr,
+                                                true,
                                             )
                                             .await
                                         }
                                     });
 
                                     if let Err(e) = ServerBuilder::new()
+                                        .max_buf_size(max_header_size)
                                         .keep_alive(true)
                                         .serve_connection(TokioIo::new(tls_stream), service)
                                         .with_upgrades()
@@ -787,6 +830,11 @@ impl Proxy for CombinedProxyAdapter {
                             _ = shutdown.cancelled() => return Ok(()),
                             result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
                         };
+                        let Some(connection_permit) = server_limits.try_acquire() else {
+                            warn!("Combined proxy connection limit reached; rejecting {}", remote_addr);
+                            continue;
+                        };
+                        let max_header_size = server_limits.max_header_size();
 
                         let reverse_proxy = reverse_proxy.clone();
                         let static_handler = static_handler.clone();
@@ -794,9 +842,11 @@ impl Proxy for CombinedProxyAdapter {
                         let route_table = route_table.clone();
                         let client_ip = remote_addr.ip().to_string();
                         tokio::spawn(async move {
+                            let _connection_permit = connection_permit;
                             let io = TokioIo::new(stream);
 
                             if let Err(err) = ServerBuilder::new()
+                                .max_buf_size(max_header_size)
                                 .serve_connection(
                                     io,
                                     service_fn(move |req| {
@@ -832,6 +882,7 @@ impl Proxy for CombinedProxyAdapter {
                                                 &route_table,
                                                 req,
                                                 remote_addr,
+                                                false,
                                             ).await
                                         }
                                     })
@@ -887,10 +938,20 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_factory_rejects_invalid_listener_limits() {
+        let mut config = Config::default();
+        config.max_connections = Some(0);
+        assert!(ProxyFactory::create_proxy(config).is_err());
+
+        let mut config = Config::default();
+        config.max_header_size = Some(1024);
+        assert!(ProxyFactory::create_proxy(config).is_err());
+    }
+
+    #[test]
     fn test_route_entry_order() {
         let static_entry = RouteEntry::StaticMount {
             order: 100,
-            mount_index: 0,
             path: "/".to_string(),
         };
         let proxy_entry = RouteEntry::ReverseProxy {
@@ -908,7 +969,6 @@ mod tests {
         let mut routes = vec![
             RouteEntry::StaticMount {
                 order: 100,
-                mount_index: 0,
                 path: "/".to_string(),
             },
             RouteEntry::ReverseProxy {
@@ -917,7 +977,6 @@ mod tests {
             },
             RouteEntry::StaticMount {
                 order: 10,
-                mount_index: 1,
                 path: "/admin".to_string(),
             },
         ];

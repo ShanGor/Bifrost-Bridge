@@ -1,6 +1,6 @@
 # Plugin Design
 
-**Status:** Proposed design. Bifrost Bridge does not yet load or execute plugins.
+**Status:** Partially implemented. Bifrost Bridge loads signed QuickJS access plugins; the identity exchange, sensitive cache, remote JWT verification, and asynchronous host PDK described here remain proposed.
 
 This document describes a programmable gateway extension model for organizations that need
 company-specific authentication, authorization, and request transformation. It uses QuickJS for

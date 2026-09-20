@@ -689,7 +689,12 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         relay_proxy_domain_suffixes: None,
         proxy_username: args.proxy_username.clone(),
         proxy_password: args.proxy_password.clone(),
-        reverse_proxy_config: None,
+        reverse_proxy_config: args.pool_max_idle.map(|pool_max_idle_per_host| {
+            bifrost_bridge::config::ReverseProxyConfig {
+                pool_max_idle_per_host,
+                ..Default::default()
+            }
+        }),
         logging: None,
         monitoring: bifrost_bridge::config::MonitoringConfig::default(),
         websocket: None,
@@ -771,6 +776,19 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
 }
 
 fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.max_connections == Some(0) {
+        return Err("max_connections must be greater than 0".into());
+    }
+    if let Some(max_header_size) = config.max_header_size {
+        if max_header_size < bifrost_bridge::common::MIN_HTTP1_HEADER_BUFFER_SIZE {
+            return Err(format!(
+                "max_header_size must be at least {} bytes",
+                bifrost_bridge::common::MIN_HTTP1_HEADER_BUFFER_SIZE
+            )
+            .into());
+        }
+    }
+
     match config.mode {
         ProxyMode::Reverse => {
             let has_target = config.reverse_proxy_target.is_some();
@@ -887,6 +905,21 @@ mod config_validation_tests {
         };
 
         assert_eq!(effective_worker_threads(&config), Some(8));
+    }
+
+    #[test]
+    fn listener_limits_are_validated() {
+        let no_connections = Config {
+            max_connections: Some(0),
+            ..Default::default()
+        };
+        assert!(validate_config(&no_connections).is_err());
+
+        let small_header_buffer = Config {
+            max_header_size: Some(1024),
+            ..Default::default()
+        };
+        assert!(validate_config(&small_header_buffer).is_err());
     }
 
     #[cfg(unix)]

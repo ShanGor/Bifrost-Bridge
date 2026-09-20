@@ -26,7 +26,7 @@ A high-performance proxy server written in Rust that can function as both a forw
 
 ```bash
 git clone <repository-url>
-cd proxy-server
+cd Bifrost-Bridge
 cargo build --release
 ```
 
@@ -97,9 +97,10 @@ echo "relay-secret" | cargo run -- --encrypt
    Use `cargo run -- --encrypt <payload>` to encrypt short secrets. When `<payload>` is omitted the CLI reads from stdin, so you can pipe secrets from external tools:
    ```bash
    $ echo "relayPassword!" | cargo run -- --encrypt
-   {encrypted}QmFzZTY0Tm9uY2VDb2RlCg==
+   {encrypted}<base64 nonce-and-ciphertext>
    ```
-   Copy the full `{encrypted}...` token.
+   The encrypted output is randomized and differs on every run. Copy the exact token emitted by
+   your command; the text above is only a shape example.
 
 3. **Reference in Config**  
    Place the token anywhere a secret is expected in `config.json`, for example:
@@ -108,7 +109,7 @@ echo "relay-secret" | cargo run -- --encrypt
      "relay_proxies": [{
        "relay_proxy_url": "https://relay.internal:8443",
        "relay_proxy_username": "service",
-       "relay_proxy_password": "{encrypted}QmFzZTY0Tm9uY2VDb2RlCg=="
+       "relay_proxy_password": "{encrypted}<token emitted by --encrypt>"
      }]
    }
    ```
@@ -322,10 +323,11 @@ Run with `cargo run -- --mode reverse --listen 127.0.0.1:8080 -c your-config.jso
 
 The reverse proxy automatically adds the following headers:
 
-- `X-Forwarded-For`: Client IP address
-- `X-Forwarded-Proto`: Protocol used by client
+- `X-Forwarded-For`: Existing forwarding chain with the direct client IP appended
+- `X-Forwarded-Proto`: Client-side protocol (`http` or `https`)
 - `X-Forwarded-Host`: Original Host header
-- `X-Proxy-Server`: Proxy server identification
+
+Backend responses include `X-Proxy-Server: rust-reverse-proxy`.
 
 ### WebSocket / WSS Support
 
@@ -713,13 +715,7 @@ curl http://localhost:8080
 
 Potential improvements for production use:
 
-- HTTPS/TLS support
-- Authentication and authorization
-- Load balancing for multiple backends
-- Health checking
-- Metrics and monitoring
 - Web interface for configuration
-- WebSocket proxying
 - HTTP/2 support
 
 ## Documentation

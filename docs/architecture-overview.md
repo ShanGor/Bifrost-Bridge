@@ -35,8 +35,8 @@ Only one adapter runs at a time:
 | `reverse` + static only   | `StaticFileProxyAdapter` | Static file serving with SPA fallback and optional HTTPS              |
 | `reverse` + static combo  | `CombinedProxyAdapter`   | Routes requests to static handler or backend on the same listener     |
 
-> **Note:** `docs/worker-separation-architecture.md` outlines an experimental multi-worker design.
-> That design is not part of the shipping binary today.
+> **Note:** The experimental worker-separation types live in `src/common.rs`; they are not part of
+> the shipping request path today.
 
 ## Request Flows
 

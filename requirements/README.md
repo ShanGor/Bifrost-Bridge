@@ -31,7 +31,7 @@ This folder contains all requirements, feature requests, and implementation deta
 | [R023](R023-connection-pooling-optimization.md) | Connection Pooling Optimization | Optimize forward/reverse pooling and health checks | 2025-01-18 |
 | [R024](R024-secret-encryption.md) | Encrypted Secret Management | Add key generation + encrypted secrets workflow for configurations | 2025-02-14 |
 | [R025](R025-reverse-proxy-requirements.md) | Reverse Proxy Request Routing | Multi-route reverse proxy with predicate-based matching | 2025-02-21 |
-| [R026](R026-multi-target-reverse-proxy.md) | Multi-target reverse proxy routing | Load balancing and sticky routing across multiple upstreams | 2025-02-25 |
+| [R026](R026-multi-target-reverse-proxy.md) | Multi-target reverse proxy routing | ⚠️ Partially implemented; core routing is available, but observability and coverage work remains | 2025-02-25 |
 | [R027](R027-env-variable-interpolation.md) | Environment Variable Interpolation | Resolve `$VAR` and `${VAR}` placeholders in config string values | 2026-03-01 |
 
 ### 📝 **Pending Requirements**
@@ -65,11 +65,11 @@ requirements/
 ├── R013-client-ip-detection.md        # Detailed requirement
 ├── R014-configurable-thread-pool.md   # Detailed requirement
 ├── R015-logging-system.md             # Detailed requirement
-├── R016-performance-monitoring.md     # Pending requirement
-├── R017-websocket-support.md          # Pending requirement
-├── R018-rate-limiting.md              # Pending requirement
-├── R019-health-check-endpoint.md      # Pending requirement
-├── R020-documentation-maintenance.md  # Pending requirement
+├── R016-performance-monitoring.md     # Completed requirement
+├── R017-websocket-support.md          # Completed requirement
+├── R018-rate-limiting.md              # Completed requirement
+├── R019-health-check-endpoint.md      # Duplicated by R016
+├── R020-documentation-maintenance.md  # Ongoing requirement
 ├── R021-tokio-worker-threads.md       # Detailed requirement
 ├── R022-advanced-cache-control.md      # Detailed requirement
 ├── R023-connection-pooling-optimization.md # Detailed requirement
@@ -95,6 +95,6 @@ requirements/
 
 ---
 
-**Last Updated:** 2026-03-01
+**Last Updated:** 2026-09-20
 **Maintainer:** Development Team
-**Total Requirements:** 27 (25 Completed, 2 Pending)
+**Total Requirements:** 27 (24 completed, 1 partially implemented, 2 ongoing/duplicated)

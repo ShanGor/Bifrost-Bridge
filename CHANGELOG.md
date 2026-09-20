@@ -26,8 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated example configurations to use inheritance
 - Improved code organization and documentation
 - Health check default port now respects the target URL scheme (443 for HTTPS/WSS)
+- Listener `max_connections`, `max_header_size`, and connection-lifetime settings are now enforced
+  consistently across forward, reverse, static, and combined adapters
+- Static-file JSON configuration now supplies documented defaults for omitted parent settings
 
 ### Fixed
+- Combined static/reverse routing now honors mount boundaries, static 404 fallthrough, and the
+  specific reverse route selected by `order`
+- Wired `--pool-max-idle` into reverse-proxy pool configuration
+- Preserved existing `X-Forwarded-For` chains and derived `X-Forwarded-Proto` from listener TLS
+- Repaired static mount tests that depended on a missing `test-temp` directory
+- Reconciled stale TLS, plugin, requirements-status, binary-name, and configuration documentation
 - **Client IP Detection Fix** (R014)
   - Fixed hardcoded "127.0.0.1" client IP in reverse proxy to extract actual client IP from connection
   - Now properly sets X-Forwarded-For header with real client IP address

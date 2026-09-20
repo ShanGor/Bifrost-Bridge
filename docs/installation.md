@@ -53,7 +53,7 @@ cargo --version
 #### 3. Clone and Build
 ```bash
 git clone <repository-url>
-cd proxy-server
+cd Bifrost-Bridge
 cargo build --release
 ```
 
@@ -61,23 +61,23 @@ cargo build --release
 
 ```bash
 # When published to crates.io
-cargo install proxy-server
+cargo install bifrost-bridge
 
 # Install from git repository
-cargo install --git <repository-url> proxy-server
+cargo install --git <repository-url> bifrost-bridge
 ```
 
 ### Method 3: Download Binary Release (Future Release)
 
 ```bash
 # Download pre-compiled binary for your platform
-wget https://github.com/user/proxy-server/releases/latest/download/proxy-server-linux-x64.tar.gz
+wget https://github.com/your-org/Bifrost-Bridge/releases/latest/download/bifrost-bridge-linux-x64.tar.gz
 
 # Extract
-tar -xzf proxy-server-linux-x64.tar.gz
+tar -xzf bifrost-bridge-linux-x64.tar.gz
 
 # Install
-sudo cp proxy-server /usr/local/bin/
+sudo cp bifrost-bridge /usr/local/bin/
 ```
 
 ## 🏗️ Building from Source
@@ -92,7 +92,7 @@ sudo cp proxy-server /usr/local/bin/
 #### 1. Clone Repository
 ```bash
 git clone <repository-url>
-cd proxy-server
+cd Bifrost-Bridge
 ```
 
 #### 2. Development Build
@@ -113,8 +113,8 @@ cargo check
 cargo build --release
 
 # Binary location
-# Windows: target/release/proxy-server.exe
-# Unix: target/release/proxy-server
+# Windows: target/release/bifrost-bridge.exe
+# Unix: target/release/bifrost-bridge
 ```
 
 ### Build Options
@@ -138,16 +138,16 @@ cargo build --release --no-default-features
 ### 1. Create Configuration Directory
 ```bash
 # Create config directory
-mkdir -p ~/.config/proxy-server
+mkdir -p ~/.config/bifrost-bridge
 
 # Or use /etc for system-wide
-sudo mkdir -p /etc/proxy-server
+sudo mkdir -p /etc/bifrost-bridge
 ```
 
 ### 2. Create Basic Configuration
 ```bash
 # Create basic config file
-cat > ~/.config/proxy-server/config.json << EOF
+cat > ~/.config/bifrost-bridge/config.json << EOF
 {
   "mode": "Reverse",
   "listen_addr": "127.0.0.1:8080",
@@ -167,7 +167,7 @@ EOF
 ### 3. Create Systemd Service (Linux)
 ```bash
 # Create service file
-sudo tee /etc/systemd/system/proxy-server.service > /dev/null << EOF
+sudo tee /etc/systemd/system/bifrost-bridge.service > /dev/null << EOF
 [Unit]
 Description=Proxy Server
 After=network.target
@@ -175,8 +175,8 @@ After=network.target
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/opt/proxy-server
-ExecStart=/opt/proxy-server/proxy-server --config /etc/proxy-server/config.json
+WorkingDirectory=/opt/bifrost-bridge
+ExecStart=/opt/bifrost-bridge/bifrost-bridge --config /etc/bifrost-bridge/config.json
 Restart=always
 RestartSec=5
 
@@ -185,8 +185,8 @@ WantedBy=multi-user.target
 EOF
 
 # Enable and start service
-sudo systemctl enable proxy-server
-sudo systemctl start proxy-server
+sudo systemctl enable bifrost-bridge
+sudo systemctl start bifrost-bridge
 ```
 
 ### 4. Create Windows Service
@@ -194,7 +194,7 @@ sudo systemctl start proxy-server
 # Using NSSM (Non-Sucking Service Manager)
 # Download from https://nssm.cc/download
 
-nssm install ProxyServer "C:\path\to\proxy-server.exe" --config "C:\path\to\config.json"
+nssm install BifrostBridge "C:\path\to\bifrost-bridge.exe" --config "C:\path\to\config.json"
 nssm start ProxyServer
 ```
 
@@ -203,10 +203,10 @@ nssm start ProxyServer
 ### 1. Test Installation
 ```bash
 # Check if binary is available
-proxy-server --version
+bifrost-bridge --version
 
 # Show help
-proxy-server --help
+bifrost-bridge --help
 ```
 
 ### 2. Test Basic Functionality
@@ -216,7 +216,7 @@ mkdir -p /tmp/test-site
 echo "<h1>Hello World</h1>" > /tmp/test-site/index.html
 
 # Start server
-proxy-server --mode reverse --listen 127.0.0.1:8080 --static-dir /tmp/test-site
+bifrost-bridge --mode reverse --listen 127.0.0.1:8080 --static-dir /tmp/test-site
 
 # Test in another terminal
 curl http://127.0.0.1:8080/
@@ -225,7 +225,7 @@ curl http://127.0.0.1:8080/
 ### 3. Test Configuration File
 ```bash
 # Test with config file
-proxy-server --config /path/to/config.json
+bifrost-bridge --config /path/to/config.json
 
 # Verify server is running
 curl -I http://127.0.0.1:8080/
@@ -269,7 +269,7 @@ sudo yum install openssl-devel
 #### 3. Runtime Issues
 ```bash
 # Check logs with debug output
-RUST_LOG=debug proxy-server --config config.json
+RUST_LOG=debug bifrost-bridge --config config.json
 
 # Check configuration syntax
 cat config.json | python -m json.tool
@@ -291,7 +291,7 @@ netstat -ano | findstr :8080
 kill -9 <PID>
 
 # Or use different port
-proxy-server --listen 127.0.0.1:3000
+bifrost-bridge --listen 127.0.0.1:3000
 ```
 
 ### Performance Issues
@@ -331,4 +331,4 @@ ulimit -n
 - Configuration file (remove sensitive data)
 - Error messages and logs
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2026-09-20

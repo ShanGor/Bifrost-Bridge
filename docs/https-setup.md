@@ -19,16 +19,14 @@ The proxy server supports HTTPS/TLS using the rustls library. When both `private
 **Currently Supported:**
 - ✅ Static file serving (reverse proxy mode without backend target)
 - ✅ Forward proxy mode (HTTPS implemented)
-- 🔄 Reverse proxy mode (HTTPS support planned)
-
-For reverse proxy mode with backend target, HTTPS configuration is accepted but not yet implemented. The server will run in HTTP mode for these configurations.
+- ✅ Reverse proxy mode, including TLS termination for HTTPS/WSS clients and TLS connections to HTTPS/WSS backends
 
 ### How it Works
 
 1. **TLS Termination**: The proxy server handles TLS encryption/decryption
 2. **Certificate Validation**: Server presents its certificate to clients
 3. **Secure Communication**: All traffic between clients and the proxy is encrypted
-4. **Backend Communication**: Proxy-to-backend communication remains HTTP unless otherwise configured
+4. **Backend Communication**: Proxy-to-backend communication uses the target URL scheme (`http`/`ws` or `https`/`wss`)
 
 ## 📄 Certificate Formats
 
@@ -274,8 +272,8 @@ After=network.target
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/opt/proxy-server
-ExecStart=/opt/proxy-server/target/release/proxy-server --config /opt/proxy-server/config.json
+WorkingDirectory=/opt/bifrost-bridge
+ExecStart=/opt/bifrost-bridge/target/release/bifrost-bridge --config /opt/bifrost-bridge/config.json
 Restart=always
 RestartSec=5
 
@@ -451,5 +449,5 @@ Referrer-Policy: strict-origin-when-cross-origin
 
 ---
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2026-09-20
 **See Also:** [Configuration Guide](./configuration.md), [Examples](../examples/)

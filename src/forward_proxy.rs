@@ -6,7 +6,7 @@
 //! - Basic proxy authentication
 //! - Connection pooling and timeout configuration
 
-use crate::common::{ResponseBuilder, TlsConfig, is_websocket_upgrade};
+use crate::common::{ResponseBuilder, ServerLimits, TlsConfig, is_websocket_upgrade};
 use crate::config::{RelayProxyConfig, WebSocketConfig};
 use crate::error::ProxyError;
 use crate::rate_limit::RateLimiter;
@@ -45,6 +45,7 @@ pub struct ForwardProxy {
     http_client: Arc<Client<HttpConnector, Incoming>>,
     websocket_config: WebSocketConfig,
     rate_limiter: Arc<RateLimiter>,
+    server_limits: ServerLimits,
 }
 
 /// Internal structure to store relay proxy configuration with pre-computed authentication.
@@ -81,6 +82,7 @@ impl ForwardProxy {
             http_client: Arc::new(http_client),
             websocket_config: WebSocketConfig::default(),
             rate_limiter: Arc::new(RateLimiter::new(None)),
+            server_limits: ServerLimits::new(1000, 16 * 1024),
         }
     }
 
@@ -113,6 +115,7 @@ impl ForwardProxy {
             http_client: Arc::new(http_client),
             websocket_config: WebSocketConfig::default(),
             rate_limiter: Arc::new(RateLimiter::new(None)),
+            server_limits: ServerLimits::new(1000, 16 * 1024),
         }
     }
 
@@ -220,7 +223,13 @@ impl ForwardProxy {
             http_client: Arc::new(http_client),
             websocket_config: websocket_config.unwrap_or_default(),
             rate_limiter,
+            server_limits: ServerLimits::new(1000, 16 * 1024),
         }
+    }
+
+    pub fn with_server_limits(mut self, server_limits: ServerLimits) -> Self {
+        self.server_limits = server_limits;
+        self
     }
 
     /// Build HTTP client for forward proxy.
@@ -342,6 +351,8 @@ impl ForwardProxy {
         let http_client = self.http_client; // Capture the HTTP client
         let websocket_config = self.websocket_config.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let server_limits = self.server_limits.clone();
+        let max_connection_lifetime = self.max_connection_lifetime;
 
         info!(
             "HTTP forward proxy listening on: http://{}",
@@ -353,6 +364,11 @@ impl ForwardProxy {
                 _ = shutdown.cancelled() => return Ok(()),
                 result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
             };
+            let Some(connection_permit) = server_limits.try_acquire() else {
+                warn!("Forward proxy connection limit reached; rejecting {}", remote_addr);
+                continue;
+            };
+            let max_header_size = server_limits.max_header_size();
 
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
@@ -363,6 +379,7 @@ impl ForwardProxy {
             let client_ip = remote_addr.ip().to_string();
 
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 // For CONNECT requests, we need to handle the tunnel manually
                 // Try to peek at the first line to check if it's CONNECT
                 let mut peek_buf = vec![0u8; 1024];
@@ -380,6 +397,8 @@ impl ForwardProxy {
                                 proxy_username,
                                 proxy_password,
                                 rate_limiter.clone(),
+                                max_connection_lifetime,
+                                max_header_size,
                             )
                             .await;
                             return;
@@ -393,7 +412,8 @@ impl ForwardProxy {
                 // Not a CONNECT request, use normal HTTP handling
                 let io = TokioIo::new(stream);
                 let http_client = Arc::clone(&http_client);
-                if let Err(err) = ServerBuilder::new()
+                let connection = ServerBuilder::new()
+                    .max_buf_size(max_header_size)
                     .serve_connection(
                         io,
                         service_fn(move |req| {
@@ -413,6 +433,7 @@ impl ForwardProxy {
                                         websocket_config.clone(),
                                         rate_limiter.clone(),
                                         Some(client_ip.clone()),
+                                        max_connection_lifetime,
                                     )
                                     .await
                                 } else {
@@ -425,16 +446,18 @@ impl ForwardProxy {
                                         websocket_config,
                                         rate_limiter,
                                         Some(client_ip.clone()),
+                                        max_connection_lifetime,
                                     )
                                     .await
                                 }
                             }
                         }),
                     )
-                    .with_upgrades()
-                    .await
-                {
-                    error!("Error serving forward proxy connection: {}", err);
+                    .with_upgrades();
+                match timeout(max_connection_lifetime, connection).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => error!("Error serving forward proxy connection: {}", err),
+                    Err(_) => debug!("Forward proxy connection reached its maximum lifetime"),
                 }
             });
         }
@@ -451,6 +474,8 @@ impl ForwardProxy {
         _proxy_username: Option<String>,
         _proxy_password: Option<String>,
         rate_limiter: Arc<RateLimiter>,
+        max_connection_lifetime: Duration,
+        max_header_size: usize,
     ) -> Result<(), std::io::Error> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -459,6 +484,11 @@ impl ForwardProxy {
         // Read the CONNECT request line
         let mut request_line = String::new();
         reader.read_line(&mut request_line).await?;
+        if request_line.len() > max_header_size {
+            let mut stream = reader.into_inner();
+            stream.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await?;
+            return Ok(());
+        }
         debug!("CONNECT request: {}", request_line.trim());
 
         // Parse the request
@@ -483,9 +513,16 @@ impl ForwardProxy {
         };
 
         // Read and discard headers until empty line
+        let mut header_bytes = request_line.len();
         loop {
             let mut header_line = String::new();
             reader.read_line(&mut header_line).await?;
+            header_bytes = header_bytes.saturating_add(header_line.len());
+            if header_bytes > max_header_size {
+                let mut stream = reader.into_inner();
+                stream.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await?;
+                return Ok(());
+            }
             if header_line.trim().is_empty() || header_line == "\r\n" {
                 break;
             }
@@ -569,7 +606,7 @@ impl ForwardProxy {
             target_stream,
             remote_addr,
             target_desc,
-            Duration::from_secs(300), // Static method uses default 300s
+            max_connection_lifetime,
         )
         .await;
 
@@ -599,6 +636,8 @@ impl ForwardProxy {
         let http_client = self.http_client; // Capture the HTTP client
         let websocket_config = self.websocket_config.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let server_limits = self.server_limits.clone();
+        let max_connection_lifetime = self.max_connection_lifetime;
         let tls_acceptor = if let Some(config) = tls_config {
             Some(TlsAcceptor::from(config))
         } else {
@@ -620,6 +659,11 @@ impl ForwardProxy {
                 _ = shutdown.cancelled() => return Ok(()),
                 result = listener.accept() => result.map_err(ProxyError::Io)?,
             };
+            let Some(connection_permit) = server_limits.try_acquire() else {
+                warn!("Forward proxy connection limit reached; rejecting {}", remote_addr);
+                continue;
+            };
+            let max_header_size = server_limits.max_header_size();
 
             let relay_proxies = relay_proxies.clone();
             let proxy_username = proxy_username.clone();
@@ -631,6 +675,7 @@ impl ForwardProxy {
             let client_ip = remote_addr.ip().to_string();
 
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 if let Some(acceptor) = tls_acceptor {
                     // HTTPS mode
                     match acceptor.accept(tcp_stream).await {
@@ -653,6 +698,7 @@ impl ForwardProxy {
                                             websocket_config.clone(),
                                             rate_limiter.clone(),
                                             Some(client_ip.clone()),
+                                            max_connection_lifetime,
                                         )
                                         .await
                                     } else {
@@ -665,19 +711,22 @@ impl ForwardProxy {
                                             websocket_config,
                                             rate_limiter,
                                             Some(client_ip.clone()),
+                                            max_connection_lifetime,
                                         )
                                         .await
                                     }
                                 }
                             });
 
-                            if let Err(e) = ServerBuilder::new()
+                            let connection = ServerBuilder::new()
+                                .max_buf_size(max_header_size)
                                 .keep_alive(true)
                                 .serve_connection(TokioIo::new(tls_stream), service)
-                                .with_upgrades()
-                                .await
-                            {
-                                error!("Error serving HTTPS connection: {}", e);
+                                .with_upgrades();
+                            match timeout(max_connection_lifetime, connection).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => error!("Error serving HTTPS connection: {}", e),
+                                Err(_) => debug!("Forward proxy TLS connection reached its maximum lifetime"),
                             }
                         }
                         Err(e) => {
@@ -1641,18 +1690,20 @@ impl ForwardProxy {
         websocket_config: WebSocketConfig,
         rate_limiter: Arc<RateLimiter>,
         client_ip: Option<String>,
+        max_connection_lifetime: Duration,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Create a temporary proxy instance for request handling
         // Note: HTTP client is passed in, not using instance's client
         let proxy = ForwardProxy {
             connection_pool_enabled: true,
-            max_connection_lifetime: Duration::from_secs(300), // Default value for temporary instance
+            max_connection_lifetime,
             relay_proxies,
             proxy_username,
             proxy_password,
             http_client,
             websocket_config,
             rate_limiter,
+            server_limits: ServerLimits::new(1000, 16 * 1024),
         };
         proxy.handle_request(req, client_ip).await
     }
@@ -1664,17 +1715,19 @@ impl ForwardProxy {
         websocket_config: WebSocketConfig,
         rate_limiter: Arc<RateLimiter>,
         client_ip: Option<String>,
+        max_connection_lifetime: Duration,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // For CONNECT, we don't need the HTTP client
         let proxy = ForwardProxy {
             connection_pool_enabled: true,
-            max_connection_lifetime: Duration::from_secs(300), // Default value for temporary instance
+            max_connection_lifetime,
             relay_proxies,
             proxy_username: None,
             proxy_password: None,
             http_client: Arc::new(Self::build_http_client(10, 90, true)),
             websocket_config,
             rate_limiter,
+            server_limits: ServerLimits::new(1000, 16 * 1024),
         };
         proxy.handle_connect_tunnel(req, client_ip).await
     }

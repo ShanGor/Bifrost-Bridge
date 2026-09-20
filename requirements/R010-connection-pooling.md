@@ -14,19 +14,21 @@ Full connection pooling configuration with HTTP client pool management, supporti
 
 ## 🔧 Technical Details
 
-- Added `connection_pool_enabled` and `pool_max_idle_per_host` fields to main Config struct
+- Added top-level `connection_pool_enabled` for forward-proxy pooling
+- Added `reverse_proxy_config.pool_max_idle_per_host` for reverse-proxy pool sizing
 - Enhanced ForwardProxy with configurable connection pool settings
 - Added `new_with_pool_config()` method for custom pool configuration
 - Implemented pool/no-pool mode switching with hyper client builder
-- Added CLI arguments: `--no-connection-pool` and `--pool-max-idle`
+- Added CLI arguments: `--no-connection-pool` for forward mode and `--pool-max-idle` for reverse mode
 - Real-time pool status display on server startup
 
 ## ⚙️ Configuration
 
 ### Command Line
 ```bash
-# Enable connection pool (default)
-cargo run -- --mode forward --listen 127.0.0.1:8888 --pool-max-idle 20
+# Configure reverse-proxy idle pool size
+cargo run -- --mode reverse --listen 127.0.0.1:8888 \
+  --target http://127.0.0.1:3000 --pool-max-idle 20
 
 # Disable connection pool (no-pool mode)
 cargo run -- --mode forward --listen 127.0.0.1:8888 --no-connection-pool
@@ -35,10 +37,13 @@ cargo run -- --mode forward --listen 127.0.0.1:8888 --no-connection-pool
 ### JSON Configuration
 ```json
 {
-  "mode": "Forward",
+  "mode": "Reverse",
   "listen_addr": "127.0.0.1:8888",
-  "connection_pool_enabled": true,
-  "pool_max_idle_per_host": 15
+  "reverse_proxy_target": "http://127.0.0.1:3000",
+  "reverse_proxy_config": {
+    "pool_max_idle_per_host": 15,
+    "pool_idle_timeout_secs": 90
+  }
 }
 ```
 
@@ -86,8 +91,8 @@ cargo run -- --mode forward --listen 127.0.0.1:8888 --no-connection-pool
 
 Server startup messages indicate current pool configuration:
 ```
-[INFO] Connection pooling: ENABLED (max idle per host: 15)
-[INFO] Connection pooling: DISABLED (no-pool mode)
+[INFO] Reverse proxy: connection pooling ENABLED (pool_max_idle_per_host=15, idle_timeout=90s)
+[INFO] Forward proxy: no-pool mode (new connection per request)
 ```
 
 ## 🧪 Testing Scenarios

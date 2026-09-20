@@ -1,5 +1,8 @@
 # Requirements Documentation Restructure - Summary
 
+> Historical record: this document describes the original restructure. Its file counts and pending
+> status labels are superseded by the current [requirements index](requirements/README.md).
+
 ## ✅ **Task Completed Successfully**
 
 Successfully reorganized the requirements documentation from a single monolithic file to a structured index with individual requirement files.
@@ -31,11 +34,11 @@ requirements/
 ├── R013-client-ip-detection.md        # Individual requirement file
 ├── R014-configurable-thread-pool.md   # Individual requirement file
 ├── R015-logging-system.md             # Individual requirement file
-├── R016-performance-monitoring.md     # Pending requirement
-├── R017-websocket-support.md          # Pending requirement
-├── R018-rate-limiting.md              # Pending requirement
-├── R019-health-check-endpoint.md      # Pending requirement
-├── R020-documentation-maintenance.md  # Pending requirement
+├── R016-performance-monitoring.md     # Completed requirement
+├── R017-websocket-support.md          # Completed requirement
+├── R018-rate-limiting.md              # Completed requirement
+├── R019-health-check-endpoint.md      # Duplicated by R016
+├── R020-documentation-maintenance.md  # Ongoing requirement
 └── R021-tokio-worker-threads.md       # Individual requirement file
 ```
 

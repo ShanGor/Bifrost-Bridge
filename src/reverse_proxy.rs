@@ -1,5 +1,5 @@
 use crate::common::{
-    ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, TlsConfig,
+    ConnectionTracker, PerformanceMetrics, RequestTimer, ResponseBuilder, ServerLimits, TlsConfig,
     is_websocket_upgrade,
 };
 use crate::config::{
@@ -137,6 +137,7 @@ impl PluginWorkerPool {
 #[derive(Clone, Debug)]
 pub struct RequestContext {
     pub client_ip: Option<String>,
+    pub is_tls: bool,
 }
 
 #[derive(Clone)]
@@ -658,6 +659,17 @@ impl RouteMatcher {
         }
 
         None
+    }
+
+    fn select_route_by_id<'a, B>(
+        &'a self,
+        route_id: &str,
+        req: &Request<B>,
+        context: &RequestContext,
+    ) -> Option<&'a CompiledRoute> {
+        self.routes
+            .iter()
+            .find(|route| route.id == route_id && route.matches(req, context))
     }
 }
 
@@ -1284,6 +1296,8 @@ pub struct ReverseProxy {
     websocket_config: WebSocketConfig,
     rate_limiter: Arc<RateLimiter>,
     plugin_workers: Arc<PluginWorkerPool>,
+    server_limits: ServerLimits,
+    max_connection_lifetime: Duration,
 }
 
 impl ReverseProxy {
@@ -1345,16 +1359,16 @@ impl ReverseProxy {
     pub fn new_with_routes(
         routes: Vec<ReverseProxyRouteConfig>,
         connect_timeout_secs: u64,
-        _idle_timeout_secs: u64,
-        _max_connection_lifetime_secs: u64,
+        idle_timeout_secs: u64,
+        max_connection_lifetime_secs: u64,
         reverse_proxy_config: Option<ReverseProxyConfig>,
         websocket_config: Option<WebSocketConfig>,
     ) -> Result<Self, ProxyError> {
         Self::new_with_routes_and_plugins(
             routes,
             connect_timeout_secs,
-            _idle_timeout_secs,
-            _max_connection_lifetime_secs,
+            idle_timeout_secs,
+            max_connection_lifetime_secs,
             reverse_proxy_config,
             websocket_config,
             PluginRuntimeConfig::default(),
@@ -1365,16 +1379,22 @@ impl ReverseProxy {
     pub fn new_with_routes_and_plugins(
         routes: Vec<ReverseProxyRouteConfig>,
         connect_timeout_secs: u64,
-        _idle_timeout_secs: u64,
-        _max_connection_lifetime_secs: u64,
+        idle_timeout_secs: u64,
+        max_connection_lifetime_secs: u64,
         reverse_proxy_config: Option<ReverseProxyConfig>,
         websocket_config: Option<WebSocketConfig>,
         plugin_runtime: PluginRuntimeConfig,
     ) -> Result<Self, ProxyError> {
+        let default_pool_config = reverse_proxy_config.or_else(|| {
+            Some(ReverseProxyConfig {
+                pool_idle_timeout_secs: idle_timeout_secs,
+                ..Default::default()
+            })
+        });
         let router = Arc::new(RouteMatcher::new_with_plugins(
             routes,
             connect_timeout_secs,
-            reverse_proxy_config,
+            default_pool_config,
             &plugin_runtime,
         )?);
         let plugin_workers = Arc::new(PluginWorkerPool::new(plugin_runtime.worker_threads)?);
@@ -1391,6 +1411,8 @@ impl ReverseProxy {
             websocket_config: websocket_config.unwrap_or_default(),
             rate_limiter: Arc::new(RateLimiter::new(None)),
             plugin_workers,
+            server_limits: ServerLimits::new(1000, 16 * 1024),
+            max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
         })
     }
 
@@ -1445,6 +1467,11 @@ impl ReverseProxy {
         self
     }
 
+    pub fn with_server_limits(mut self, server_limits: ServerLimits) -> Self {
+        self.server_limits = server_limits;
+        self
+    }
+
     /// Public method for handling individual requests (used by CombinedProxyAdapter)
     pub async fn handle_request_with_context(
         &self,
@@ -1460,6 +1487,40 @@ impl ReverseProxy {
             self.metrics.clone(),
             self.rate_limiter.clone(),
             self.plugin_workers.clone(),
+            self.max_connection_lifetime,
+            None,
+        )
+        .await
+    }
+
+    pub fn route_matches<B>(
+        &self,
+        route_id: &str,
+        req: &Request<B>,
+        context: &RequestContext,
+    ) -> bool {
+        self.routes
+            .select_route_by_id(route_id, req, context)
+            .is_some()
+    }
+
+    pub async fn handle_request_for_route(
+        &self,
+        route_id: &str,
+        req: Request<Incoming>,
+        context: RequestContext,
+    ) -> Result<Response<BoxedBody>, Infallible> {
+        Self::handle_request_static(
+            req,
+            context,
+            self.routes.clone(),
+            self.preserve_host,
+            Arc::new(self.websocket_config.clone()),
+            self.metrics.clone(),
+            self.rate_limiter.clone(),
+            self.plugin_workers.clone(),
+            self.max_connection_lifetime,
+            Some(route_id.to_string()),
         )
         .await
     }
@@ -1518,12 +1579,19 @@ impl ReverseProxy {
         let metrics = self.metrics.clone();
         let rate_limiter = self.rate_limiter.clone();
         let plugin_workers = self.plugin_workers.clone();
+        let server_limits = self.server_limits.clone();
+        let max_connection_lifetime = self.max_connection_lifetime;
 
         loop {
             let (stream, remote_addr) = listener
                 .accept()
                 .await
                 .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+            let Some(connection_permit) = server_limits.try_acquire() else {
+                warn!("Reverse proxy connection limit reached; rejecting {}", remote_addr);
+                continue;
+            };
+            let max_header_size = server_limits.max_header_size();
 
             let routes = routes.clone();
             let metrics = metrics.clone();
@@ -1535,6 +1603,7 @@ impl ReverseProxy {
                 Some(acceptor) => {
                     let acceptor = acceptor.clone();
                     tokio::spawn(async move {
+                        let _connection_permit = connection_permit;
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 Self::serve_stream(
@@ -1546,6 +1615,9 @@ impl ReverseProxy {
                                     metrics,
                                     rate_limiter,
                                     plugin_workers,
+                                    true,
+                                    max_header_size,
+                                    max_connection_lifetime,
                                 )
                                 .await;
                             }
@@ -1557,6 +1629,7 @@ impl ReverseProxy {
                 }
                 None => {
                     tokio::spawn(async move {
+                        let _connection_permit = connection_permit;
                         Self::serve_stream(
                             stream,
                             remote_addr,
@@ -1566,6 +1639,9 @@ impl ReverseProxy {
                             metrics,
                             rate_limiter,
                             plugin_workers,
+                            false,
+                            max_header_size,
+                            max_connection_lifetime,
                         )
                         .await;
                     });
@@ -1610,12 +1686,19 @@ impl ReverseProxy {
         let metrics = self.metrics.clone();
         let rate_limiter = self.rate_limiter.clone();
         let plugin_workers = self.plugin_workers.clone();
+        let server_limits = self.server_limits.clone();
+        let max_connection_lifetime = self.max_connection_lifetime;
 
         loop {
             let (stream, remote_addr) = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
                 result = listener.accept() => result.map_err(|e| ProxyError::Hyper(e.to_string()))?,
             };
+            let Some(connection_permit) = server_limits.try_acquire() else {
+                warn!("Reverse proxy connection limit reached; rejecting {}", remote_addr);
+                continue;
+            };
+            let max_header_size = server_limits.max_header_size();
 
             let routes = routes.clone();
             let metrics = metrics.clone();
@@ -1627,6 +1710,7 @@ impl ReverseProxy {
                 Some(acceptor) => {
                     let acceptor = acceptor.clone();
                     tokio::spawn(async move {
+                        let _connection_permit = connection_permit;
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 Self::serve_stream(
@@ -1638,6 +1722,9 @@ impl ReverseProxy {
                                     metrics,
                                     rate_limiter,
                                     plugin_workers,
+                                    true,
+                                    max_header_size,
+                                    max_connection_lifetime,
                                 )
                                 .await;
                             }
@@ -1647,6 +1734,7 @@ impl ReverseProxy {
                 }
                 None => {
                     tokio::spawn(async move {
+                        let _connection_permit = connection_permit;
                         Self::serve_stream(
                             stream,
                             remote_addr,
@@ -1656,6 +1744,9 @@ impl ReverseProxy {
                             metrics,
                             rate_limiter,
                             plugin_workers,
+                            false,
+                            max_header_size,
+                            max_connection_lifetime,
                         )
                         .await;
                     });
@@ -1675,13 +1766,17 @@ impl ReverseProxy {
         metrics: Arc<PerformanceMetrics>,
         rate_limiter: Arc<RateLimiter>,
         plugin_workers: Arc<PluginWorkerPool>,
+        is_tls: bool,
+        max_header_size: usize,
+        max_connection_lifetime: Duration,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let _connection = ConnectionTracker::new(metrics.clone());
         let io = TokioIo::new(stream);
 
-        if let Err(err) = ServerBuilder::new()
+        let connection = ServerBuilder::new()
+            .max_buf_size(max_header_size)
             .serve_connection(
                 io,
                 service_fn(move |req| {
@@ -1694,6 +1789,7 @@ impl ReverseProxy {
 
                     let context = RequestContext {
                         client_ip: client_ip.clone(),
+                        is_tls,
                     };
 
                     async move {
@@ -1708,6 +1804,8 @@ impl ReverseProxy {
                             metrics.clone(),
                             rate_limiter.clone(),
                             plugin_workers,
+                            max_connection_lifetime,
+                            None,
                         )
                         .await;
 
@@ -1723,10 +1821,11 @@ impl ReverseProxy {
                     }
                 }),
             )
-            .with_upgrades()
-            .await
-        {
-            error!("Error serving reverse proxy connection: {}", err);
+            .with_upgrades();
+        match tokio::time::timeout(max_connection_lifetime, connection).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => error!("Error serving reverse proxy connection: {}", err),
+            Err(_) => debug!("Reverse proxy connection reached its maximum lifetime"),
         }
     }
 
@@ -1740,6 +1839,8 @@ impl ReverseProxy {
         metrics: Arc<PerformanceMetrics>,
         rate_limiter: Arc<RateLimiter>,
         plugin_workers: Arc<PluginWorkerPool>,
+        max_connection_lifetime: Duration,
+        route_id: Option<String>,
     ) -> Result<Response<BoxedBody>, Infallible> {
         if rate_limiter.is_enabled() {
             if let Some(client_ip) = context.client_ip.as_deref() {
@@ -1766,7 +1867,11 @@ impl ReverseProxy {
             }
         }
 
-        let selected_route = match routes.select_route(&req, &context) {
+        let selected_route = match route_id.as_deref() {
+            Some(route_id) => routes.select_route_by_id(route_id, &req, &context),
+            None => routes.select_route(&req, &context),
+        };
+        let selected_route = match selected_route {
             Some(route) => route,
             None => {
                 return Ok(Self::boxed_response(ResponseBuilder::error(
@@ -1822,6 +1927,7 @@ impl ReverseProxy {
                 target,
                 preserve_host,
                 websocket_config,
+                max_connection_lifetime,
             )
             .await
             {
@@ -2059,10 +2165,13 @@ impl ReverseProxy {
         selected_target: &CompiledTarget,
         preserve_host: bool,
         websocket_config: Arc<WebSocketConfig>,
+        max_connection_lifetime: Duration,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         if let Err(reason) = Self::validate_websocket_headers(req.headers(), &websocket_config) {
             return Ok(ResponseBuilder::error(StatusCode::FORBIDDEN, &reason));
         }
+        let tunnel_timeout = Duration::from_secs(websocket_config.timeout_seconds)
+            .min(max_connection_lifetime);
 
         let target_url = selected_target.url.clone();
         let http_client = selected_route.http_client.clone();
@@ -2122,8 +2231,15 @@ impl ReverseProxy {
                 (Ok(client_stream), Ok(backend_stream)) => {
                     let mut client_io = TokioIo::new(client_stream);
                     let mut backend_io = TokioIo::new(backend_stream);
-                    if let Err(e) = copy_bidirectional(&mut client_io, &mut backend_io).await {
-                        error!("WebSocket tunnel error: {}", e);
+                    match tokio::time::timeout(
+                        tunnel_timeout,
+                        copy_bidirectional(&mut client_io, &mut backend_io),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => error!("WebSocket tunnel error: {}", e),
+                        Err(_) => debug!("WebSocket tunnel reached its configured timeout"),
                     }
                 }
                 (Err(e), _) => error!("Client WebSocket upgrade failed: {}", e),
@@ -2248,9 +2364,22 @@ impl ReverseProxy {
         }
 
         if let Some(client_ip) = &context.client_ip {
-            headers.insert(X_FORWARDED_FOR.clone(), client_ip.parse().unwrap());
+            let forwarded_for = headers
+                .get(&X_FORWARDED_FOR)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{value}, {client_ip}"))
+                .unwrap_or_else(|| client_ip.clone());
+            if let Ok(value) = forwarded_for.parse() {
+                headers.insert(X_FORWARDED_FOR.clone(), value);
+            }
         }
-        headers.insert(X_FORWARDED_PROTO.clone(), "https".parse().unwrap());
+        headers.insert(
+            X_FORWARDED_PROTO.clone(),
+            if context.is_tls { "https" } else { "http" }
+                .parse()
+                .unwrap(),
+        );
         if let Some(host) = original_host {
             headers.insert(X_FORWARDED_HOST.clone(), host);
         }
@@ -2565,9 +2694,45 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
         let route = matcher
-            .select_route(&req, &RequestContext { client_ip: None })
+            .select_route(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
         assert_eq!(route.id, "high");
+        let route = matcher
+            .select_route_by_id(
+                "low",
+                &req,
+                &RequestContext { client_ip: None, is_tls: false },
+            )
+            .unwrap();
+        assert_eq!(route.id, "low");
+    }
+
+    #[test]
+    fn test_forwarded_headers_preserve_chain_and_protocol() {
+        let mut req = Request::builder()
+            .uri("/orders?id=1")
+            .header(HOST, "public.example.com")
+            .header("x-forwarded-for", "192.0.2.10")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let target = Url::parse("http://backend.example.com").unwrap();
+
+        req = ReverseProxy::rewrite_backend_request(
+            req,
+            &RequestContext {
+                client_ip: Some("198.51.100.20".to_string()),
+                is_tls: false,
+            },
+            &target,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(req.headers()["x-forwarded-for"], "192.0.2.10, 198.51.100.20");
+        assert_eq!(req.headers()["x-forwarded-proto"], "http");
+        assert_eq!(req.headers()["x-forwarded-host"], "public.example.com");
     }
 
     #[test]
@@ -2629,7 +2794,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
         let first = matcher
-            .select_route(&req, &RequestContext { client_ip: None })
+            .select_route(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
         assert!(first.id == "a" || first.id == "b");
     }
@@ -2690,10 +2855,10 @@ mod tests {
             .unwrap();
 
         let route = matcher
-            .select_route(&req, &RequestContext { client_ip: None })
+            .select_route(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
         let selection = route
-            .select_target(&req, &RequestContext { client_ip: None })
+            .select_target(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
 
         assert!(selection.target.id == "a" || selection.target.id == "b");
@@ -2750,7 +2915,7 @@ mod tests {
             .unwrap();
 
         let route = matcher
-            .select_route(&req, &RequestContext { client_ip: None })
+            .select_route(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
 
         if let Some(target) = route.targets.iter().find(|t| t.id == "a") {
@@ -2758,7 +2923,7 @@ mod tests {
         }
 
         let selection = route
-            .select_target(&req, &RequestContext { client_ip: None })
+            .select_target(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
 
         assert_eq!(selection.target.id, "b");
@@ -2805,14 +2970,14 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
         let route = matcher
-            .select_route(&req, &RequestContext { client_ip: None })
+            .select_route(&req, &RequestContext { client_ip: None, is_tls: false })
             .unwrap();
 
         let mut excluded = HashSet::new();
         excluded.insert("a".to_string());
 
         let selection = route
-            .select_target_with_exclusions(&req, &RequestContext { client_ip: None }, &excluded)
+            .select_target_with_exclusions(&req, &RequestContext { client_ip: None, is_tls: false }, &excluded)
             .unwrap();
 
         assert_eq!(selection.target.id, "b");

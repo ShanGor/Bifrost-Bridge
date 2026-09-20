@@ -168,6 +168,64 @@ impl StaticFileHandler {
             None => return Ok(self.not_found_response()),
         };
 
+        self.handle_request_in_mount(req, mount_info, relative_path).await
+    }
+
+    /// Handles a request against one configured mount. The combined adapter
+    /// uses this to honor the configured route order instead of selecting the
+    /// longest matching mount globally.
+    pub async fn handle_request_for_mount(
+        &self,
+        req: &hyper::Request<Incoming>,
+        mount_path: &str,
+    ) -> Result<Response<FileBody>, ProxyError> {
+        if req.method() != &Method::GET && req.method() != &Method::HEAD {
+            return Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("Allow", "GET, HEAD")
+                .body(FileBody::InMemory(Full::new(Bytes::new())))
+                .map_err(|e| ProxyError::Http(e.to_string()))?);
+        }
+
+        let mount_path = normalize_mount_path(mount_path);
+        let Some(mount_info) = self
+            .mounts
+            .iter()
+            .find(|mount| mount.resolved_mount.path == mount_path)
+        else {
+            return Ok(self.not_found_response());
+        };
+
+        let path = req.uri().path();
+        let relative_path = if mount_path == "/" {
+            path.to_string()
+        } else if let Some(remainder) = path.strip_prefix(&mount_path) {
+            if !remainder.is_empty() && !remainder.starts_with('/') {
+                return Ok(self.not_found_response());
+            }
+            remainder.to_string()
+        } else {
+            return Ok(self.not_found_response());
+        };
+
+        self.handle_request_in_mount(req, mount_info, relative_path).await
+    }
+
+    pub fn path_matches_mount(path: &str, mount_path: &str) -> bool {
+        let mount_path = normalize_mount_path(mount_path);
+        mount_path == "/"
+            || path == mount_path
+            || path
+                .strip_prefix(&mount_path)
+                .is_some_and(|remainder| remainder.starts_with('/'))
+    }
+
+    async fn handle_request_in_mount(
+        &self,
+        req: &hyper::Request<Incoming>,
+        mount_info: &MountInfo,
+        relative_path: String,
+    ) -> Result<Response<FileBody>, ProxyError> {
         // Resolve the file path within the mount
         let file_path = self.resolve_file_path_in_mount(&mount_info, &relative_path)?;
 
@@ -492,8 +550,10 @@ mod tests {
     #[test]
     fn test_path_extraction() {
         // Test with multi-mount configuration
-        let mut config_multi = StaticFileConfig::single("test-temp".to_string(), false);
-        config_multi.add_mount("/static".to_string(), "test-temp".to_string(), false);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let root = temp_dir.path().to_string_lossy().to_string();
+        let mut config_multi = StaticFileConfig::single(root.clone(), false);
+        config_multi.add_mount("/static".to_string(), root, false);
         let handler_multi = StaticFileHandler::new(config_multi).expect("Failed to create multi-mount handler");
 
         // Test mount finding
@@ -509,10 +569,12 @@ mod tests {
 
     #[test]
     fn test_mount_prefix_boundary() {
-        let mut config = StaticFileConfig::single("test-temp".to_string(), false);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let root = temp_dir.path().to_string_lossy().to_string();
+        let mut config = StaticFileConfig::single(root.clone(), false);
         config.mounts = vec![StaticMount {
             path: "/static/".to_string(),
-            root_dir: "test-temp".to_string(),
+            root_dir: root,
             enable_directory_listing: None,
             index_files: None,
             spa_mode: None,

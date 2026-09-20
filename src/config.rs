@@ -8,6 +8,14 @@ fn default_cache_millisecs() -> u64 {
     3600
 }
 
+fn default_index_files() -> Vec<String> {
+    vec!["index.html".to_string(), "index.htm".to_string()]
+}
+
+fn default_spa_fallback_file() -> String {
+    "index.html".to_string()
+}
+
 fn default_monitoring_enabled() -> bool {
     true
 }
@@ -644,10 +652,15 @@ pub struct ResolvedStaticMount {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticFileConfig {
+    #[serde(default)]
     pub mounts: Vec<StaticMount>,
+    #[serde(default)]
     pub enable_directory_listing: bool,
+    #[serde(default = "default_index_files")]
     pub index_files: Vec<String>,
+    #[serde(default)]
     pub spa_mode: bool,
+    #[serde(default = "default_spa_fallback_file")]
     pub spa_fallback_file: String,
     pub worker_threads: Option<usize>,
     #[serde(default)]
@@ -674,9 +687,9 @@ impl Default for StaticFileConfig {
                 order: None,                    // Will use default (100)
             }],
             enable_directory_listing: false,
-            index_files: vec!["index.html".to_string(), "index.htm".to_string()],
+            index_files: default_index_files(),
             spa_mode: false,
-            spa_fallback_file: "index.html".to_string(),
+            spa_fallback_file: default_spa_fallback_file(),
             worker_threads: None,
             custom_mime_types: std::collections::HashMap::new(),
             no_cache_files: vec![],
@@ -700,9 +713,9 @@ impl StaticFileConfig {
                 order: None,                    // Will use default (100)
             }],
             enable_directory_listing: false,
-            index_files: vec!["index.html".to_string(), "index.htm".to_string()],
+            index_files: default_index_files(),
             spa_mode,
-            spa_fallback_file: "index.html".to_string(),
+            spa_fallback_file: default_spa_fallback_file(),
             worker_threads: None,
             custom_mime_types: std::collections::HashMap::new(),
             no_cache_files: vec![],
@@ -1104,5 +1117,32 @@ mod tests {
             config.relay_proxies.unwrap()[0].relay_proxy_url,
             format!("http://{}@localhost:3128", home_value)
         );
+    }
+
+    #[test]
+    fn static_file_config_uses_documented_defaults() {
+        let config: StaticFileConfig = serde_json::from_value(json!({
+            "mounts": [{ "path": "/", "root_dir": "./dist" }],
+            "spa_mode": true
+        }))
+        .unwrap();
+
+        assert!(!config.enable_directory_listing);
+        assert_eq!(config.index_files, vec!["index.html", "index.htm"]);
+        assert_eq!(config.spa_fallback_file, "index.html");
+        assert_eq!(config.cache_millisecs, 3600);
+    }
+
+    #[test]
+    fn shipped_json_examples_deserialize() {
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        for entry in std::fs::read_dir(examples).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            Config::from_file(path.to_str().unwrap())
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
     }
 }

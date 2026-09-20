@@ -15,6 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH, Duration};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rustls::ServerConfig;
 use tokio::fs::File as TokioFile;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 use tokio_rustls::TlsAcceptor;
 use futures::Stream;
@@ -24,6 +25,32 @@ use prometheus::{
     Opts, Registry, TextEncoder,
 };
 use prometheus::proto::MetricFamily;
+
+pub const MIN_HTTP1_HEADER_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Connection and HTTP/1 parsing limits shared by one proxy generation.
+#[derive(Clone)]
+pub struct ServerLimits {
+    permits: Arc<Semaphore>,
+    max_header_size: usize,
+}
+
+impl ServerLimits {
+    pub fn new(max_connections: usize, max_header_size: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_connections)),
+            max_header_size,
+        }
+    }
+
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().try_acquire_owned().ok()
+    }
+
+    pub fn max_header_size(&self) -> usize {
+        self.max_header_size
+    }
+}
 
 /// Common response builder utilities to eliminate code duplication
 pub struct ResponseBuilder;

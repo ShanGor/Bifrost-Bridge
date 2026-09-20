@@ -30,7 +30,7 @@ code --install-extension vadimcn.vscode-lldb
 ```bash
 # Clone repository
 git clone <repository-url>
-cd proxy-server
+cd Bifrost-Bridge
 
 # Development build
 cargo build
@@ -54,7 +54,7 @@ cargo machete
 ## 📁 Project Structure
 
 ```
-proxy-server/
+Bifrost-Bridge/
 ├── src/
 │   ├── main.rs              # Application entry point
 │   ├── config.rs            # Configuration structures
@@ -254,7 +254,7 @@ RUST_LOG=debug cargo run --config config.json
 RUST_LOG=trace cargo run --config config.json
 
 # Log to file
-RUST_LOG=info cargo run --config config.json 2>&1 | tee proxy-server.log
+RUST_LOG=info cargo run -- --config config.json 2>&1 | tee bifrost-bridge.log
 ```
 
 ### Common Debugging Techniques
@@ -279,13 +279,13 @@ debug_assert!(mount_info.path.starts_with('/'), "Mount paths should start with /
 ### Debug Tools
 ```bash
 # GDB debugging
-rust-gdb target/debug/proxy-server
+rust-gdb target/debug/bifrost-bridge
 
 # LLDB debugging (macOS)
-rust-lldb target/debug/proxy-server
+rust-lldb target/debug/bifrost-bridge
 
 # Memory profiling
-valgrind --tool=massif target/release/proxy-server
+valgrind --tool=massif target/release/bifrost-bridge
 ```
 
 ## 🏗️ Building and Releasing
@@ -327,10 +327,10 @@ git push origin v0.2.0
 cargo build --release
 
 # 5. Create release package
-tar -czf proxy-server-v0.2.0-linux-x64.tar.gz target/release/proxy-server
+tar -czf bifrost-bridge-v1.5.0-linux-x64.tar.gz target/release/bifrost-bridge
 
 # 6. Test release
-./proxy-server --version
+./bifrost-bridge --version
 ```
 
 ## 📚 Documentation Updates
@@ -367,7 +367,7 @@ tar -czf proxy-server-v0.2.0-linux-x64.tar.gz target/release/proxy-server
 3. **Update Examples**
    ```bash
    # Add or update example configurations
-   edit examples/config_new_feature.json
+   edit examples/config_advanced_features.json
    ```
 
 4. **Update Changelog**
@@ -425,5 +425,5 @@ chore: Maintenance task
 
 ---
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2026-09-20
 **See Also:** [Contributing Guide](./contributing.md), [Testing Guide](./testing.md)

@@ -43,5 +43,5 @@ cargo run -- --mount /app:./frontend/dist --mount /api:./api-docs
 
 ---
 
-**Last Updated:** 2026-01-18
-**Version:** 1.0.0
+**Last Updated:** 2026-09-20
+**Version:** 1.5.0

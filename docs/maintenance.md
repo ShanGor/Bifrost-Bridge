@@ -43,7 +43,7 @@ edit quick-start.md     # Update quick start
 edit docs/configuration.md
 
 # 2. Add/update examples
-edit examples/config_new_feature.json
+edit examples/config_advanced_features.json
 
 # 3. Update changelog
 edit CHANGELOG.md
@@ -221,7 +221,7 @@ for config in examples/*.json; do
     else
         echo "❌ $config failed"
     fi
-    pkill -f "proxy-server"
+    pkill -f "bifrost-bridge"
 done
 
 # 4. Archive old versions
@@ -270,5 +270,5 @@ cp CHANGELOG.md CHANGELOG.md.new
 
 **Remember:** Documentation is as important as code. Outdated documentation is worse than no documentation.
 
-**Last Updated:** 2025-11-15
+**Last Updated:** 2026-09-20
 **Next Review:** 2025-12-15

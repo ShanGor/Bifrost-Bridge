@@ -1,10 +1,13 @@
 # Error Recovery Architecture
 
-This document describes the comprehensive error handling and recovery system implemented in Bifrost Bridge. The system provides enterprise-grade reliability with automatic recovery, worker isolation, and sophisticated error management.
+This document describes the experimental worker-separation error-recovery components. The types and
+their unit/integration tests are implemented, but `ProxyFactory` does not attach
+`IsolatedProxyAdapter` to the shipping request path. Production traffic currently relies on the
+active adapters' timeout, retry, health-check, rate-limit, and error-response behavior.
 
 ## Overview
 
-The error recovery system consists of multiple interconnected components that work together to provide:
+When the experimental adapter is used directly, the error-recovery components provide:
 
 - **Automatic Error Recovery**: Intelligent retry mechanisms with exponential backoff
 - **Circuit Breaker Pattern**: Prevention of cascade failures during system stress
@@ -104,7 +107,8 @@ pub struct WorkerHealth {
 
 ### 4. IsolatedProxyAdapter Integration
 
-The `IsolatedProxyAdapter` integrates error recovery throughout the proxy infrastructure:
+The experimental `IsolatedProxyAdapter` integrates these components, but is not constructed by the
+current `ProxyFactory`:
 
 ```rust
 pub struct IsolatedProxyAdapter {
@@ -306,7 +310,9 @@ recovery_manager.handle_error(contextual_error).await;
 
 ## Conclusion
 
-The error recovery architecture provides enterprise-grade reliability for the Bifrost Bridge proxy server. It ensures system stability under adverse conditions while maintaining high performance and operational efficiency.
+The error-recovery module is useful groundwork and has direct tests, but it should not be described
+as a production runtime guarantee until it is integrated with `ProxyFactory` and exercised through
+the shipping adapters.
 
 The system is designed to:
 - **Prevent cascade failures** through circuit breaker patterns
@@ -315,4 +321,5 @@ The system is designed to:
 - **Provide comprehensive monitoring** for operational visibility
 - **Scale efficiently** with minimal performance overhead
 
-This architecture enables Bifrost Bridge to operate reliably in production environments with automatic recovery from failures and graceful degradation under stress conditions.
+Integration with the active adapters, operational metrics, and end-to-end failure tests remains
+future work.

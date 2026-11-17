@@ -1,0 +1,4 @@
+[alias]
+test-unit = "test --lib"
+test-e2e = "test --test e2e_regression"
+bench-http = "bench --bench http_pipeline_benchmarks"

@@ -170,22 +170,24 @@ pub struct StaticMount {
 
 ### Running Tests
 ```bash
-# Run all tests
-cargo test
+# Library unit tests
+cargo test-unit
 
-# Run specific module tests
-cargo test static_files::tests
+# Process-level regression suite: starts the built executable and sends local HTTP traffic
+cargo test-e2e
 
-# Run tests with output
-cargo test -- --nocapture
+# All unit, integration, process-level regression, and doc tests
+cargo test --locked
 
-# Run integration tests
-cargo test --test integration
-
-# Generate test coverage
-cargo install cargo-tarpaulin
-cargo tarpaulin --out Html
+# Request-path performance benchmark and saved baseline comparison
+cargo bench-http -- --save-baseline before
+cargo bench-http -- --baseline before
 ```
+
+The existing `tests/*.rs` files include integration tests that run proxy components against local
+fixtures. `tests/e2e_regression.rs` additionally tests the shipped binary with file-based config and
+real sockets. See [test-and-performance guidance](../tests-and-performance.md) for suite scope and
+benchmark interpretation.
 
 ### Writing Tests
 
@@ -240,8 +242,8 @@ mod tests {
 
 1. **Unit Tests**: Test individual functions and methods
 2. **Integration Tests**: Test complete workflows
-3. **Property Tests**: Test with generated data (using proptest)
-4. **Benchmarks**: Performance testing (using criterion)
+3. **Process-level regression tests**: Test the executable, configuration loading, routing, and HTTP behavior together
+4. **Benchmarks**: Criterion microbenchmarks and local HTTP request-path benchmarks
 
 ## 🐛 Debugging
 

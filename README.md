@@ -683,11 +683,16 @@ RUST_LOG=trace cargo run
 
 ## Testing
 
-Run the test suite:
+Run tests by layer:
 
 ```bash
-cargo test
+cargo test-unit      # Library unit tests
+cargo test-e2e       # Launches the executable and checks HTTP behavior
+cargo test --locked  # All unit, integration, regression, and doc tests
+cargo bench-http     # Static and reverse proxy request-path benchmarks
 ```
+
+See [test and performance suites](tests-and-performance.md) for the coverage map, Criterion baselines, and existing microbenchmarks.
 
 ## Examples
 

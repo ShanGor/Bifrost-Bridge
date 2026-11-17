@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- SSE proxy configuration examples and guide (`docs/sse-proxy.md`), with socket-level
+  regression coverage for streaming, pooling, cancellation, idle eviction, and timeouts
+- Configurable upstream response-header and SSE idle deadlines for reverse routes and
+  forward HTTP/relay requests (defaults: 30s / 60s; set either to 0 to disable)
 - Completed the signed QuickJS lifecycle plugin runtime with asynchronous host calls, exact-host HTTPS
   egress policy, opaque credential handles, AES-256-GCM sensitive caching, JWKS/OIDC JWT validation,
   X.509 certificate keys, custom CA and mTLS support, scheduled refresh, cancellable execution,
@@ -27,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New example configs: `config_reverse_websocket.json`, `config_reverse_wss_tls_termination.json`, `config_reverse_wss.json`
 
 ### Changed
+- Forward HTTP and HTTP relay responses now stream instead of buffering to EOF
+- `max_connection_lifetime_secs: 0` disables the hard deadline for forward/reverse
+  HTTP connections and CONNECT tunnels; configure this explicitly for long-lived SSE
+- SSE forwarding strips hop-by-hop headers, adds `X-Accel-Buffering: no`, and keeps
+  least-connections accounting active until the response body completes or is dropped
 - Updated example configurations to use inheritance
 - Improved code organization and documentation
 - Health check default port now respects the target URL scheme (443 for HTTPS/WSS)

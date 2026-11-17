@@ -18,3 +18,5 @@ mod plugin_host;
 pub use config::{Config, ProxyMode};
 pub use error::ProxyError;
 pub use proxy::ProxyFactory;
+
+mod streaming;

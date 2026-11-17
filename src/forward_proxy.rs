@@ -7,8 +7,9 @@
 //! - Connection pooling and timeout configuration
 
 use crate::common::{ResponseBuilder, ServerLimits, TlsConfig, is_websocket_upgrade};
-use crate::config::{RelayProxyConfig, WebSocketConfig};
+use crate::config::{ForwardProxyConfig, RelayProxyConfig, WebSocketConfig};
 use crate::error::ProxyError;
+use crate::streaming::{BoxedBody, BoxError, StreamingBody, strip_hop_headers, with_optional_timeout};
 use crate::rate_limit::RateLimiter;
 use base64::{Engine as _, engine::general_purpose};
 use http_body_util::{BodyExt, Full};
@@ -32,11 +33,30 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+#[derive(Clone, Copy)]
+struct UpstreamTimeouts {
+    connect: Duration,
+    headers: Duration,
+    idle: Duration,
+}
+
+impl UpstreamTimeouts {
+    fn new(connect_timeout_secs: u64) -> Self {
+        let config = ForwardProxyConfig::default();
+        Self {
+            connect: Duration::from_secs(connect_timeout_secs),
+            headers: Duration::from_secs(config.response_header_timeout_secs),
+            idle: Duration::from_secs(config.stream_idle_timeout_secs),
+        }
+    }
+}
+
 /// Forward proxy server implementation.
 ///
 /// Supports both direct connections and relay proxy routing based on domain patterns.
 pub struct ForwardProxy {
     connection_pool_enabled: bool,
+    upstream_timeouts: UpstreamTimeouts,
     max_connection_lifetime: Duration,
     relay_proxies: Vec<RelayProxyWithAuth>,
     proxy_username: Option<String>,
@@ -59,6 +79,13 @@ struct RelayProxyWithAuth {
 }
 
 impl ForwardProxy {
+    /// Set upstream HTTP header and SSE idle deadlines; zero disables each deadline.
+    pub fn with_stream_config(mut self, config: ForwardProxyConfig) -> Self {
+        self.upstream_timeouts.headers = Duration::from_secs(config.response_header_timeout_secs);
+        self.upstream_timeouts.idle = Duration::from_secs(config.stream_idle_timeout_secs);
+        self
+    }
+
     /// Creates a new forward proxy with basic timeout configuration.
     ///
     /// # Arguments
@@ -75,6 +102,7 @@ impl ForwardProxy {
 
         Self {
             connection_pool_enabled: true,
+            upstream_timeouts: UpstreamTimeouts::new(connect_timeout_secs),
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             relay_proxies: Vec::new(),
             proxy_username: None,
@@ -108,6 +136,7 @@ impl ForwardProxy {
 
         Self {
             connection_pool_enabled,
+            upstream_timeouts: UpstreamTimeouts::new(connect_timeout_secs),
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             relay_proxies: Vec::new(),
             proxy_username: None,
@@ -216,6 +245,7 @@ impl ForwardProxy {
 
         Self {
             connection_pool_enabled,
+            upstream_timeouts: UpstreamTimeouts::new(connect_timeout_secs),
             max_connection_lifetime: Duration::from_secs(max_connection_lifetime_secs),
             relay_proxies,
             proxy_username,
@@ -353,6 +383,7 @@ impl ForwardProxy {
         let rate_limiter = self.rate_limiter.clone();
         let server_limits = self.server_limits.clone();
         let max_connection_lifetime = self.max_connection_lifetime;
+        let upstream_timeouts = self.upstream_timeouts;
 
         info!(
             "HTTP forward proxy listening on: http://{}",
@@ -447,6 +478,7 @@ impl ForwardProxy {
                                         rate_limiter,
                                         Some(client_ip.clone()),
                                         max_connection_lifetime,
+                                        upstream_timeouts,
                                     )
                                     .await
                                 }
@@ -454,7 +486,7 @@ impl ForwardProxy {
                         }),
                     )
                     .with_upgrades();
-                match timeout(max_connection_lifetime, connection).await {
+                match with_optional_timeout(max_connection_lifetime, async move { connection.await }).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => error!("Error serving forward proxy connection: {}", err),
                     Err(_) => debug!("Forward proxy connection reached its maximum lifetime"),
@@ -638,6 +670,7 @@ impl ForwardProxy {
         let rate_limiter = self.rate_limiter.clone();
         let server_limits = self.server_limits.clone();
         let max_connection_lifetime = self.max_connection_lifetime;
+        let upstream_timeouts = self.upstream_timeouts;
         let tls_acceptor = if let Some(config) = tls_config {
             Some(TlsAcceptor::from(config))
         } else {
@@ -712,6 +745,7 @@ impl ForwardProxy {
                                             rate_limiter,
                                             Some(client_ip.clone()),
                                             max_connection_lifetime,
+                                        upstream_timeouts,
                                         )
                                         .await
                                     }
@@ -723,7 +757,7 @@ impl ForwardProxy {
                                 .keep_alive(true)
                                 .serve_connection(TokioIo::new(tls_stream), service)
                                 .with_upgrades();
-                            match timeout(max_connection_lifetime, connection).await {
+                            match with_optional_timeout(max_connection_lifetime, async move { connection.await }).await {
                                 Ok(Ok(())) => {}
                                 Ok(Err(e)) => error!("Error serving HTTPS connection: {}", e),
                                 Err(_) => debug!("Forward proxy TLS connection reached its maximum lifetime"),
@@ -742,7 +776,7 @@ impl ForwardProxy {
         &self,
         req: Request<Incoming>,
         client_ip: Option<String>,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<BoxedBody>, Infallible> {
         match self.process_request(req, client_ip).await {
             Ok(response) => Ok(response),
             Err(e) => {
@@ -767,7 +801,7 @@ impl ForwardProxy {
                     );
                 }
 
-                Ok(response_builder)
+                Ok(Self::box_response(response_builder))
             }
         }
     }
@@ -776,7 +810,7 @@ impl ForwardProxy {
         &self,
         req: Request<Incoming>,
         client_ip: Option<String>,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+    ) -> Result<Response<BoxedBody>, ProxyError> {
         self.verify_authentication(&req)?;
 
         if let Some(ip) = client_ip.as_deref() {
@@ -796,16 +830,16 @@ impl ForwardProxy {
                     "Forward proxy rate limit hit for {} via rule {}",
                     ip, hit.rule_id
                 );
-                return Ok(ResponseBuilder::too_many_requests(
+                return Ok(Self::box_response(ResponseBuilder::too_many_requests(
                     &hit.rule_id,
                     hit.retry_after_secs,
-                ));
+                )));
             }
         }
 
         if *req.method() == Method::CONNECT {
             return match self.handle_connect_tunnel(req, client_ip).await {
-                Ok(response) => Ok(response),
+                Ok(response) => Ok(Self::box_response(response)),
                 Err(_) => unreachable!(),
             };
         }
@@ -846,7 +880,7 @@ impl ForwardProxy {
 
         if is_websocket {
             if let Err(reason) = self.validate_websocket_headers(req.headers()) {
-                return Ok(ResponseBuilder::error(StatusCode::FORBIDDEN, &reason));
+                return Ok(Self::box_response(ResponseBuilder::error(StatusCode::FORBIDDEN, &reason)));
             }
         }
 
@@ -856,12 +890,12 @@ impl ForwardProxy {
                     .forward_websocket_via_relay(req, relay, &target_uri)
                     .await
                 {
-                    Ok(resp) => Ok(resp),
+                    Ok(resp) => Ok(Self::box_response(resp)),
                     Err(e) => {
                         error!("Proxy error (relay websocket): {}", e);
-                        Ok(ResponseBuilder::proxy_error(
+                        Ok(Self::box_response(ResponseBuilder::proxy_error(
                             "Failed to forward WebSocket request",
-                        ))
+                        )))
                     }
                 };
             }
@@ -870,19 +904,19 @@ impl ForwardProxy {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     error!("Proxy error (relay): {}", e);
-                    Ok(ResponseBuilder::proxy_error("Failed to forward request"))
+                    Ok(Self::upstream_error_response(&e))
                 }
             };
         }
 
         if is_websocket {
             return match self.forward_websocket_direct(req, &target_uri).await {
-                Ok(resp) => Ok(resp),
+                Ok(resp) => Ok(Self::box_response(resp)),
                 Err(e) => {
                     error!("Proxy error (websocket): {}", e);
-                    Ok(ResponseBuilder::proxy_error(
+                    Ok(Self::box_response(ResponseBuilder::proxy_error(
                         "Failed to forward WebSocket request",
-                    ))
+                    )))
                 }
             };
         }
@@ -891,7 +925,7 @@ impl ForwardProxy {
             Ok(response) => Ok(response),
             Err(e) => {
                 error!("Proxy error (direct): {}", e);
-                Ok(ResponseBuilder::proxy_error("Failed to forward request"))
+                Ok(Self::upstream_error_response(&e))
             }
         }
     }
@@ -900,7 +934,7 @@ impl ForwardProxy {
         &self,
         mut req: Request<Incoming>,
         target_uri: &Uri,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+    ) -> Result<Response<BoxedBody>, ProxyError> {
         let client = &self.http_client;
 
         let uri_to_use = if target_uri.scheme().is_some() && target_uri.authority().is_some() {
@@ -914,8 +948,10 @@ impl ForwardProxy {
         *req.uri_mut() = uri_to_use.clone();
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         req.headers_mut().remove("Proxy-Connection");
+        strip_hop_headers(req.headers_mut(), false);
 
-        let response = client.request(req).await.map_err(|e| {
+        let response = with_optional_timeout(self.upstream_timeouts.headers, client.request(req)).await
+            .map_err(|_| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Upstream response headers timed out")))?.map_err(|e| {
             error!("HTTP client error: {}", e);
             error!("  Target was: {}", uri_to_use);
             if e.is_connect() {
@@ -926,7 +962,7 @@ impl ForwardProxy {
             ProxyError::Connection(format!("Failed to forward request: {}", e))
         })?;
 
-        Self::finalize_standard_response(response).await
+        self.finalize_standard_response(response).await
     }
 
     async fn handle_connect_tunnel(
@@ -1021,7 +1057,7 @@ impl ForwardProxy {
                         tokio::join!(client_to_target, target_to_client);
                     };
 
-                    match tokio::time::timeout(max_lifetime, tunnel_future).await {
+                    match with_optional_timeout(max_lifetime, tunnel_future).await {
                         Ok(_) => {
                             debug!("TCP tunnel closed normally for {}:{}", host, port);
                         }
@@ -1057,13 +1093,16 @@ impl ForwardProxy {
         *req.uri_mut() = target_uri.clone();
         req.headers_mut().remove(PROXY_AUTHORIZATION);
         req.headers_mut().remove("Proxy-Connection");
+        strip_hop_headers(req.headers_mut(), true);
 
         let mut response = self.http_client.request(req).await.map_err(|e| {
             ProxyError::Connection(format!("Failed to forward WebSocket request: {}", e))
         })?;
 
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Self::finalize_standard_response(response).await;
+            let (parts, body) = response.into_parts();
+            let bytes = body.collect().await.map_err(|e| ProxyError::Http(e.to_string()))?.to_bytes();
+            return Ok(Response::from_parts(parts, Full::new(bytes)));
         }
 
         let backend_upgrade = hyper::upgrade::on(&mut response);
@@ -1096,21 +1135,24 @@ impl ForwardProxy {
         &self,
         req: Request<Incoming>,
         relay: RelayProxyWithAuth,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        let mut reader = self.open_relay_stream(req, &relay).await?;
-        let (status_code, response_headers, content_length, chunked) =
-            Self::parse_relay_status_and_headers(&mut reader).await?;
-        let body = Self::read_relay_body(&mut reader, content_length, chunked).await?;
-
-        let mut response = Response::builder()
-            .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY));
-        if let Some(headers) = response.headers_mut() {
-            *headers = response_headers;
+    ) -> Result<Response<BoxedBody>, ProxyError> {
+        // Let Hyper handle chunk framing, trailers and streaming, including an
+        // absolute-form request target required by an HTTP forward proxy.
+        let relay_uri: Uri = relay.url.parse().map_err(|e| ProxyError::Config(format!("Invalid relay URL: {e}")))?;
+        let host = relay_uri.host().ok_or_else(|| ProxyError::Config("Relay missing host".into()))?;
+        let stream = with_optional_timeout(self.upstream_timeouts.connect, TcpStream::connect((host, relay_uri.port_u16().unwrap_or(8080))))
+            .await.map_err(|_| ProxyError::Connection("Relay connect timed out".into()))??;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(|e| ProxyError::Hyper(e.to_string()))?;
+        tokio::spawn(async move { if let Err(e) = connection.await { debug!("Relay connection ended: {e}"); } });
+        let mut req = req;
+        strip_hop_headers(req.headers_mut(), false);
+        if let Some(auth) = relay.auth {
+            req.headers_mut().insert(PROXY_AUTHORIZATION, HeaderValue::from_str(&auth).map_err(|e| ProxyError::Config(e.to_string()))?);
         }
-
-        response
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|e| ProxyError::Http(e.to_string()))
+        let response = with_optional_timeout(self.upstream_timeouts.headers, sender.send_request(req)).await
+            .map_err(|_| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Relay response headers timed out")))?
+            .map_err(|e| ProxyError::Hyper(e.to_string()))?;
+        self.finalize_standard_response(response).await
     }
 
     async fn forward_websocket_via_relay(
@@ -1349,18 +1391,28 @@ impl ForwardProxy {
     }
 
     async fn finalize_standard_response(
+        &self,
         response: Response<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, ProxyError> {
-        let (parts, body) = response.into_parts();
-        let body_bytes = body
-            .collect()
-            .await
-            .map_err(|e| ProxyError::Http(format!("Failed to read response body: {}", e)))?;
+    ) -> Result<Response<BoxedBody>, ProxyError> {
+        let (mut parts, body) = response.into_parts();
+        let is_sse = parts.headers.get("content-type").and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/event-stream"));
+        strip_hop_headers(&mut parts.headers, false);
+        if is_sse { parts.headers.insert("x-accel-buffering", HeaderValue::from_static("no")); }
+        let body = body.map_err(|e| Box::new(e) as BoxError).boxed();
+        let body = if is_sse { StreamingBody::new(body, self.upstream_timeouts.idle, ()).boxed() } else { body };
+        Ok(Response::from_parts(parts, body))
+    }
 
-        Ok(Response::from_parts(
-            parts,
-            Full::new(body_bytes.to_bytes()),
-        ))
+    fn upstream_error_response(error: &ProxyError) -> Response<BoxedBody> {
+        let status = if matches!(error, ProxyError::Io(err) if err.kind() == std::io::ErrorKind::TimedOut) {
+            StatusCode::GATEWAY_TIMEOUT
+        } else { StatusCode::BAD_GATEWAY };
+        Self::box_response(ResponseBuilder::error(status, "Failed to forward request"))
+    }
+
+    fn box_response(response: Response<Full<Bytes>>) -> Response<BoxedBody> {
+        response.map(|body| body.map_err(|e| match e {}).boxed())
     }
 
     async fn setup_tunnel_with_lifetime(
@@ -1382,7 +1434,7 @@ impl ForwardProxy {
             target_desc.clone(),
         );
 
-        match tokio::time::timeout(max_lifetime, tunnel_future).await {
+        match with_optional_timeout(max_lifetime, tunnel_future).await {
             Ok(result) => {
                 debug!(
                     "Tunnel closed normally between {} and {}",
@@ -1691,11 +1743,13 @@ impl ForwardProxy {
         rate_limiter: Arc<RateLimiter>,
         client_ip: Option<String>,
         max_connection_lifetime: Duration,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+        upstream_timeouts: UpstreamTimeouts,
+    ) -> Result<Response<BoxedBody>, Infallible> {
         // Create a temporary proxy instance for request handling
         // Note: HTTP client is passed in, not using instance's client
         let proxy = ForwardProxy {
             connection_pool_enabled: true,
+            upstream_timeouts,
             max_connection_lifetime,
             relay_proxies,
             proxy_username,
@@ -1716,10 +1770,11 @@ impl ForwardProxy {
         rate_limiter: Arc<RateLimiter>,
         client_ip: Option<String>,
         max_connection_lifetime: Duration,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<BoxedBody>, Infallible> {
         // For CONNECT, we don't need the HTTP client
         let proxy = ForwardProxy {
             connection_pool_enabled: true,
+            upstream_timeouts: UpstreamTimeouts::new(10),
             max_connection_lifetime,
             relay_proxies,
             proxy_username: None,
@@ -1729,7 +1784,7 @@ impl ForwardProxy {
             rate_limiter,
             server_limits: ServerLimits::new(1000, 16 * 1024),
         };
-        proxy.handle_connect_tunnel(req, client_ip).await
+        proxy.handle_connect_tunnel(req, client_ip).await.map(Self::box_response)
     }
 }
 

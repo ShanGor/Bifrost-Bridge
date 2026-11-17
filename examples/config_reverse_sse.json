@@ -1,0 +1,23 @@
+{
+  "mode": "Reverse",
+  "listen_addr": "127.0.0.1:8888",
+  "max_connections": 2000,
+  "connect_timeout_secs": 10,
+  "max_connection_lifetime_secs": 0,
+  "reverse_proxy_config": {
+    "pool_max_idle_per_host": 32,
+    "pool_idle_timeout_secs": 15,
+    "response_header_timeout_secs": 30,
+    "stream_idle_timeout_secs": 60
+  },
+  "reverse_proxy_routes": [
+    {
+      "id": "sse-api",
+      "target": "http://127.0.0.1:3000",
+      "predicates": [
+        { "type": "Path", "patterns": ["/**"], "match_trailing_slash": true }
+      ]
+    }
+  ],
+  "monitoring": { "enabled": false }
+}

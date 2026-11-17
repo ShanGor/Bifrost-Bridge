@@ -146,7 +146,7 @@ restart. The command is currently Unix-only because it uses `SIGHUP` and a PID f
 | `max_header_size` | Number | Maximum HTTP/1 request-header buffer in bytes; must be at least 8192 | `16384` |
 | `connect_timeout_secs` | Number | Timeout for establishing upstream connections | `10` |
 | `idle_timeout_secs` | Number | Forward pool idle timeout; also the reverse pool default unless `reverse_proxy_config` overrides it | `90` |
-| `max_connection_lifetime_secs` | Number | Maximum lifetime of accepted HTTP, CONNECT, and upgraded connections | `300` |
+| `max_connection_lifetime_secs` | Number | Maximum lifetime of accepted HTTP, CONNECT, and upgraded connections; `0` disables the hard deadline | `300` |
 | `timeout_secs` | Number | Legacy connect timeout in seconds | unset |
 | `reverse_proxy_target` | String | Legacy single target for reverse proxy (use `reverse_proxy_routes` instead) | `null` |
 | `reverse_proxy_routes` | Array | Route list for reverse proxy (id, target, predicates, optional strip/pooling) | `[]` |
@@ -154,9 +154,12 @@ restart. The command is currently Unix-only because it uses `SIGHUP` and a PID f
 | `private_key` | String | Path to PKCS#8 PEM format private key file for HTTPS | `null` |
 | `certificate` | String | Path to PEM format certificate file for HTTPS | `null` |
 | `connection_pool_enabled` | Boolean | Enable HTTP connection pooling for forward proxy | `true` |
-| `reverse_proxy_config` | Object | Reverse-proxy pool configuration (`pool_max_idle_per_host`, `pool_idle_timeout_secs`, optional health check) | pool size `10`, idle timeout `90` |
+| `forward_proxy_config` | Object | Forward HTTP/relay `response_header_timeout_secs` and SSE `stream_idle_timeout_secs`; each accepts `0` to disable | headers `30`, stream idle `60` |
+| `reverse_proxy_config` | Object | Reverse pool, health checks, `response_header_timeout_secs` and SSE `stream_idle_timeout_secs`; timeout `0` disables that deadline | pool size `10`, pool idle `90`, headers `30`, stream idle `60` |
 | `logging` | Object | Logging configuration (see below) | Default console logging |
 | `monitoring` | Object | Monitoring endpoints configuration (see below) | Enabled with default endpoints |
+
+See [SSE proxy configuration and review](sse-proxy.md) for timeout semantics, route overrides, CONNECT limitations, and ready-to-run examples.
 
 ## Environment Variable Interpolation
 

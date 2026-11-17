@@ -122,6 +122,7 @@ impl ProxyFactory {
                     config.websocket.clone(),
                     rate_limiter.clone(),
                 )
+                .with_stream_config(config.forward_proxy_config.clone())
                 .with_server_limits(server_limits.clone());
 
                 Box::new(ForwardProxyAdapter {

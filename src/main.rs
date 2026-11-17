@@ -71,7 +71,7 @@ struct Args {
     #[clap(
         long,
         value_name = "SECONDS",
-        help = "Maximum connection lifetime in seconds"
+        help = "Maximum connection lifetime in seconds (0 disables the hard deadline)"
     )]
     max_connection_lifetime: Option<u64>,
 
@@ -681,6 +681,7 @@ fn create_config_from_args(args: &Args) -> Result<Config, Box<dyn std::error::Er
         private_key: args.private_key.clone(),
         certificate: args.certificate.clone(),
         connection_pool_enabled: Some(!args.no_connection_pool),
+        forward_proxy_config: Default::default(),
         max_header_size: args.max_header_size,
         relay_proxies: None,
         relay_proxy_url: None,

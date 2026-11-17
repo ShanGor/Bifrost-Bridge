@@ -247,6 +247,25 @@ impl Default for HealthCheckConfig {
     }
 }
 
+/// Forward HTTP/relay streaming configuration. CONNECT tunnels are opaque and
+/// retain their tunnel lifetime policy; SSE cannot be inspected inside TLS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardProxyConfig {
+    #[serde(default = "default_response_header_timeout")]
+    pub response_header_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout_secs: u64,
+}
+
+impl Default for ForwardProxyConfig {
+    fn default() -> Self {
+        Self {
+            response_header_timeout_secs: default_response_header_timeout(),
+            stream_idle_timeout_secs: default_stream_idle_timeout(),
+        }
+    }
+}
+
 /// Reverse proxy specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseProxyConfig {
@@ -260,9 +279,23 @@ pub struct ReverseProxyConfig {
     /// Default: 90s
     #[serde(default = "default_pool_idle_timeout")]
     pub pool_idle_timeout_secs: u64,
+    /// Deadline for receiving upstream response headers (0 disables it).
+    #[serde(default = "default_response_header_timeout")]
+    pub response_header_timeout_secs: u64,
+    /// Maximum silence between upstream SSE data frames (0 disables it).
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout_secs: u64,
     /// Health check configuration (optional)
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+}
+
+fn default_response_header_timeout() -> u64 {
+    30
+}
+
+fn default_stream_idle_timeout() -> u64 {
+    60
 }
 
 fn default_pool_max_idle_per_host() -> usize {
@@ -278,6 +311,8 @@ impl Default for ReverseProxyConfig {
         Self {
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: 90,
+            response_header_timeout_secs: default_response_header_timeout(),
+            stream_idle_timeout_secs: default_stream_idle_timeout(),
             health_check: None,
         }
     }
@@ -881,6 +916,7 @@ pub struct Config {
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
     #[serde(default)]
+    /// Hard lifetime for accepted connections/tunnels; 0 disables the deadline.
     pub max_connection_lifetime_secs: Option<u64>,
     // Legacy timeout field for backward compatibility
     #[serde(default)]
@@ -895,6 +931,8 @@ pub struct Config {
     pub certificate: Option<String>,
     #[serde(default)]
     pub connection_pool_enabled: Option<bool>,
+    #[serde(default)]
+    pub forward_proxy_config: ForwardProxyConfig,
     #[serde(default = "default_max_header_size")]
     pub max_header_size: Option<usize>,
     // Multiple relay proxy configurations
@@ -1112,6 +1150,7 @@ impl Default for Config {
             private_key: None,
             certificate: None,
             connection_pool_enabled: Some(true),
+            forward_proxy_config: ForwardProxyConfig::default(),
             max_header_size: default_max_header_size(),
             relay_proxies: None,
             relay_proxy_url: None,

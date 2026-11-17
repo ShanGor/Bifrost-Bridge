@@ -8,6 +8,7 @@ use crate::config::{
     StickyMode, WebSocketConfig,
 };
 use crate::error::ProxyError;
+use crate::streaming::{StreamingBody, strip_hop_headers, with_optional_timeout};
 use crate::plugin::{load_route_plugins, PluginOutcome, PluginChain};
 use crate::rate_limit::RateLimiter;
 use chrono::{DateTime, FixedOffset, Utc};
@@ -315,6 +316,8 @@ struct CompiledRoute {
     targets: Vec<CompiledTarget>,
     http_client: Arc<Client<BackendConnector, BoxedBody>>,
     health_check_config: Option<HealthCheckConfig>,
+    response_header_timeout: Duration,
+    stream_idle_timeout: Duration,
     strip_path_prefix: Option<String>,
     priority: i32,
     predicates: Vec<Predicate>,
@@ -674,6 +677,8 @@ impl RouteMatcher {
                 targets,
                 http_client,
                 health_check_config,
+                response_header_timeout: Duration::from_secs(pool_cfg.response_header_timeout_secs),
+                stream_idle_timeout: Duration::from_secs(pool_cfg.stream_idle_timeout_secs),
                 strip_path_prefix: cfg.strip_path_prefix,
                 priority: cfg.priority.unwrap_or(0),
                 predicates,
@@ -1976,7 +1981,7 @@ impl ReverseProxy {
                 }),
             )
             .with_upgrades();
-        match tokio::time::timeout(max_connection_lifetime, connection).await {
+        match with_optional_timeout(max_connection_lifetime, async move { connection.await }).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => error!("Error serving reverse proxy connection: {}", err),
             Err(_) => debug!("Reverse proxy connection reached its maximum lifetime"),
@@ -2192,8 +2197,11 @@ impl ReverseProxy {
             Err(RequestFailure::Forward(e)) => {
                 error!("Proxy error: {}", e);
                 let body = Full::new(Bytes::from(format!("Proxy Error: {}", e)));
+                let status = if matches!(&e, ProxyError::Io(err) if err.kind() == std::io::ErrorKind::TimedOut) {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else { StatusCode::BAD_GATEWAY };
                 let error_response = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
+                    .status(status)
                     .body(body)
                     .unwrap();
                 metrics.increment_connection_errors();
@@ -2256,7 +2264,7 @@ impl ReverseProxy {
         selected_target: &CompiledTarget,
         preserve_host: bool,
     ) -> Result<Response<BoxedBody>, ProxyError> {
-        let _inflight = InflightGuard::new(selected_target.inflight.clone());
+        let inflight = InflightGuard::new(selected_target.inflight.clone());
         let prepared = Self::rewrite_backend_request(
             req,
             &context,
@@ -2267,10 +2275,11 @@ impl ReverseProxy {
         )?;
 
         let prepared = Self::box_incoming_request(prepared);
-        let response = selected_route
-            .http_client
-            .request(prepared)
-            .await
+        let response = with_optional_timeout(
+            selected_route.response_header_timeout,
+            selected_route.http_client.request(prepared),
+        ).await
+            .map_err(|_| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Upstream response headers timed out")))?
             .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
 
         // Check if this is an SSE response
@@ -2278,7 +2287,9 @@ impl ReverseProxy {
 
         if is_sse {
             // Use streaming handler for SSE
-            Self::finalize_backend_response_streaming(response, false)
+            Self::finalize_backend_response_streaming(response, false).map(|response| {
+                response.map(|body| StreamingBody::new(body, selected_route.stream_idle_timeout, inflight).boxed())
+            })
         } else {
             // Use buffered handler for regular responses
             Self::finalize_backend_response(response, false)
@@ -2294,7 +2305,7 @@ impl ReverseProxy {
         selected_target: &CompiledTarget,
         preserve_host: bool,
     ) -> Result<Response<BoxedBody>, ProxyError> {
-        let _inflight = InflightGuard::new(selected_target.inflight.clone());
+        let inflight = InflightGuard::new(selected_target.inflight.clone());
         let prepared = Self::rewrite_backend_request(
             req,
             &context,
@@ -2305,10 +2316,11 @@ impl ReverseProxy {
         )?;
 
         let prepared = Self::box_infallible_request(prepared);
-        let response = selected_route
-            .http_client
-            .request(prepared)
-            .await
+        let response = with_optional_timeout(
+            selected_route.response_header_timeout,
+            selected_route.http_client.request(prepared),
+        ).await
+            .map_err(|_| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Upstream response headers timed out")))?
             .map_err(|e| ProxyError::Connection(format!("Failed to forward request: {}", e)))?;
 
         // Check if this is an SSE response
@@ -2316,7 +2328,9 @@ impl ReverseProxy {
 
         if is_sse {
             // Use streaming handler for SSE
-            Self::finalize_backend_response_streaming(response, false)
+            Self::finalize_backend_response_streaming(response, false).map(|response| {
+                response.map(|body| StreamingBody::new(body, selected_route.stream_idle_timeout, inflight).boxed())
+            })
         } else {
             // Use buffered handler for regular responses
             Self::finalize_backend_response(response, false)
@@ -2435,8 +2449,12 @@ impl ReverseProxy {
         if let Err(reason) = Self::validate_websocket_headers(req.headers(), &websocket_config) {
             return Ok(ResponseBuilder::error(StatusCode::FORBIDDEN, &reason));
         }
-        let tunnel_timeout = Duration::from_secs(websocket_config.timeout_seconds)
-            .min(max_connection_lifetime);
+        let websocket_timeout = Duration::from_secs(websocket_config.timeout_seconds);
+        let tunnel_timeout = if max_connection_lifetime.is_zero() {
+            websocket_timeout
+        } else {
+            websocket_timeout.min(max_connection_lifetime)
+        };
 
         let target_url = selected_target.url.clone();
         let http_client = selected_route.http_client.clone();
@@ -2654,16 +2672,7 @@ impl ReverseProxy {
     }
 
     fn strip_request_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool) {
-        if !keep_upgrade {
-            headers.remove("Connection");
-            headers.remove("Upgrade");
-        }
-        headers.remove("Keep-Alive");
-        headers.remove("Proxy-Authenticate");
-        headers.remove("Proxy-Authorization");
-        headers.remove("TE");
-        headers.remove("Trailers");
-        headers.remove("Transfer-Encoding");
+        strip_hop_headers(headers, keep_upgrade);
     }
 
     fn box_incoming_request(req: Request<Incoming>) -> Request<BoxedBody> {
@@ -2686,7 +2695,7 @@ impl ReverseProxy {
         headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("text/event-stream"))
+            .map(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/event-stream"))
             .unwrap_or(false)
     }
 
@@ -2712,7 +2721,7 @@ impl ReverseProxy {
             .await
             .map_err(|e| ProxyError::Http(format!("Failed to collect response body: {}", e)))?;
 
-        Self::strip_response_headers(&mut parts.headers, keep_upgrade, is_sse);
+        Self::strip_response_headers(&mut parts.headers, keep_upgrade);
         parts
             .headers
             .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
@@ -2731,35 +2740,21 @@ impl ReverseProxy {
         let (mut parts, body) = response.into_parts();
         let is_sse = Self::is_sse_response(&parts.headers);
 
-        Self::strip_response_headers(&mut parts.headers, keep_upgrade, is_sse);
+        Self::strip_response_headers(&mut parts.headers, keep_upgrade);
         parts
             .headers
             .insert("X-Proxy-Server", "rust-reverse-proxy".parse().unwrap());
 
+        if is_sse {
+            parts.headers.insert("x-accel-buffering", "no".parse().unwrap());
+        }
         // Convert Incoming body to BoxedBody for streaming
         let boxed_body = body.map_err(|err| Box::new(err) as BoxError).boxed();
         Ok(Response::from_parts(parts, boxed_body))
     }
 
-    fn strip_response_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool, is_sse: bool) {
-        // For SSE responses, preserve critical headers
-        if is_sse {
-            // Only remove proxy-specific headers, keep Connection, Transfer-Encoding, etc.
-            headers.remove("Proxy-Authenticate");
-            headers.remove("Proxy-Authorization");
-            return;
-        }
-
-        if !keep_upgrade {
-            headers.remove("Connection");
-            headers.remove("Upgrade");
-        }
-        headers.remove("Keep-Alive");
-        headers.remove("Proxy-Authenticate");
-        headers.remove("Proxy-Authorization");
-        headers.remove("TE");
-        headers.remove("Trailers");
-        headers.remove("Transfer-Encoding");
+    fn strip_response_headers(headers: &mut hyper::HeaderMap, keep_upgrade: bool) {
+        strip_hop_headers(headers, keep_upgrade);
     }
 
     /// Health check loop (runs in background)
@@ -3304,6 +3299,10 @@ mod tests {
         );
         assert!(ReverseProxy::is_sse_response(&headers));
 
+        headers.insert("content-type", "Text/Event-Stream; charset=utf-8".parse().unwrap());
+        assert!(ReverseProxy::is_sse_response(&headers));
+        headers.insert("content-type", "text/event-stream-invalid".parse().unwrap());
+        assert!(!ReverseProxy::is_sse_response(&headers));
         // Test with non-SSE content-type
         headers.insert("content-type", "application/json".parse().unwrap());
         assert!(!ReverseProxy::is_sse_response(&headers));
@@ -3317,16 +3316,16 @@ mod tests {
         headers.insert("cache-control", "no-cache".parse().unwrap());
         headers.insert("content-type", "text/event-stream".parse().unwrap());
 
-        // For SSE responses, critical headers should be preserved
-        ReverseProxy::strip_response_headers(&mut headers, false, true);
+        // Preserve end-to-end SSE metadata, never upstream hop-by-hop framing
+        ReverseProxy::strip_response_headers(&mut headers, false);
 
         assert!(
-            headers.contains_key("connection"),
-            "Connection header should be preserved for SSE"
+            !headers.contains_key("connection"),
+            "Connection is hop-by-hop even for SSE"
         );
         assert!(
-            headers.contains_key("transfer-encoding"),
-            "Transfer-Encoding should be preserved for SSE"
+            !headers.contains_key("transfer-encoding"),
+            "Hyper must generate downstream framing"
         );
         assert!(
             headers.contains_key("cache-control"),
@@ -3342,7 +3341,7 @@ mod tests {
         headers2.insert("connection", "keep-alive".parse().unwrap());
         headers2.insert("transfer-encoding", "chunked".parse().unwrap());
 
-        ReverseProxy::strip_response_headers(&mut headers2, false, false);
+        ReverseProxy::strip_response_headers(&mut headers2, false);
 
         assert!(
             !headers2.contains_key("connection"),

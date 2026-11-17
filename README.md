@@ -16,6 +16,8 @@ A high-performance proxy server written in Rust that can function as both a forw
 - **Encrypted configuration secrets** with AES-256 `{encrypted}` payloads backed by a masked key on disk
 - **Signed QuickJS lifecycle plugins** with protected identity exchange, encrypted credential caching, remote JWT verification, audit events, and safe request/response plans
 
+SSE streaming, connection reuse, timeout tuning, and ready-to-run examples: [SSE proxy guide](docs/sse-proxy.md).
+
 ## Installation
 
 ### Prerequisites
